@@ -8,6 +8,11 @@ param(
     [switch]$SkipBackup
 )
 
+# 项目路径结构：
+#   .venv/                              - Python 虚拟环境
+#   scripts/migrate_sqlite_to_postgres.py - 迁移脚本
+#   data/                               - SQLite 数据库和备份目录
+#   .env                                - 环境变量配置（根目录）
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")

@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 $FrontendDir = Join-Path $Root "frontend"
-$Requirements = Join-Path $Root "backend\requirements.txt"
+# 项目根目录结构：requirements.txt 位于项目根目录
+$Requirements = Join-Path $Root "requirements.txt"
 
 function Test-Command($Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)

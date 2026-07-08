@@ -4,6 +4,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 项目路径结构：
+#   .env.example    - 环境变量模板（根目录）
+#   .env            - 环境变量配置（根目录，由本脚本创建）
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $EnvExample = Join-Path $Root ".env.example"
 $EnvFile = Join-Path $Root ".env"

@@ -4,8 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 项目路径结构：
+#   .venv/          - Python 虚拟环境
+#   backend/        - 后端 Python 代码（app/main:app）
+#   frontend/       - 前端代码
+#   .env            - 环境变量配置（根目录）
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$PythonCommand = "py -3.14"
+$VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 $BackendDir = Join-Path $Root "backend"
 $RunDir = Join-Path $Root ".run"
 $BackendPidFile = Join-Path $RunDir "backend.pid"
@@ -20,8 +25,9 @@ function Test-PortInUse($Port) {
     return [bool](Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 }
 
+# 检查虚拟环境和 .env 配置文件是否存在
+Assert-File $VenvPython "Virtual environment not found. Run install_packages.cmd first."
 Assert-File (Join-Path $Root ".env") ".env not found. Run create_env.cmd first."
-& py -3.14 -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 14) else 1)" | Out-Null
 
 New-Item -ItemType Directory -Force $RunDir | Out-Null
 
@@ -33,7 +39,8 @@ $BackendArgs = @(
     "-NoExit",
     "-ExecutionPolicy", "Bypass",
     "-Command",
-    "Set-Location '$BackendDir'; `$env:PYTHONPATH='.'; $PythonCommand -m uvicorn app.main:app --host 127.0.0.1 --port $BackendPort"
+    # 使用虚拟环境中的 Python 启动 uvicorn 后端服务
+    "Set-Location '$BackendDir'; & '$VenvPython' -m uvicorn app.main:app --host 127.0.0.1 --port $BackendPort"
 )
 $BackendProcess = Start-Process powershell.exe -ArgumentList $BackendArgs -PassThru -WindowStyle Normal
 $BackendProcess.Id | Set-Content $BackendPidFile

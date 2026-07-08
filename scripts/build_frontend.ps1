@@ -1,3 +1,6 @@
+# 项目路径结构：
+#   frontend/           - 前端代码目录
+#   frontend/dist/      - 构建输出目录
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")

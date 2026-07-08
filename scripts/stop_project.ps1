@@ -4,6 +4,10 @@ param(
 
 $ErrorActionPreference = "Continue"
 
+# 项目路径结构：
+#   .run/           - PID 文件和日志目录
+#     backend.pid   - 后端进程 PID
+#     frontend.pid  - 前端进程 PID
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RunDir = Join-Path $Root ".run"
 $PidFiles = @(
