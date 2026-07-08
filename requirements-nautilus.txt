@@ -1,0 +1,3 @@
+# NautilusTrader 是 V1 可选只读接入依赖，主 requirements 不强制安装。
+# 固定版本，避免 1.229.0 Beta 之后 Python/Rust v2 API breaking changes 直接影响主服务。
+nautilus_trader==1.229.0

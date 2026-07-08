@@ -1,0 +1,35 @@
+symbols:
+  - symbol: BTC
+    leg_a_venue: hyperliquid
+    leg_a_venue_symbol: BTC
+    mt5_symbol: BTCUSD
+    leg_b_venue: mt5
+    base_asset: BTC
+    quote_asset: USD
+    contract_multiplier: 1
+    min_order_size: 0.001
+    quantity_precision: 4
+    price_precision: 2
+    min_tick: 0.01
+    max_slippage_bps: 8
+    mt5_pre_close_no_open_minutes: 15
+    mt5_post_open_cooldown_minutes: 10
+    allow_hold_through_mt5_close: false
+    enabled: true
+  - symbol: ETH
+    leg_a_venue: hyperliquid
+    leg_a_venue_symbol: ETH
+    mt5_symbol: ETHUSD
+    leg_b_venue: mt5
+    base_asset: ETH
+    quote_asset: USD
+    contract_multiplier: 1
+    min_order_size: 0.01
+    quantity_precision: 3
+    price_precision: 2
+    min_tick: 0.01
+    max_slippage_bps: 10
+    mt5_pre_close_no_open_minutes: 15
+    mt5_post_open_cooldown_minutes: 10
+    allow_hold_through_mt5_close: false
+    enabled: true
