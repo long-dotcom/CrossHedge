@@ -2,7 +2,7 @@
 交易所适配器基础数据模型
 ========================
 
-定义所有交易所适配器（Paper / Hyperliquid / MT5 / Nautilus）共用的数据结构：
+定义旧交易所适配器共用的数据结构：
 
 - :class:`Ticker`        —— 实时行情快照（买一 / 卖一 / 深度名义值）
 - :class:`Account`       —— 账户权益摘要（净值 / 可用余额 / 保证金）
@@ -84,8 +84,10 @@ class AdapterOrder:
         order_type: 订单类型，默认 ``"market"``。
         post_only: 是否为 Post-Only（Maker）单。
         reduce_only: 是否为只减仓单。
+        position_side: 目标仓位侧（``LONG`` / ``SHORT``）；原生 Hedge Mode 使用。
         ttl_seconds: 挂单有效期（秒），0 表示不限制。
         paper_latency_ms: Paper 模式下模拟延迟（毫秒）。
+        client_order_id: 调用方提供的稳定订单 ID，用于崩溃恢复和防重复下单。
     """
 
     platform: str
@@ -99,6 +101,8 @@ class AdapterOrder:
     reduce_only: bool = False
     ttl_seconds: int = 0
     paper_latency_ms: int = 0
+    position_side: str = ""
+    client_order_id: str = ""
 
 
 @dataclass
@@ -131,7 +135,7 @@ class AdapterOrderResult:
 class ExchangeAdapter(Protocol):
     """交易所适配器协议（Protocol），定义各适配器必须实现的接口。
 
-    所有适配器（Paper / Hyperliquid / MT5 / Nautilus）均需实现以下方法，
+    所有旧适配器均需实现以下方法，
     以便上层策略和执行模块以统一方式调用不同交易所。
     """
 

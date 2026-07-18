@@ -32,13 +32,13 @@ from dataclasses import dataclass
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from app.adapters.venue import is_native_hyper_mt5_pair
 from app.core.logging import get_logger
 from app.core.worker_runner import run_worker
-from app.db.models import ArbitrageOpportunity, HedgeGroup, StrategySetting, SymbolMapping, SystemLog, WorkerRun
+from app.db.models import ArbitrageOpportunity, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
-from app.execution.engine import open_hedge_group
+from app.execution.coordinator import create_open_intent
+from app.risk.engine import open_capacity_check
 from app.market.mt5_tradability import mt5_tradability_cache
 
 logger = get_logger(__name__)
@@ -52,12 +52,8 @@ class OpportunityConfirmation:
     ticks: int            # 累计出现次数
 
 
-# 模块级状态：机会确认跟踪和冷却期
+# 模块级状态仅跟踪短时信号确认；开仓冷却改为查询持久化对冲组。
 _confirmations: dict[tuple[int, str, str], OpportunityConfirmation] = {}
-_cooldown_until: dict[tuple[str, str], float] = {}
-
-# 视为"未平仓"的对冲组状态
-OPEN_GROUP_STATUSES = ("opening", "open", "open_partial", "closing", "manual_intervention")
 
 
 def run_auto_execute(db: Session) -> int:
@@ -111,19 +107,17 @@ def run_auto_execute(db: Session) -> int:
         if decision_delay_ms > 0:
             time.sleep(decision_delay_ms / 1000)
         try:
-            opportunity.status = "executing"
-            opportunity.reject_reason = "auto_execute executing"
-            db.commit()
-            # 执行开仓
-            group = open_hedge_group(db, opportunity.id, source="auto_paper")
-            _set_cooldown(strategy, opportunity.symbol, opportunity.direction)
+            result = create_open_intent(
+                db,
+                opportunity_id=opportunity.id,
+                requested_by="auto_executor",
+                idempotency_key=f"auto-open:{opportunity.id}",
+                source="auto_paper",
+            )
             _confirmations.pop(_confirmation_key(opportunity), None)
-            if group.status in {"failed", "manual_intervention"}:
-                logger.warning("自动纸面执行异常: symbol={} group_id={} status={}", opportunity.symbol, group.id, group.status)
-                db.add(SystemLog(level="warning", category="auto_execute", message=f"自动纸面执行异常: {opportunity.symbol} #{group.id}", context=f"group_status={group.status}"))
-            else:
-                logger.info("自动纸面执行成功: symbol={} group_id={}", opportunity.symbol, group.id)
-                db.add(SystemLog(level="info", category="auto_execute", message=f"自动纸面执行成功: {opportunity.symbol} #{group.id}"))
+            if result.created:
+                logger.info("自动开仓 Intent 已创建: symbol={} intent_id={} group_id={}", opportunity.symbol, result.intent.id, result.intent.hedge_group_id)
+                db.add(SystemLog(level="info", category="auto_execute", message=f"自动开仓已进入执行队列: {opportunity.symbol} Intent #{result.intent.id}"))
                 executed += 1
             prune_table_by_id(db, SystemLog)
             db.commit()
@@ -134,7 +128,6 @@ def run_auto_execute(db: Session) -> int:
             if row:
                 row.status = "executable"
                 row.reject_reason = f"自动执行失败: {exc}"
-            _set_cooldown(strategy, opportunity.symbol, opportunity.direction)
             db.add(SystemLog(level="warning", category="auto_execute", message=f"自动执行失败: {opportunity.symbol}", context=str(exc)))
             db.add(WorkerRun(worker_name="auto_executor", status="failed", duration_ms=0, error_message=str(exc)))
             prune_table_by_id(db, SystemLog)
@@ -162,34 +155,15 @@ def _eligible(db: Session, strategy: StrategySetting, opportunity: ArbitrageOppo
     """检查机会是否满足自动执行资格。
 
     检查项：
-    1. 品种映射是否为原生 Hyper/MT5 对（Nautilus 只读 pair 不允许）
-    2. 净利润是否达标
-    3. 是否在冷却期内
-    4. 同品种和全局未平对冲组数量是否超限
+    1. 净利润是否达标
+    2. 品种级与全局开仓容量是否充足
     """
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == opportunity.symbol).first()
-    if mapping and not is_native_hyper_mt5_pair(mapping):
-        return False, "Nautilus V1 只读 venue pair 不允许自动执行"
     min_profit = strategy.auto_execute_min_net_profit or strategy.min_net_profit
     if opportunity.net_profit < min_profit:
         return False, f"自动执行净利润不足: {opportunity.net_profit:.2f} < {min_profit:.2f}"
-    # 冷却期检查
-    cooldown_key = (opportunity.symbol, opportunity.direction)
-    remaining = _cooldown_until.get(cooldown_key, 0.0) - time.time()
-    if remaining > 0:
-        return False, f"自动执行冷却中: {remaining:.1f}s"
-    # 同品种未平对冲组上限
-    symbol_open_count = (
-        db.query(HedgeGroup)
-        .filter(HedgeGroup.symbol == opportunity.symbol, HedgeGroup.status.in_(OPEN_GROUP_STATUSES))
-        .count()
-    )
-    if symbol_open_count >= strategy.auto_execute_max_per_symbol_open_groups:
-        return False, f"同品种未平对冲组已达上限: {symbol_open_count}"
-    # 全局未平对冲组上限
-    global_open_count = db.query(HedgeGroup).filter(HedgeGroup.status.in_(OPEN_GROUP_STATUSES)).count()
-    if global_open_count >= strategy.auto_execute_max_global_open_groups:
-        return False, f"全局未平对冲组已达上限: {global_open_count}"
+    capacity = open_capacity_check(db, opportunity.symbol, opportunity.direction, opportunity.notional)
+    if not capacity.allowed:
+        return False, capacity.reason
     return True, ""
 
 
@@ -219,11 +193,6 @@ def _confirm(strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tu
 def _confirmation_key(opportunity: ArbitrageOpportunity) -> tuple[int, str, str]:
     """生成机会确认的唯一键。"""
     return (opportunity.id, opportunity.symbol, opportunity.direction)
-
-
-def _set_cooldown(strategy: StrategySetting, symbol: str, direction: str) -> None:
-    """设置品种+方向的冷却期。"""
-    _cooldown_until[(symbol, direction)] = time.time() + max(strategy.auto_execute_cooldown_seconds, 0)
 
 
 def _decision_delay_ms(strategy: StrategySetting) -> int:

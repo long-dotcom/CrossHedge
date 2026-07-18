@@ -2,11 +2,12 @@
 实时成本数据模块
 ================
 
-从 Hyperliquid API 和 MT5 终端获取实时费率数据，包括：
+按 venue 自动获取实时费率数据，包括：
 
 - Hyperliquid 用户费率（userFees）
 - Hyperliquid 资金费率（metaAndAssetCtxs）
-- MT5 品种佣金和隔夜利息
+- 原生连接器返回的 maker/taker 费率和永续 funding
+- MT5 品种隔夜利息
 
 使用 ``TTLCache`` 缓存结果，避免频繁请求。
 
@@ -29,6 +30,7 @@ from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
 from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.core.type_utils import safe_float
+from app.market.fx import fx_to_usd
 
 logger = get_logger(__name__)
 
@@ -41,12 +43,14 @@ class VenueCostInputs:
         taker_fee_rate: Taker 费率
         maker_fee_rate: Maker 费率
         funding_rate: 资金费率
+        funding_interval_hours: 资金费率对应的结算周期（小时）
         source: 数据来源标识
     """
     taker_fee_rate: float
     maker_fee_rate: float
     funding_rate: float
     source: str
+    funding_interval_hours: float = 1.0
 
 
 # 向后兼容别名
@@ -82,9 +86,65 @@ class HyperliquidMarketData:
 
 # ── TTL 缓存实例 ────────────────────────────────────────────────────────────
 # 市场数据缓存（按 dex 分组），TTL 由 settings.cost.cost_cache_ttl_seconds 控制
-_hl_market_cache: TTLCache[HyperliquidMarketData] = TTLCache(ttl_seconds=60.0)
+_cost_cache_ttl = max(float(get_settings().cost.cost_cache_ttl_seconds), 1.0)
+_hl_market_cache: TTLCache[HyperliquidMarketData] = TTLCache(ttl_seconds=_cost_cache_ttl)
 # 用户费率缓存，TTL 同上
-_hl_user_fee_cache: TTLCache[tuple[float, float]] = TTLCache(ttl_seconds=60.0)
+_hl_user_fee_cache: TTLCache[tuple[float, float]] = TTLCache(ttl_seconds=_cost_cache_ttl)
+# 交易所成本缓存，避免扫描循环反复请求品种与 funding。
+_venue_cost_cache: TTLCache[VenueCostInputs] = TTLCache(ttl_seconds=_cost_cache_ttl)
+
+
+class VenueCostUnavailable(RuntimeError):
+    """venue 费率或 funding 无法自动获取。"""
+
+
+def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
+    """按 venue 自动获取 maker/taker 费率和 funding。
+
+    不支持或查询失败时抛出异常，调用方必须阻止成本未知的候选进入执行，
+    禁止静默套用 Hyperliquid 费率或按零成本处理。
+    """
+    normalized = str(venue or "").strip().lower()
+    if normalized == "hyperliquid":
+        return leg_a_cost_inputs(symbol)
+    if normalized == "mt5":
+        return VenueCostInputs(0.0, 0.0, 0.0, "mt5_no_trading_fee", 1.0)
+
+    cache_key = f"{normalized}:{str(symbol or '').upper()}"
+    cached = _venue_cost_cache.get(cache_key)
+    if cached:
+        return cached
+    try:
+        from app.venues.manager import native_venue_manager
+
+        instrument = native_venue_manager.connector_for(normalized, "live").get_instrument(symbol)
+        result = VenueCostInputs(
+            taker_fee_rate=safe_float(instrument.taker_fee_rate),
+            maker_fee_rate=safe_float(instrument.maker_fee_rate),
+            funding_rate=safe_float(instrument.funding_rate),
+            funding_interval_hours=8.0 if normalized == "binance" else 1.0,
+            source=f"native_{normalized}",
+        )
+    except Exception as exc:
+        raise VenueCostUnavailable(f"{normalized} {symbol} 自动成本查询失败: {exc}") from exc
+    _venue_cost_cache.set(cache_key, result)
+    return result
+
+
+def estimated_pair_close_fee(mapping, notional: float) -> float:
+    """按平仓执行模式估算两腿手续费。"""
+    from app.adapters.venue import mapping_leg
+    from app.execution.modes import MAKER_THEN_MARKET, execution_mode, maker_leg
+
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
+    leg_a = venue_cost_inputs(leg_a_venue, leg_a_symbol)
+    leg_b = venue_cost_inputs(leg_b_venue, leg_b_symbol)
+    value = max(float(notional or 0.0), 0.0)
+    maker_key = maker_leg(mapping) if execution_mode(mapping) == MAKER_THEN_MARKET else ""
+    leg_a_rate = leg_a.maker_fee_rate if maker_key == "a" else leg_a.taker_fee_rate
+    leg_b_rate = leg_b.maker_fee_rate if maker_key == "b" else leg_b.taker_fee_rate
+    return value * (float(leg_a_rate or 0.0) + float(leg_b_rate or 0.0))
 
 
 def leg_a_cost_inputs(symbol: str) -> VenueCostInputs:
@@ -108,6 +168,7 @@ def leg_a_cost_inputs(symbol: str) -> VenueCostInputs:
         taker_fee_rate=effective_taker,
         maker_fee_rate=effective_maker,
         funding_rate=market_data.funding_rates.get(symbol, 0.00010),
+        funding_interval_hours=1.0,
         source=f"{fee_source}+metaAndAssetCtxs",
     )
 
@@ -117,7 +178,7 @@ hyperliquid_cost_inputs = leg_a_cost_inputs
 
 
 def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_days: float) -> MT5CostInputs:
-    """获取 MT5 品种的成本输入（佣金 + 隔夜利息）。
+    """自动获取 MT5 品种隔夜利息；账户佣金固定按 0 处理。
 
     参数:
         mt5_symbol: MT5 品种名
@@ -129,14 +190,11 @@ def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_day
         MT5CostInputs
     """
     settings = get_settings()
-    # swap_free 模式下无隔夜利息
-    if settings.mt5.swap_free:
-        return MT5CostInputs(settings.mt5.default_commission_rate, 0.0, 0.0, 0.0, 0, "mt5_swap_free")
     try:
         import MetaTrader5 as mt5  # type: ignore
     except Exception as exc:
         logger.warning("MetaTrader5 包不可用，使用默认 MT5 成本: {}", exc)
-        return MT5CostInputs(settings.mt5.default_commission_rate, 0.0, 0.0, 0.0, 0, "mt5_default")
+        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
 
     if not ensure_mt5_connected(
         login=settings.mt5.login,
@@ -144,43 +202,83 @@ def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_day
         server=settings.mt5.server,
     ):
         logger.warning("MT5 连接失败，使用默认 MT5 成本")
-        return MT5CostInputs(settings.mt5.default_commission_rate, 0.0, 0.0, 0.0, 0, "mt5_default")
+        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
     mt5.symbol_select(mt5_symbol, True)
     info = mt5.symbol_info(mt5_symbol)
     if not info:
-        return MT5CostInputs(settings.mt5.default_commission_rate, 0.0, 0.0, 0.0, 0, "mt5_default")
+        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
     swap_long = safe_float(getattr(info, "swap_long", 0.0))
     swap_short = safe_float(getattr(info, "swap_short", 0.0))
     swap_mode = int(getattr(info, "swap_mode", 0))
     point = safe_float(getattr(info, "point", 0.0))
     contract_size = safe_float(getattr(info, "trade_contract_size", 1.0))
+    tick = mt5.symbol_info_tick(mt5_symbol)
+    current_price = (
+        (safe_float(getattr(tick, "bid", 0.0)) + safe_float(getattr(tick, "ask", 0.0))) / 2
+        if tick
+        else 0.0
+    )
+    account = mt5.account_info()
+    currency_by_mode = {
+        2: str(getattr(info, "currency_base", "") or "USD"),
+        3: str(getattr(info, "currency_margin", "") or "USD"),
+        4: str(getattr(account, "currency", "") or "USD"),
+    }
+    swap_currency = currency_by_mode.get(swap_mode, "USD")
+    currency_rate_to_usd = fx_to_usd(swap_currency).rate_to_usd if swap_mode in currency_by_mode else 1.0
     selected_swap = swap_long if mt5_side == "buy" else swap_short
-    swap_cost = _estimate_mt5_swap_cost(selected_swap, swap_mode, point, contract_size, quantity, holding_days)
+    swap_cost = _estimate_mt5_swap_cost(
+        selected_swap,
+        swap_mode,
+        point,
+        contract_size,
+        quantity,
+        holding_days,
+        current_price=current_price,
+        currency_rate_to_usd=currency_rate_to_usd,
+    )
     return MT5CostInputs(
-        commission_rate=settings.mt5.default_commission_rate,
+        commission_rate=0.0,
         swap_cost=swap_cost,
         swap_long=swap_long,
         swap_short=swap_short,
         swap_mode=swap_mode,
-        source="mt5_symbol_info",
+        source=f"mt5_symbol_info_swap_mode_{swap_mode}",
     )
 
 
-def _estimate_mt5_swap_cost(swap_value: float, swap_mode: int, point: float, contract_size: float, quantity: float, holding_days: float) -> float:
+def _estimate_mt5_swap_cost(
+    swap_value: float,
+    swap_mode: int,
+    point: float,
+    contract_size: float,
+    quantity: float,
+    holding_days: float,
+    *,
+    current_price: float = 0.0,
+    currency_rate_to_usd: float = 1.0,
+) -> float:
     """估算 MT5 隔夜利息成本。
 
-    swap_mode=1 表示点数模式，当前券商 BTCUSD/ETHUSD 是这种模式。
-    其他模式按每手金额估算；负值表示支付，正值表示收取。
+    支持 MT5 的 points、货币、年化利率和 reopen 模式；负值表示支付，
+    正值表示收取。holding_days 表示期望持仓天数，因此结果是期望成本。
     """
     if swap_mode == 0 or holding_days <= 0:
         return 0.0
-    if swap_mode == 1:
-        # 点数模式：swap_value × point × contract_size × quantity × days
+    if swap_mode in {1, 7, 8}:
+        # points / reopen：swap 参数以价格点数表示。
         swap_pnl = swap_value * point * contract_size * quantity * holding_days
         return -swap_pnl
-    # 其他模式：按每手金额估算
-    swap_pnl = swap_value * quantity * holding_days
-    return -swap_pnl
+    if swap_mode in {2, 3, 4}:
+        # 指定货币金额/手/天，统一折算为 USD。
+        swap_pnl = swap_value * quantity * holding_days * currency_rate_to_usd
+        return -swap_pnl
+    if swap_mode in {5, 6}:
+        # 年化百分比，MT5 使用 360 天银行年；open 模式在估算阶段用当前价近似。
+        notional = current_price * contract_size * quantity
+        swap_pnl = notional * (swap_value / 100.0) * (holding_days / 360.0)
+        return -swap_pnl
+    raise ValueError(f"不支持的 MT5 swap_mode: {swap_mode}")
 
 
 def _leg_a_user_fee_rates() -> tuple[float, float]:

@@ -53,7 +53,7 @@ export function ExecutionPage() {
   const [fillPage, setFillPage] = useState(1);
   const [activeTab, setActiveTab] = useState('orders');
   const streamStatus = usePageStream('execution', { page: orderPage, fillPage, pageSize: 20 });
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const orders = useQuery({ queryKey: ['orders', orderPage], queryFn: async () => (await api.get('/orders', { params: { page: orderPage, page_size: 20 } })).data });
   const fills = useQuery({ queryKey: ['fills', fillPage], queryFn: async () => (await api.get('/fills', { params: { page: fillPage, page_size: 20 } })).data });
   const orderRows = orders.data?.items || [];

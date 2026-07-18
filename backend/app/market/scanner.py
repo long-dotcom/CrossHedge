@@ -42,16 +42,17 @@ from app.db.models import (
 )
 from app.db.retention import prune_table_by_id
 from app.market.symbols import enabled_mappings
-from app.market.fx import fx_to_usd
 from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.quotes import quote_cache, quote_synchronizer
 from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.mt5_tradability import mt5_tradability_cache
-from app.strategy.cost import estimate_cost
-from app.strategy.live_costs import leg_a_cost_inputs, mt5_cost_inputs
+from app.strategy.cost import estimate_pair_cost
+from app.strategy.live_costs import VenueCostUnavailable, mt5_cost_inputs, venue_cost_inputs
+from app.strategy.position_sizing import PositionSizing, calculate_position_sizing
 from app.strategy.statistical_signal import evaluate_entry_signal
 from app.execution.circuit_breaker import feed_spread as breaker_feed
+from app.execution.modes import MAKER_THEN_MARKET, close_order_type, execution_mode, maker_leg, open_order_type
 from app.strategy.spread_math import DIRECTIONS, LONG_LEG_A_SHORT_LEG_B, spreads_for_direction
 from app.adapters.venue import is_native_pair, mapping_leg
 
@@ -80,19 +81,6 @@ class BucketAccumulator:
     mid_spread_sum: float
     spread_cost_sum: float
     sample_count: int
-
-
-@dataclass
-class PositionSizing:
-    """仓位计算结果。"""
-    leg_b_quantity: float       # MT5 手数
-    leg_b_base_quantity: float  # MT5 基础数量（手数 × 合约大小）
-    leg_b_point_value_usd: float  # 每点 USD 价值
-    leg_a_quantity: float       # Hyperliquid 数量
-    notional_usd: float         # USD 名义价值
-    currency: str               # 计价货币
-    fx_rate_to_usd: float       # 货币→USD 汇率
-    fx_source: str              # 汇率来源
 
 
 @dataclass(frozen=True)
@@ -173,7 +161,7 @@ def run_scan(db: Session) -> int:
                 # ── 非原生品种对：只读模式 ──────────────────────────────────
                 if not is_native_pair(mapping):
                     persist_started = perf_counter()
-                    readonly_payloads = _readonly_leg_pair_payloads(mapping, settings)
+                    readonly_payloads = _readonly_leg_pair_payloads(mapping, settings, strategy)
                     if readonly_payloads:
                         direction_payloads_all.extend(readonly_payloads)
                         current_payloads.append(_best_current_payload(readonly_payloads))
@@ -184,7 +172,7 @@ def run_scan(db: Session) -> int:
                             leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
                             quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
                             total_cost=0, net_profit=0, annualized_return=0,
-                            status="rejected", reason="缺少 Nautilus 只读行情",
+                            status="rejected", reason="缺少原生连接器行情",
                             gate="quote", blocker="quote",
                         ))
                     _record_duration(timings, "persist_duration_ms", persist_started)
@@ -192,7 +180,12 @@ def run_scan(db: Session) -> int:
 
                 # ── MT5 会话状态检查 ──────────────────────────────────────
                 quote_sync_started = perf_counter()
-                session_state = mt5_session_state(mapping)
+                has_mt5 = "mt5" in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}
+                session_state = mt5_session_state(mapping) if has_mt5 else SimpleNamespace(
+                    can_quote=True,
+                    status="not_applicable",
+                    reason="",
+                )
                 if not session_state.can_quote:
                     _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
                     persist_started = perf_counter()
@@ -240,7 +233,8 @@ def run_scan(db: Session) -> int:
                 # ── 仓位计算 ──────────────────────────────────────────────
                 sizing_started = perf_counter()
                 try:
-                    sizing = _position_sizing(mapping, mt.mid, hl.mid, strategy.default_notional)
+                    target_notional = getattr(mapping, "target_notional", strategy.default_notional)
+                    sizing = _position_sizing(mapping, mt.mid, hl.mid, target_notional)
                 except ValueError as exc:
                     _record_duration(timings, "sizing_duration_ms", sizing_started)
                     persist_started = perf_counter()
@@ -259,8 +253,12 @@ def run_scan(db: Session) -> int:
                 _record_duration(timings, "sizing_duration_ms", sizing_started)
 
                 # ── 成本估算 + 信号评估 + 门控判定 ────────────────────────
-                holding_hours = max(strategy.max_holding_minutes / 60, 1)
-                hl_costs = leg_a_cost_inputs(mapping.leg_a_venue_symbol)
+                holding_minutes = getattr(mapping, "max_holding_minutes", strategy.max_holding_minutes)
+                holding_hours = max(holding_minutes / 60, 1)
+                leg_a_symbol = mapping_leg(mapping, "a")[1]
+                leg_b_symbol = mapping_leg(mapping, "b")[1]
+                leg_a_costs = venue_cost_inputs(leg_a_venue_name, leg_a_symbol)
+                leg_b_costs = venue_cost_inputs(leg_b_venue_name, leg_b_symbol)
                 persist_started = perf_counter()
                 direction_payloads = []
                 cost_started = perf_counter()
@@ -275,28 +273,51 @@ def run_scan(db: Session) -> int:
                     notional = sizing.notional_usd
                     leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
                     leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
-                    mt5_costs = mt5_cost_inputs(mapping.mt5_symbol, leg_b_side, sizing.leg_b_quantity, holding_hours / 24)
-                    cost = estimate_cost(
-                        notional, mt.bid, mt.ask,
-                        min(mapping.max_slippage_bps, settings.cost.default_slippage_bps),
-                        quantity=sizing.leg_a_quantity,
-                        leg_a_bid=hl.bid, leg_a_ask=hl.ask,
-                        leg_a_fee_rate=_leg_a_fee_rate(mapping.hl_open_order_type, hl_costs),
-                        leg_a_fee_round_trips=settings.hyperliquid.fee_round_trips,
-                        leg_a_close_fee_rate=_leg_a_fee_rate(mapping.hl_close_order_type, hl_costs),
-                        leg_a_funding_rate=hl_costs.funding_rate,
-                        leg_a_side=leg_a_side,
-                        leg_b_commission_rate=mt5_costs.commission_rate,
-                        leg_b_swap_cost=mt5_costs.swap_cost,
-                        holding_hours=holding_hours,
-                        leg_b_spread_rebate_rate=settings.mt5.spread_rebate_rate,
-                        fx_cost_rate=settings.cost.default_fx_cost_rate,
-                        source=f"{hl_costs.source};{mt5_costs.source}",
+                    mt5_costs = (
+                        mt5_cost_inputs(mapping.mt5_symbol, leg_b_side, sizing.leg_b_quantity, holding_hours / 24)
+                        if leg_b_venue_name == "mt5"
+                        else SimpleNamespace(swap_cost=0.0, source="no_mt5")
                     )
-                    net_profit = gross_profit - cost.total
+                    cost = estimate_pair_cost(
+                        notional=notional,
+                        holding_hours=holding_hours,
+                        max_slippage_bps=min(mapping.max_slippage_bps, settings.cost.default_slippage_bps),
+                        leg_a_open_fee_rate=_venue_fee_rate(
+                            open_order_type(mapping, "a"), leg_a_costs,
+                            post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
+                        ),
+                        leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
+                        # 策略机会成本不纳入预测 funding；实际持仓 funding 仍单独记账。
+                        leg_a_funding_rate=0.0,
+                        leg_a_funding_interval_hours=1.0,
+                        leg_a_side=leg_a_side,
+                        leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                        leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                        leg_b_funding_rate=0.0,
+                        leg_b_funding_interval_hours=1.0,
+                        leg_b_side=leg_b_side,
+                        leg_b_swap_cost=mt5_costs.swap_cost,
+                        fx_cost_rate=settings.cost.default_fx_cost_rate,
+                        source=f"{leg_a_costs.source};{leg_b_costs.source};{mt5_costs.source}",
+                    )
                     unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
-                    unit_net_profit = gross_spread - unit_cost
+                    # 第一次评估用于得到统计退出线；最终收益必须扣除退出价差，
+                    # 因为入场和平仓均使用可成交 bid/ask，不能另行重复扣点差。
+                    provisional_net_profit = gross_profit - cost.total
+                    provisional_unit_net_profit = gross_spread - unit_cost
+                    provisional_annualized_return = (provisional_net_profit / notional) * (365 * 24 / holding_hours)
+                    statistical_signal = evaluate_entry_signal(
+                        db, strategy, mapping.symbol, direction,
+                        gross_spread, unit_cost, provisional_unit_net_profit,
+                        provisional_net_profit, provisional_annualized_return,
+                    )
+                    entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
+                    exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
+                    net_profit, unit_net_profit = _projected_profit(
+                        gross_spread, exit_target, cost.total, sizing.leg_a_quantity,
+                    )
                     annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
+                    # 用包含退出线摩擦的最终净利润再次执行利润门槛。
                     statistical_signal = evaluate_entry_signal(
                         db, strategy, mapping.symbol, direction,
                         gross_spread, unit_cost, unit_net_profit, net_profit, annualized_return,
@@ -309,7 +330,11 @@ def run_scan(db: Session) -> int:
                         mapping.symbol, leg_a_side, sizing.leg_a_quantity,
                         notional, hl.depth_notional, signal_gate.status, leg_a_venue_name,
                     )
-                    market_gate = _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
+                    market_gate = (
+                        _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
+                        if has_mt5
+                        else GateResult("candidate", "", "market", "")
+                    )
                     final_gate = _combine_gates(signal_gate, liquidity_gate, market_gate)
                     reason = final_gate.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
                     payload = dict(
@@ -381,70 +406,43 @@ def run_scan(db: Session) -> int:
 # 仓位计算
 # ---------------------------------------------------------------------------
 
-def _round_up_to_step(value: float, step: float, precision: int) -> float:
-    """向上取整到指定步长。"""
-    if step <= 0:
-        return round(value, precision)
-    units = int(value / step)
-    if units * step < value:
-        units += 1
-    return round(units * step, precision)
-
-
 def _position_sizing(mapping, leg_b_mid: float, leg_a_mid: float, target_notional_usd: float) -> PositionSizing:
-    """计算两腿仓位大小。
-
-    根据目标 USD 名义价值反算 MT5 手数和 Hyperliquid 数量。
-    """
-    currency = (mapping.mt5_currency_profit or mapping.quote_asset or "USD").upper()
-    fx = fx_to_usd(currency)
-    contract_size = mapping.mt5_contract_size or mapping.contract_multiplier or 1.0
-    lot_min = mapping.mt5_min_lot or mapping.min_order_size or 0.0
-    lot_step = mapping.mt5_volume_step or lot_min or 0.0
-    if leg_b_mid <= 0 or leg_a_mid <= 0:
-        raise ValueError("报价异常，无法计算名义价值")
-    lot_notional_usd = leg_b_mid * contract_size * fx.rate_to_usd
-    if lot_notional_usd <= 0:
-        raise ValueError("MT5 单手 USD 名义价值异常")
-    raw_lots = max(target_notional_usd / lot_notional_usd, lot_min)
-    leg_b_lots = _round_up_to_step(raw_lots, lot_step, _decimal_places(lot_step))
-    leg_b_base_quantity = leg_b_lots * contract_size
-    leg_b_point_value_usd = leg_b_base_quantity * fx.rate_to_usd
-    notional_usd = leg_b_mid * leg_b_base_quantity * fx.rate_to_usd
-    leg_a_quantity = leg_b_point_value_usd
-    if leg_a_quantity <= 0:
-        raise ValueError("Hyperliquid 数量异常")
-    return PositionSizing(
-        leg_b_quantity=leg_b_lots,
-        leg_b_base_quantity=leg_b_base_quantity,
-        leg_b_point_value_usd=leg_b_point_value_usd,
-        leg_a_quantity=round(leg_a_quantity, 8),
-        notional_usd=notional_usd,
-        currency=currency,
-        fx_rate_to_usd=fx.rate_to_usd,
-        fx_source=fx.source,
+    """兼容旧调用点，实际换算统一委托给 position_sizing 模块。"""
+    return calculate_position_sizing(
+        mapping,
+        leg_b_mid=leg_b_mid,
+        leg_a_mid=leg_a_mid,
+        target_notional_usd=target_notional_usd,
     )
 
 
-def _decimal_places(value: float) -> int:
-    """计算浮点数的小数位数。"""
-    text = f"{value:.12f}".rstrip("0").rstrip(".")
-    return len(text.split(".", 1)[1]) if "." in text else 0
+def _venue_fee_rate(order_type: str, costs, *, post_only: bool = False) -> float:
+    """只有 Post-only 限价单确定为 Maker，其余按 Taker 保守估算。"""
+    is_maker = str(order_type or "").lower() == "limit" and post_only
+    return costs.maker_fee_rate if is_maker else costs.taker_fee_rate
 
 
-def _leg_a_fee_rate(order_type: str, hl_costs) -> float:
-    """根据订单类型返回对应的 Leg A 费率。"""
-    return hl_costs.maker_fee_rate if order_type == "limit" else hl_costs.taker_fee_rate
+def _projected_profit(
+    entry_spread: float,
+    exit_spread: float,
+    total_cost: float,
+    quantity: float,
+) -> tuple[float, float]:
+    """按可成交入场/退出价差计算预计总利润和单位利润。"""
+    qty = max(float(quantity or 0.0), 0.0)
+    unit_cost = float(total_cost or 0.0) / qty if qty > 0 else float(total_cost or 0.0)
+    unit_profit = float(entry_spread or 0.0) - float(exit_spread or 0.0) - unit_cost
+    return unit_profit * qty, unit_profit
 
 
 # ---------------------------------------------------------------------------
 # 只读品种对载荷
 # ---------------------------------------------------------------------------
 
-def _readonly_leg_pair_payloads(mapping, settings) -> list[dict]:
-    """为非原生品种对（Nautilus 只读模式）生成价差载荷。"""
-    leg_a_venue, _ = mapping_leg(mapping, "a")
-    leg_b_venue, _ = mapping_leg(mapping, "b")
+def _readonly_leg_pair_payloads(mapping, settings, strategy=None) -> list[dict]:
+    """为暂未进入自动执行矩阵的品种对生成只读价差载荷。"""
+    leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
+    leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
     leg_meta = _leg_metadata(mapping)
     leg_a = quote_cache.latest(leg_a_venue, mapping.symbol)
     leg_b = quote_cache.latest(leg_b_venue, mapping.symbol)
@@ -459,25 +457,113 @@ def _readonly_leg_pair_payloads(mapping, settings) -> list[dict]:
         return []
     if leg_a.bid <= 0 or leg_a.ask <= 0 or leg_b.bid <= 0 or leg_b.ask <= 0:
         return []
-    quantity = max(float(getattr(mapping, "min_order_size", 0.0) or 0.0), 1.0)
-    direction_specs = (
-        ("long_leg_a_short_leg_b", leg_b.bid - leg_a.ask, leg_a.mid - leg_b.mid),
-        ("long_leg_b_short_leg_a", leg_a.bid - leg_b.ask, leg_b.mid - leg_a.mid),
-    )
+    target_notional = max(float(getattr(mapping, "target_notional", getattr(strategy, "default_notional", 0.0)) or 0.0), 1.0)
+    try:
+        sizing = calculate_position_sizing(
+            mapping,
+            leg_b_mid=leg_b.mid,
+            leg_a_mid=leg_a.mid,
+            target_notional_usd=target_notional,
+        )
+    except ValueError:
+        return []
+    notional = sizing.notional_usd
+    holding_hours = max(float(getattr(mapping, "max_holding_minutes", getattr(strategy, "max_holding_minutes", 60.0)) or 60.0) / 60, 1.0)
+    try:
+        leg_a_costs = venue_cost_inputs(leg_a_venue, leg_a_symbol)
+        leg_b_costs = venue_cost_inputs(leg_b_venue, leg_b_symbol)
+        cost_error = ""
+    except VenueCostUnavailable as exc:
+        leg_a_costs = leg_b_costs = None
+        cost_error = str(exc)
     rows = []
-    for direction, entry_spread, mid_spread in direction_specs:
+    for direction in DIRECTIONS:
+        spreads = spreads_for_direction(direction, leg_a.bid, leg_a.ask, leg_b.bid, leg_b.ask)
+        leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
+        leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
+        if cost_error:
+            total_cost = 0.0
+            unit_cost = 0.0
+            unit_net_profit = 0.0
+            net_profit = 0.0
+            status = "rejected"
+            reason = f"自动成本不可用: {cost_error}"
+            blocker = "cost"
+        else:
+            mt5_swap = 0.0
+            mt5_source = "no_mt5"
+            if leg_b_venue == "mt5":
+                mt5_inputs = mt5_cost_inputs(
+                    leg_b_symbol,
+                    leg_b_side,
+                    sizing.leg_b_lots,
+                    holding_hours / 24,
+                )
+                mt5_swap = mt5_inputs.swap_cost
+                mt5_source = mt5_inputs.source
+            cost = estimate_pair_cost(
+                notional=notional,
+                holding_hours=holding_hours,
+                max_slippage_bps=min(
+                    float(getattr(mapping, "max_slippage_bps", 0.0) or 0.0),
+                    float(settings.cost.default_slippage_bps or 0.0),
+                ),
+                leg_a_open_fee_rate=_venue_fee_rate(
+                    open_order_type(mapping, "a"), leg_a_costs,
+                    post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
+                ),
+                leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
+                # 策略机会成本不纳入预测 funding；实际持仓 funding 仍单独记账。
+                leg_a_funding_rate=0.0,
+                leg_a_funding_interval_hours=1.0,
+                leg_a_side=leg_a_side,
+                leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                leg_b_funding_rate=0.0,
+                leg_b_funding_interval_hours=1.0,
+                leg_b_side=leg_b_side,
+                leg_b_swap_cost=mt5_swap,
+                fx_cost_rate=settings.cost.default_fx_cost_rate,
+                source=f"{leg_a_costs.source};{leg_b_costs.source};{mt5_source}",
+            )
+            logger.debug(
+                "成本明细: symbol={}, direction={}, notional={:.4f}, leg_a_qty={:.8f}, "
+                "leg_b_lots={:.8f}, breakdown={}",
+                mapping.symbol,
+                direction,
+                notional,
+                sizing.leg_a_base_quantity,
+                sizing.leg_b_lots,
+                cost.as_dict(),
+            )
+            total_cost = cost.total
+            unit_cost = total_cost / sizing.leg_a_base_quantity if sizing.leg_a_base_quantity > 0 else total_cost
+            exit_target = _effective_exit_target(mapping, 0.0)
+            net_profit, unit_net_profit = _projected_profit(
+                spreads.entry_spread, exit_target, total_cost, sizing.leg_a_base_quantity,
+            )
+            status = "candidate"
+            reason = (
+                f"原生连接器只读候选: {leg_a_venue}/{leg_b_venue}; "
+                f"自动成本源 {cost.source}; 不进入自动执行"
+            )
+            blocker = "execution"
         rows.append(_current_payload(
             symbol=mapping.symbol, direction=direction, **leg_meta,
             leg_a_bid=leg_a.bid, leg_a_ask=leg_a.ask, leg_b_bid=leg_b.bid, leg_b_ask=leg_b.ask,
-            quantity=quantity, leg_b_quantity=quantity, leg_a_quantity=quantity,
-            notional_currency=getattr(mapping, "quote_asset", "USD") or "USD",
-            fx_rate_to_usd=1.0, gross_spread=entry_spread,
-            entry_spread=entry_spread, close_spread=-entry_spread, mid_spread=mid_spread,
-            spread_cost=0.0, unit_cost=0.0, unit_net_profit=entry_spread,
-            total_cost=0.0, net_profit=entry_spread * quantity, annualized_return=0.0,
-            status="candidate",
-            reason=f"Nautilus V1 只读候选: {leg_a_venue}/{leg_b_venue}; 不进入自动执行",
-            gate="readonly", blocker="execution",
+            quantity=sizing.leg_b_lots,
+            leg_b_quantity=sizing.leg_b_lots,
+            leg_a_quantity=sizing.leg_a_base_quantity,
+            notional_currency=sizing.currency,
+            fx_rate_to_usd=sizing.fx_rate_to_usd, gross_spread=spreads.entry_spread,
+            entry_spread=spreads.entry_spread, close_spread=spreads.close_spread, mid_spread=spreads.mid_spread,
+            spread_cost=spreads.spread_cost, unit_cost=unit_cost,
+            unit_net_profit=unit_net_profit,
+            total_cost=total_cost, net_profit=net_profit,
+            annualized_return=(net_profit / notional) * (365 * 24 / holding_hours) if notional > 0 else 0.0,
+            status=status,
+            reason=reason,
+            gate="readonly" if not cost_error else "cost", blocker=blocker,
             sampled_at=now,
             leg_a_captured_at=leg_a.local_recv_ts, leg_b_captured_at=leg_b.local_recv_ts,
             leg_a_depth_notional=leg_a.depth_notional, leg_b_depth_notional=leg_b.depth_notional,

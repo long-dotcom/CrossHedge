@@ -27,7 +27,7 @@ Schema 迁移由 Alembic 管理，请勿手动修改数据库结构。
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.core.time_utils import utc_now
@@ -126,7 +126,7 @@ class ExchangeCredential(Base, TimestampMixin):
     关键字段：
     - venue: 交易所标识（如 hyperliquid / mt5），唯一
     - display_name: 前端显示名称
-    - environment: 运行环境（sandbox / live）
+    - environment: 交易所连接环境（live / testnet / demo）
     - enabled: 是否启用
     - read_only: 是否为只读凭据
     - encrypted_credentials: 加密后的凭据内容
@@ -139,7 +139,7 @@ class ExchangeCredential(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     venue: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(64), default="")
-    environment: Mapped[str] = mapped_column(String(32), default="sandbox")
+    environment: Mapped[str] = mapped_column(String(32), default="live")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     read_only: Mapped[bool] = mapped_column(Boolean, default=True)
     encrypted_credentials: Mapped[str] = mapped_column(Text, default="")
@@ -247,6 +247,10 @@ class RiskSetting(Base, TimestampMixin):
     max_slippage_bps: Mapped[float] = mapped_column(Float, default=8.0)
     max_market_age_seconds: Mapped[int] = mapped_column(Integer, default=10)
     max_api_errors: Mapped[int] = mapped_column(Integer, default=3)
+    max_total_open_notional: Mapped[float] = mapped_column(Float, default=10000.0)
+    max_global_open_groups: Mapped[int] = mapped_column(Integer, default=3)
+    max_pending_open_groups: Mapped[int] = mapped_column(Integer, default=2)
+    max_daily_loss: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +271,8 @@ class SymbolMapping(Base, TimestampMixin):
     - mt5_*: MT5 侧特有参数（最小手数、步长、合约规模、币种、计算模式等）
     - hl_*: Hyperliquid 侧特有参数（订单类型、Post-Only、偏移、TTL 等）
     - mt5_session_*: MT5 交易时段配置（会话模板、时区、常规/仅平仓时段 JSON）
-    - execution_style: 执行方式（taker_taker / maker_taker 等）
+    - execution_style: 泛化执行模式（simultaneous_market / maker_then_market）
+    - maker_*: Maker 腿、挂单偏移、TTL 与到期动作
     - single_leg_action: 单腿成交时的处理策略
     - enabled: 是否启用该品种
     """
@@ -297,7 +302,21 @@ class SymbolMapping(Base, TimestampMixin):
     mt5_min_base_size: Mapped[float] = mapped_column(Float, default=0.0)
     leg_a_min_base_size: Mapped[float] = mapped_column(Float, default=0.0)
     leg_a_min_notional: Mapped[float] = mapped_column(Float, default=10.0)
-    execution_style: Mapped[str] = mapped_column(String(64), default="taker_taker")
+    target_notional: Mapped[float] = mapped_column(Float, default=1000.0)
+    max_open_notional: Mapped[float] = mapped_column(Float, default=5000.0)
+    max_open_groups: Mapped[int] = mapped_column(Integer, default=1)
+    open_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    max_daily_opens: Mapped[int] = mapped_column(Integer, default=0)
+    max_daily_open_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    allow_opposite_direction: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_holding_minutes: Mapped[int] = mapped_column(Integer, default=240)
+    execution_style: Mapped[str] = mapped_column(String(64), default="simultaneous_market")
+    maker_leg: Mapped[str] = mapped_column(String(1), default="a")
+    maker_offset_bps: Mapped[float] = mapped_column(Float, default=1.0)
+    maker_order_ttl_seconds: Mapped[int] = mapped_column(Integer, default=3)
+    maker_unfilled_action: Mapped[str] = mapped_column(String(32), default="cancel")
+    leg_a_close_order_type: Mapped[str] = mapped_column(String(16), default="market")
+    leg_b_close_order_type: Mapped[str] = mapped_column(String(16), default="market")
     hl_open_order_type: Mapped[str] = mapped_column(String(16), default="market")
     hl_close_order_type: Mapped[str] = mapped_column(String(16), default="market")
     hl_post_only: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -768,6 +787,161 @@ class Fill(Base, TimestampMixin):
 
 
 # ---------------------------------------------------------------------------
+# 下一代执行编排与事件投影
+# ---------------------------------------------------------------------------
+
+class ExecutionIntent(Base, TimestampMixin):
+    """一次不可变的业务执行意图，例如开仓、平仓、补偿或 Probe。"""
+    __tablename__ = "execution_intents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hedge_group_id: Mapped[int | None] = mapped_column(ForeignKey("hedge_groups.id"), nullable=True, index=True)
+    intent_type: Mapped[str] = mapped_column(String(32), index=True)
+    execution_mode: Mapped[str] = mapped_column(String(16), default="paper", index=True)
+    execution_style: Mapped[str] = mapped_column(String(32), default="simultaneous_market", index=True)
+    requested_by: Mapped[str] = mapped_column(String(64), default="system")
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="CREATED", index=True)
+    expected_group_version: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ExecutionLeg(Base, TimestampMixin):
+    """执行意图中的单条 venue 腿，明确动作、仓位侧与不同数量语义。"""
+    __tablename__ = "execution_legs"
+    __table_args__ = (UniqueConstraint("intent_id", "leg_key", name="uq_execution_leg_intent_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    intent_id: Mapped[int] = mapped_column(ForeignKey("execution_intents.id"), index=True)
+    parent_leg_id: Mapped[int | None] = mapped_column(ForeignKey("execution_legs.id"), nullable=True, index=True)
+    leg_key: Mapped[str] = mapped_column(String(32))
+    role: Mapped[str] = mapped_column(String(32), default="PRIMARY", index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    venue: Mapped[str] = mapped_column(String(32), index=True)
+    instrument_id: Mapped[str] = mapped_column(String(128), default="")
+    venue_symbol: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))
+    position_side: Mapped[str] = mapped_column(String(16), default="NET")
+    order_side: Mapped[str] = mapped_column(String(16))
+    strategy_quantity: Mapped[float] = mapped_column(Float)
+    venue_order_quantity: Mapped[float] = mapped_column(Float)
+    target_position_quantity_before: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_position_quantity_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+    order_type: Mapped[str] = mapped_column(String(16), default="market")
+    limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_in_force: Mapped[str] = mapped_column(String(16), default="GTC")
+    post_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    venue_reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), default="PLANNED", index=True)
+
+
+class VenueOrder(Base, TimestampMixin):
+    """交易所订单投影，保留场所标识、PositionId 与累计成交事实。"""
+    __tablename__ = "venue_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_leg_id: Mapped[int] = mapped_column(ForeignKey("execution_legs.id"), index=True)
+    legacy_order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True, index=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    venue_order_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    command_id: Mapped[str] = mapped_column(String(64), default="")
+    correlation_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    position_id: Mapped[str] = mapped_column(String(160), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="INITIALIZED", index=True)
+    requested_quantity: Mapped[float] = mapped_column(Float)
+    filled_quantity: Mapped[float] = mapped_column(Float, default=0.0)
+    remaining_quantity: Mapped[float] = mapped_column(Float)
+    average_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    commission: Mapped[float] = mapped_column(Float, default=0.0)
+    reconciliation_state: Mapped[str] = mapped_column(String(32), default="LOCAL")
+    raw_last_report: Mapped[str] = mapped_column(Text, default="")
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ExecutionEvent(Base, TimestampMixin):
+    """不可变执行事件，用于去重、审计和重建订单投影。"""
+    __tablename__ = "execution_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    intent_id: Mapped[int | None] = mapped_column(ForeignKey("execution_intents.id"), nullable=True, index=True)
+    execution_leg_id: Mapped[int | None] = mapped_column(ForeignKey("execution_legs.id"), nullable=True, index=True)
+    venue_order_id_ref: Mapped[int | None] = mapped_column(ForeignKey("venue_orders.id"), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    venue_order_id: Mapped[str] = mapped_column(String(128), default="", index=True)
+    ts_event: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ts_init: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reconciliation: Mapped[bool] = mapped_column(Boolean, default=False)
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ExecutionPositionSnapshot(Base, TimestampMixin):
+    """执行侧仓位快照，按账户、instrument 和 PositionId 唯一标识。"""
+    __tablename__ = "execution_position_snapshots"
+    __table_args__ = (
+        UniqueConstraint("venue", "account_id", "instrument_id", "position_id", name="uq_exec_position_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    venue: Mapped[str] = mapped_column(String(32), index=True)
+    account_id: Mapped[str] = mapped_column(String(128), default="")
+    instrument_id: Mapped[str] = mapped_column(String(128), index=True)
+    position_id: Mapped[str] = mapped_column(String(160), default="")
+    position_side: Mapped[str] = mapped_column(String(16), default="NET")
+    quantity: Mapped[float] = mapped_column(Float)
+    entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mark_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source_event_id: Mapped[str] = mapped_column(String(64), default="")
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
+    is_fresh: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ProbeRun(Base, TimestampMixin):
+    """独立 Paper Probe 生命周期；真实最小敞口必须在同一 Run 内回平。"""
+    __tablename__ = "probe_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    hedge_group_id: Mapped[int | None] = mapped_column(ForeignKey("hedge_groups.id"), nullable=True, index=True)
+    entry_intent_id: Mapped[int | None] = mapped_column(ForeignKey("execution_intents.id"), nullable=True, index=True)
+    exit_intent_id: Mapped[int | None] = mapped_column(ForeignKey("execution_intents.id"), nullable=True, index=True)
+    purpose: Mapped[str] = mapped_column(String(32))
+    venue: Mapped[str] = mapped_column(String(32), index=True)
+    instrument_id: Mapped[str] = mapped_column(String(128), index=True)
+    position_side: Mapped[str] = mapped_column(String(16), default="NET")
+    entry_side: Mapped[str] = mapped_column(String(16), default="BUY")
+    probe_quantity: Mapped[float] = mapped_column(Float)
+    open_venue_order_id: Mapped[int | None] = mapped_column(ForeignKey("venue_orders.id"), nullable=True)
+    close_venue_order_id: Mapped[int | None] = mapped_column(ForeignKey("venue_orders.id"), nullable=True)
+    open_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close_fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    residual_quantity: Mapped[float] = mapped_column(Float, default=0.0)
+    baseline_position_quantity: Mapped[float] = mapped_column(Float, default=0.0)
+    final_position_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    flat_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="CREATED", index=True)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+
+
+class ExecutionOutbox(Base, TimestampMixin):
+    """与 Intent 同事务写入的待发送命令，提供可靠投递和幂等重试。"""
+    __tablename__ = "execution_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    intent_id: Mapped[int] = mapped_column(ForeignKey("execution_intents.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, index=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+
+
+# ---------------------------------------------------------------------------
 # 盈亏快照
 # ---------------------------------------------------------------------------
 
@@ -897,3 +1071,10 @@ Index("ix_arbitrage_opps_symbol_status", ArbitrageOpportunity.symbol, ArbitrageO
 Index("ix_market_snapshots_symbol_platform", MarketSnapshot.symbol, MarketSnapshot.platform)
 Index("ix_positions_platform_symbol", Position.platform, Position.symbol)
 Index("ix_risk_events_created_at", RiskEvent.created_at)
+Index("ix_orders_created_id", Order.created_at, Order.id)
+Index("ix_fills_created_id", Fill.created_at, Fill.id)
+Index("ix_alerts_created_id", Alert.created_at, Alert.id)
+Index("ix_account_snapshots_platform_created", AccountSnapshot.platform, AccountSnapshot.created_at, AccountSnapshot.id)
+Index("ix_arbitrage_opps_status_profit", ArbitrageOpportunity.status, ArbitrageOpportunity.net_profit)
+Index("ix_arbitrage_opps_status_updated", ArbitrageOpportunity.status, ArbitrageOpportunity.updated_at)
+Index("ix_worker_runs_name_created", WorkerRun.worker_name, WorkerRun.created_at)

@@ -1,80 +1,37 @@
-"""
-适配器工厂与品种映射工具
-=========================
-
-提供交易所适配器（Adapter）的工厂方法和品种映射辅助函数：
-
-- :func:`build_market_adapter` —— 根据 venue 名称构建对应的适配器实例
-- :func:`is_native_pair` —— 判断品种映射是否为可直接执行的原生配对（Hyperliquid + MT5）
-- :func:`mapping_leg` —— 从品种映射中提取指定腿的 venue 和品种名
-- :func:`nautilus_venues_from_mappings` —— 从品种映射列表中提取 Nautilus venue
-"""
+"""品种映射工具与原生连接器兼容入口。"""
 
 from __future__ import annotations
 
-from app.adapters.base import ExchangeAdapter
-from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.mt5 import MT5Adapter
-from app.adapters.nautilus import NautilusAdapter
-from app.core.logging import get_logger
+from app.venues.manager import native_venue_manager
 
-logger = get_logger(__name__)
-
-# 原生适配器 venue 集合（不需要通过 Nautilus 连接）
-NATIVE_VENUES = {"hyperliquid", "mt5"}
+SUPPORTED_VENUES = {"hyperliquid", "mt5", "binance"}
+# 保留旧常量名，调用方含义已统一为项目原生支持集合。
+NATIVE_VENUES = SUPPORTED_VENUES
 
 
 def normalize_venue(value: str) -> str:
-    """标准化 venue 名称（去除空白并转小写）。"""
     return (value or "").strip().lower()
 
 
-def build_market_adapter(venue: str, *, live: bool = False) -> ExchangeAdapter:
-    """根据 venue 名称构建对应的交易所适配器。
-
-    参数:
-        venue: 交易所名称（如 ``"hyperliquid"`` / ``"mt5"`` / ``"binance"``）。
-        live: 是否启用实盘模式。
-
-    返回:
-        对应的适配器实例：
-        - ``"hyperliquid"`` → :class:`HyperliquidAdapter`
-        - ``"mt5"`` → :class:`MT5Adapter`
-        - 其他 → :class:`NautilusAdapter`
-    """
-    venue = normalize_venue(venue)
-    if venue == "hyperliquid":
-        return HyperliquidAdapter(live=live)
-    if venue == "mt5":
-        return MT5Adapter(live=live)
-    return NautilusAdapter(venue, live=live)
+def build_market_adapter(venue: str, *, live: bool = False):
+    """兼容旧调用名，返回统一原生或 Paper 连接器。"""
+    normalized = normalize_venue(venue)
+    if normalized not in SUPPORTED_VENUES:
+        raise ValueError(f"尚未接入原生交易场所: {normalized}")
+    return native_venue_manager.connector_for(normalized, "live" if live else "paper")
 
 
 def is_native_pair(mapping) -> bool:
-    """判断品种映射是否为可直接执行的原生配对。
-
-    原生配对定义：A 腿为 Hyperliquid，B 腿为 MT5。
-    这类配对可以直接通过内置适配器执行，无需 Nautilus。
-    """
     leg_a_venue, _ = mapping_leg(mapping, "a")
     leg_b_venue, _ = mapping_leg(mapping, "b")
-    return leg_a_venue == "hyperliquid" and leg_b_venue == "mt5"
+    return leg_a_venue in SUPPORTED_VENUES and leg_b_venue in SUPPORTED_VENUES
 
 
-# 向后兼容别名
 is_native_hyper_mt5_pair = is_native_pair
 
 
 def mapping_leg(mapping, index: str) -> tuple[str, str]:
-    """从品种映射中提取指定腿的 venue 和品种名。
-
-    参数:
-        mapping: 品种映射对象（SymbolMapping 或 SimpleNamespace）。
-        index: 腿标识，``"a"`` 或 ``"b"``。
-
-    返回:
-        ``(venue, symbol)`` 元组。A 腿默认为 hyperliquid，B 腿默认为 mt5。
-    """
+    """从品种映射中提取指定腿的交易所和交易所品种。"""
     if index == "a":
         venue = normalize_venue(getattr(mapping, "leg_a_venue", "")) or "hyperliquid"
         symbol = str(
@@ -83,7 +40,6 @@ def mapping_leg(mapping, index: str) -> tuple[str, str]:
             or getattr(mapping, "symbol", "")
         )
         return venue, symbol
-
     venue = normalize_venue(getattr(mapping, "leg_b_venue", "")) or "mt5"
     symbol = str(
         getattr(mapping, "leg_b_symbol", "")
@@ -93,22 +49,11 @@ def mapping_leg(mapping, index: str) -> tuple[str, str]:
     return venue, symbol
 
 
-def nautilus_venues_from_mappings(mappings) -> list[str]:
-    """从品种映射列表中提取需要 Nautilus 连接的 venue 列表。
-
-    排除原生 venue（hyperliquid / mt5），仅返回需要通过 Nautilus 连接的交易所。
-
-    参数:
-        mappings: 品种映射对象列表。
-
-    返回:
-        去重后的 Nautilus venue 名称列表。
-    """
+def configured_venues_from_mappings(mappings) -> list[str]:
     venues: list[str] = []
     for mapping in mappings:
         for index in ("a", "b"):
             venue, _ = mapping_leg(mapping, index)
-            if venue in NATIVE_VENUES or venue in venues:
-                continue
-            venues.append(venue)
+            if venue in SUPPORTED_VENUES and venue not in venues:
+                venues.append(venue)
     return venues

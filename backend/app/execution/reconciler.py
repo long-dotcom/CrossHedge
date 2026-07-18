@@ -26,26 +26,30 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.mt5 import MT5Adapter
-from app.adapters.venue import build_market_adapter, NATIVE_VENUES, nautilus_venues_from_mappings
+from app.config.settings import get_settings
 from app.core.logging import get_logger
 from app.core.time_utils import utc_now
 from app.core.worker_runner import run_worker
-from app.db.models import Alert, ExchangeCredential, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
-from app.execution.gateway import LegOrderIntent, build_execution_gateway
+from app.db.models import Alert, ExchangeCredential, ExecutionIntent, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
+from app.execution.event_projection import project_legacy_order, project_legacy_orders, project_unmirrored_legacy_orders
 from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import actual_entry_spread_from_fills, realized_pnl_from_fills
+from app.venues.domain.models import Position as VenuePosition, PositionSide
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
 # 订单状态分类
-PENDING_ORDER_STATUSES = {"accepted", "submitted", "pending", "open", "new"}
+PENDING_ORDER_STATUSES = {
+    "initialized", "released", "emulated",
+    "accepted", "submitted", "pending", "open", "new",
+}
 POSITION_EFFECT_STATUSES = {"filled", "partially_filled"}
 FAILED_ORDER_STATUSES = {"failed", "rejected", "canceled", "expired", "unfilled", "not_found"}
 UNRECONSTRUCTABLE_ORDER_STATUSES = {"not_ready", "not_supported"}
 RECONCILE_GROUP_STATUSES = {"opening", "closing"}
 MANAGED_POSITION_GROUP_STATUSES = {"opening", "open", "open_partial", "closing", "manual_intervention", "closed"}
+SUPPORTED_VENUES = {"hyperliquid", "mt5", "binance"}
 
 
 def run_execution_reconcile(db: Session) -> int:
@@ -75,50 +79,117 @@ def _reconcile_impl(db: Session) -> int:
     for group in groups:
         changed = reconcile_hedge_group(db, group)
         reconciled += 1 if changed else 0
+    reconciled += reconcile_unresolved_orders(db, exclude_group_ids={group.id for group in groups})
     reconciled += reconcile_residual_positions(db)
     reconciled += reconcile_orphan_positions(db)
+    # 分批回填历史订单；幂等事件 ID 保证重启或重复扫描不会重复写入。
+    project_unmirrored_legacy_orders(db)
     # 同步完成后刷新内存对冲池
     hedge_pool.load_from_db(db)
     return reconciled
 
 
+def reconcile_unresolved_orders(db: Session, *, exclude_group_ids: set[int] | None = None) -> int:
+    """同步已离开活动状态但仍未确认终态的外部订单。
+
+    原生私有事件会持续推进订单。本函数负责把断线期间迟到的 ACK、
+    Fill、Cancel 等结果写回业务数据库，避免对冲组提前进入 failed 后丢失成交。
+    """
+    excluded = exclude_group_ids or set()
+    orders = (
+        db.query(Order)
+        .filter(
+            Order.status.in_(PENDING_ORDER_STATUSES | {"partially_filled"}),
+            Order.external_order_id != "",
+            Order.hedge_group_id.isnot(None),
+        )
+        .order_by(Order.id)
+        .all()
+    )
+    changed_count = 0
+    for order in orders:
+        if order.hedge_group_id in excluded:
+            continue
+        group = db.query(HedgeGroup).filter(HedgeGroup.id == order.hedge_group_id).first()
+        if group is None:
+            continue
+        had_position_effect = _order_has_position_effect(db, order)
+        changed = _refresh_order(db, group, order)
+        escalated = _escalate_detached_unresolved_order(db, group, order)
+        project_legacy_order(db, order)
+        if not changed and not escalated:
+            continue
+        changed_count += 1
+        if escalated:
+            continue
+        if had_position_effect or not _order_has_position_effect(db, order):
+            continue
+        detail = (
+            f"对冲组已处于 {group.status}，但外部订单随后确认成交: "
+            f"{order.platform}:{order.external_order_id}:{order.status}"
+        )
+        group.status = "manual_intervention"
+        if not _has_group_event(db, group.id, "late_external_fill"):
+            db.add(Alert(level="critical", title="已结束对冲组出现迟到成交", message=f"{group.symbol} 对冲组 #{group.id} {detail}"))
+            db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="late_external_fill", detail=detail))
+            db.add(SystemLog(level="warning", category="execution_reconcile", message=f"迟到成交: {group.symbol} #{group.id}", context=detail))
+    return changed_count
+
+
+def _escalate_detached_unresolved_order(db: Session, group: HedgeGroup, order: Order) -> bool:
+    """对超过阈值仍无法由原生对账重建的离线订单升级人工介入。"""
+    if not order.error_message or _order_age_seconds(order) < max(int(get_settings().execution.reconcile_pending_stale_seconds), 1):
+        return False
+    if _has_group_event(db, group.id, "detached_order_reconcile_required"):
+        return False
+    detail = (
+        f"外部订单长期无法重建: {order.platform}:{order.external_order_id}:{order.error_message}; "
+        "旧订单仅升级人工恢复，禁止对账器绕过 Coordinator 自动撤单"
+    )
+    group.status = "manual_intervention"
+    db.add(Alert(level="critical", title="历史外部订单无法确认", message=f"{group.symbol} 对冲组 #{group.id} {detail}"))
+    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="detached_order_reconcile_required", detail=detail))
+    db.add(SystemLog(level="warning", category="execution_reconcile", message=f"历史外部订单无法确认: {group.symbol} #{group.id}", context=detail))
+    return True
+
+
 def sync_live_positions(db: Session) -> int:
     """从各交易平台同步 live 仓位到 Position 表。
 
-    支持 Hyperliquid、MT5 以及 Nautilus 扩展 venue。
+    支持 Hyperliquid、MT5 和 Binance 原生连接器。
     """
-    adapters = [HyperliquidAdapter(live=True), MT5Adapter(live=True)]
     mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
-    venues = nautilus_venues_from_mappings(mappings)
+    venues = {
+        str(value or "").strip().lower()
+        for mapping in mappings
+        for value in (mapping.leg_a_venue, mapping.leg_b_venue)
+    }
+    venues.update({"hyperliquid", "mt5"})
     for (venue,) in db.query(ExchangeCredential.venue).filter(ExchangeCredential.enabled.is_(True)).all():
-        if venue not in NATIVE_VENUES and venue not in venues:
-            venues.append(venue)
-    for venue in venues:
-        adapters.append(build_market_adapter(venue, live=True))
-    platforms = [adapter.platform for adapter in adapters]
-    db.query(Position).filter(Position.platform.in_(platforms)).delete(synchronize_session=False)
+        venues.add(str(venue or "").strip().lower())
     count = 0
-    hyperliquid_dexes = _hyperliquid_position_dexes(db)
-    for adapter in adapters:
+    for venue in sorted(venues & SUPPORTED_VENUES):
         try:
-            positions = adapter.get_positions(dexes=hyperliquid_dexes) if isinstance(adapter, HyperliquidAdapter) else adapter.get_positions()
+            positions = native_venue_manager.connector_for(venue, "live").get_positions()
         except Exception as exc:
-            db.add(SystemLog(level="warning", category="execution_reconcile", message=f"{adapter.platform} 持仓同步失败", context=str(exc)))
+            db.add(SystemLog(level="warning", category="execution_reconcile", message=f"{venue} 持仓同步失败", context=str(exc)))
             continue
+        # 只有拿到该平台完整快照后才替换旧数据，断线不能把最后已知持仓清空。
+        db.query(Position).filter(Position.platform == venue).delete(synchronize_session=False)
         for item in positions:
-            quantity = float(item.get("quantity", 0.0) or 0.0)
+            quantity = float(item.quantity)
             if abs(quantity) <= 0:
                 continue
             db.add(Position(
-                platform=str(item.get("platform") or adapter.platform),
-                symbol=str(item.get("symbol") or ""),
-                side=str(item.get("side") or ("long" if quantity > 0 else "short")),
+                platform=venue,
+                symbol=item.symbol,
+                side=_venue_position_side(item),
                 quantity=abs(quantity),
-                entry_price=float(item.get("entry_price", 0.0) or 0.0),
-                mark_price=float(item.get("mark_price", 0.0) or 0.0),
-                unrealized_pnl=float(item.get("unrealized_pnl", 0.0) or 0.0),
-                margin_used=float(item.get("margin_used", 0.0) or 0.0),
-                liquidation_price=item.get("liquidation_price"),
+                entry_price=float(item.entry_price),
+                mark_price=float(item.mark_price),
+                unrealized_pnl=float(item.unrealized_pnl),
+                margin_used=float(item.margin_used),
+                liquidation_price=float(item.liquidation_price) if item.liquidation_price is not None else None,
             ))
             count += 1
     return count
@@ -147,14 +218,19 @@ def reconcile_hedge_group(db: Session, group: HedgeGroup) -> bool:
     3. 推进对冲组状态机
     4. 升级过期不可重建的订单
     """
+    # 新模型完全由原生事件投影和 Outbox 状态机推进；旧对账器不得再次提交、
+    # 撤销或补偿这些订单，否则会绕过稳定 ClientOrderId 和恢复协议。
+    if db.query(ExecutionIntent.id).filter(ExecutionIntent.hedge_group_id == group.id).first() is not None:
+        return False
     orders = db.query(Order).filter(Order.hedge_group_id == group.id).order_by(Order.id).all()
     changed = False
     changed = _recover_hyperliquid_orders_from_account(db, group, orders) or changed
     for order in orders:
-        if order.status in PENDING_ORDER_STATUSES and order.external_order_id:
+        if (order.status in PENDING_ORDER_STATUSES or (order.post_only and order.status == "partially_filled")) and order.external_order_id:
             changed = _refresh_order(db, group, order) or changed
     changed = _advance_group_state(db, group, orders) or changed
     changed = _escalate_stale_unreconstructable_group(db, group, orders) or changed
+    project_legacy_orders(db, orders)
     return changed
 
 
@@ -181,7 +257,7 @@ def reconcile_residual_positions(db: Session) -> int:
 def reconcile_orphan_positions(db: Session) -> int:
     """检测未归属任何 live 对冲组的外部仓位。"""
     changed = 0
-    positions = db.query(Position).filter(Position.platform.in_(list(NATIVE_VENUES))).all()
+    positions = db.query(Position).filter(Position.platform.in_(list(SUPPORTED_VENUES))).all()
     for position in positions:
         if abs(position.quantity) <= 0:
             continue
@@ -198,44 +274,47 @@ def reconcile_orphan_positions(db: Session) -> int:
 
 
 def _refresh_order(db: Session, group: HedgeGroup, order: Order) -> bool:
-    """通过网关查询外部订单最新状态并更新本地记录。"""
-    adapter = _adapter_for_order(order.platform, group)
-    gateway = build_execution_gateway(adapter)
-    snapshot = gateway.query_order(order.platform, order.external_order_id)
-    status = str(snapshot.get("status") or order.status)
-    changed = False
-    if status in UNRECONSTRUCTABLE_ORDER_STATUSES:
-        message = str(snapshot.get("message") or snapshot.get("error_message") or "外部订单状态不可重建")
+    """通过原生连接器查询外部订单最新状态并更新本地记录。"""
+    connector = native_venue_manager.connector_for(order.platform, group.execution_mode)
+    symbol = _venue_symbol_for_order(db, group, order)
+    try:
+        snapshot = connector.get_order(symbol, venue_order_id=order.external_order_id)
+    except Exception as exc:
+        message = f"外部订单状态暂不可重建: {exc}"
         if message != order.error_message:
             order.error_message = message
-            changed = True
-        return changed
+            return True
+        return False
+    status = snapshot.status.value.lower()
+    changed = False
     if status and status != order.status:
         order.status = status
         changed = True
-    message = str(snapshot.get("message") or snapshot.get("error_message") or "")
-    if message and message != order.error_message:
-        order.error_message = message
+    if order.error_message:
+        order.error_message = ""
         changed = True
-    filled_quantity = _float_value(snapshot, "filled_quantity", "quantity", "filled")
-    average_price = _float_value(snapshot, "average_price", "price", "avg_price")
-    fee = _float_value(snapshot, "fee", "commission")
-    if filled_quantity > 0 and average_price > 0 and _order_fill_quantity(db, order.id) <= 0:
-        db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=filled_quantity, price=average_price, fee=fee))
+    filled_quantity = float(snapshot.filled_quantity)
+    average_price = float(snapshot.average_price or snapshot.price or 0)
+    fee = float(snapshot.commission)
+    recorded_quantity = _order_fill_quantity(db, order.id)
+    fill_delta = max(filled_quantity - recorded_quantity, 0.0)
+    if fill_delta > 0 and average_price > 0:
+        fee_delta = fee * (fill_delta / filled_quantity) if filled_quantity > 0 else 0.0
+        db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=fill_delta, price=average_price, fee=fee_delta))
         changed = True
-    if hasattr(adapter, "get_trades") and _order_fill_quantity(db, order.id) <= 0:
-        for trade in adapter.get_trades(order.external_order_id):
-            quantity = float(trade.get("quantity", 0.0) or 0.0)
-            price = float(trade.get("price", 0.0) or 0.0)
+    if filled_quantity <= 0 and recorded_quantity <= 0:
+        for trade in connector.get_fills(symbol, venue_order_id=order.external_order_id):
+            quantity = float(trade.quantity)
+            price = float(trade.price)
             if quantity <= 0 or price <= 0:
                 continue
-            db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=quantity, price=price, fee=float(trade.get("fee", 0.0) or 0.0)))
+            db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=quantity, price=price, fee=float(trade.commission)))
             changed = True
     return changed
 
 
 def _recover_hyperliquid_orders_from_account(db: Session, group: HedgeGroup, orders: list[Order]) -> bool:
-    """从 Hyperliquid 账户历史订单中恢复未匹配的 pending 订单。"""
+    """从原生账户活动订单中恢复未匹配的 pending 订单。"""
     if group.execution_mode != "live":
         return False
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
@@ -243,95 +322,24 @@ def _recover_hyperliquid_orders_from_account(db: Session, group: HedgeGroup, ord
     target_orders = [order for order in orders if order.platform == leg_a_venue and order.status in PENDING_ORDER_STATUSES]
     if not target_orders:
         return False
-    if leg_a_venue == "hyperliquid":
-        gateway = build_execution_gateway(HyperliquidAdapter(live=True))
-    else:
-        gateway = build_execution_gateway(build_market_adapter(leg_a_venue, live=True))
-    query_account_orders = getattr(gateway, "query_account_orders", None)
-    if not callable(query_account_orders):
-        return False
-    snapshots = query_account_orders(leg_a_venue)
+    connector = native_venue_manager.connector_for(leg_a_venue, "live")
+    snapshots = connector.get_open_orders()
     if not snapshots:
         return False
     changed = False
-    by_external_id = _account_snapshots_by_external_id(snapshots)
+    by_external_id = {snapshot.venue_order_id: snapshot for snapshot in snapshots if snapshot.venue_order_id}
     for order in target_orders:
         snapshot = by_external_id.get(str(order.external_order_id)) if order.external_order_id else None
-        if snapshot is None and not order.external_order_id:
-            matched = [item for item in snapshots if _account_snapshot_matches_order(db, group, order, item)]
-            if len(matched) == 1:
-                snapshot = matched[0]
         if snapshot is not None:
-            changed = _apply_account_snapshot_to_order(db, order, snapshot) or changed
+            external_order_id = snapshot.venue_order_id
+            status = snapshot.status.value.lower()
+            if external_order_id and external_order_id != order.external_order_id:
+                order.external_order_id = external_order_id
+                changed = True
+            if status != order.status:
+                order.status = status
+                changed = True
     return changed
-
-
-def _account_snapshots_by_external_id(snapshots: list[dict]) -> dict[str, dict]:
-    """按外部订单 ID 索引账户快照。"""
-    by_external_id: dict[str, dict] = {}
-    for snapshot in snapshots:
-        for key in ("external_order_id", "oid", "cloid"):
-            value = str(snapshot.get(key) or "")
-            if value:
-                by_external_id[value] = snapshot
-        for alias in snapshot.get("external_order_ids", []) or []:
-            value = str(alias or "")
-            if value:
-                by_external_id[value] = snapshot
-    return by_external_id
-
-
-def _apply_account_snapshot_to_order(db: Session, order: Order, snapshot: dict) -> bool:
-    """将账户快照中的信息应用到本地订单记录。"""
-    changed = False
-    external_order_id = str(snapshot.get("external_order_id") or order.external_order_id or "")
-    if external_order_id and external_order_id != order.external_order_id:
-        order.external_order_id = external_order_id
-        changed = True
-    status = str(snapshot.get("status") or order.status)
-    if status and status != order.status:
-        order.status = status
-        changed = True
-    message = str(snapshot.get("message") or "")
-    if message and message != order.error_message:
-        order.error_message = message
-        changed = True
-    average_price = _float_value(snapshot, "average_price", "price", "avg_price")
-    if average_price > 0 and order.price != average_price:
-        order.price = average_price
-        changed = True
-    filled_quantity = _float_value(snapshot, "filled_quantity", "quantity", "filled")
-    fee = _float_value(snapshot, "fee", "commission")
-    if status in POSITION_EFFECT_STATUSES and filled_quantity > 0 and average_price > 0 and _order_fill_quantity(db, order.id) <= 0:
-        db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=filled_quantity, price=average_price, fee=fee))
-        changed = True
-    return changed
-
-
-def _account_snapshot_matches_order(db: Session, group: HedgeGroup, order: Order, snapshot: dict) -> bool:
-    """判断账户快照是否与本地订单匹配。"""
-    if str(snapshot.get("side") or "") != order.side:
-        return False
-    if not _same_symbol(db, group, order, str(snapshot.get("symbol") or "")):
-        return False
-    quantity = _float_value(snapshot, "quantity", "filled_quantity")
-    if quantity <= 0 or abs(quantity - order.quantity) > max(abs(order.quantity) * 0.000001, 0.00000001):
-        return False
-    timestamp_ms = int(snapshot.get("timestamp_ms") or 0)
-    if timestamp_ms and order.created_at:
-        snapshot_at = datetime.fromtimestamp(timestamp_ms / 1000)
-        if snapshot_at < order.created_at:
-            return False
-    return True
-
-
-def _same_symbol(db: Session, group: HedgeGroup, order: Order, external_symbol: str) -> bool:
-    """检查外部品种名是否与本地订单/对冲组/品种映射匹配。"""
-    symbols = {order.symbol, group.symbol}
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
-    if mapping:
-        symbols.add(mapping.leg_a_venue_symbol)
-    return external_symbol in symbols
 
 
 def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) -> bool:
@@ -339,10 +347,6 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     if not orders:
         return False
     platform_orders = _latest_platform_orders(orders)
-    if group.status == "opening" and _complete_hyper_maker_with_mt5_taker(db, group, platform_orders):
-        return True
-    if group.status in {"opening", "closing"} and _complete_hyper_then_mt5_after_fill(db, group, platform_orders):
-        return True
     if len(platform_orders) < 2:
         return False
     effects = [_order_has_position_effect(db, order) for order in platform_orders.values()]
@@ -362,11 +366,8 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
             logger.info("对账开仓完成: symbol={} group=#{}", group.symbol, group.id)
             return True
         if any(effects) and (any(failures) or any(pendings)):
-            canceled = _cancel_pending_orders(group, platform_orders.values())
-            if _auto_compensate_single_leg(db, group, platform_orders.values(), "opening", canceled):
-                return True
             group.status = "manual_intervention"
-            detail = f"订单回查发现开仓单边成交，已尝试撤销未成交腿: {', '.join(canceled) or '无可撤订单'}"
+            detail = "旧订单回查发现开仓单边成交；已禁止旧对账器自动撤单/补偿，请通过恢复 Intent 处理"
             db.add(Alert(level="critical", title="开仓单边成交", message=f"{group.symbol} 对冲组 #{group.id} {detail}"))
             db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
             return True
@@ -390,11 +391,8 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
             logger.info("对账平仓完成: symbol={} group=#{}", group.symbol, group.id)
             return True
         if any(effects) and (any(failures) or any(pendings)):
-            canceled = _cancel_pending_orders(group, platform_orders.values())
-            if _auto_compensate_single_leg(db, group, platform_orders.values(), "closing", canceled):
-                return True
             group.status = "manual_intervention"
-            group.close_reason = f"平仓单边成交: {group.close_reason}; 已尝试撤销未成交腿: {', '.join(canceled) or '无可撤订单'}"
+            group.close_reason = f"平仓单边成交: {group.close_reason}; 旧对账器禁止自动撤单/补偿，请通过恢复 Intent 处理"
             db.add(Alert(level="critical", title="平仓单边成交", message=f"{group.symbol} 对冲组 #{group.id} {group.close_reason}"))
             db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=group.close_reason))
             return True
@@ -402,187 +400,6 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     return False
 
 
-def _auto_compensate_single_leg(db, group, orders, phase, canceled) -> bool:
-    """单腿成交时尝试自动反向冲销补偿。"""
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
-    action = (mapping.single_leg_action if mapping else "manual_intervention") or "manual_intervention"
-    if action not in {"auto_close", "reverse_filled_leg"}:
-        return False
-    filled_orders = [order for order in orders if _order_has_position_effect(db, order)]
-    if len(filled_orders) != 1:
-        return False
-    filled_order = filled_orders[0]
-    if _has_group_event(db, group.id, f"{phase}_single_leg_compensation"):
-        return False
-    compensation = _submit_compensation_order(db, group, filled_order, mapping)
-    detail = (
-        f"{'开仓' if phase == 'opening' else '平仓'}单腿成交，已尝试撤销未成交腿: {', '.join(canceled) or '无可撤订单'}; "
-        f"按 single_leg_action={action} 反向冲销 {filled_order.platform}:{filled_order.external_order_id}; "
-        f"补偿订单 {compensation.platform}:{compensation.external_order_id or compensation.id} 状态 {compensation.status}"
-    )
-    if _order_has_position_effect(db, compensation):
-        group.fees += _orders_fee(db, [filled_order, compensation])
-        if phase == "opening":
-            group.status = "failed"
-            group.close_reason = "开仓单腿成交后已自动反向冲销"
-        else:
-            group.status = "open"
-            group.close_reason = f"平仓单腿成交后已自动反向冲销，恢复原对冲组: {group.close_reason}"
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=f"{phase}_single_leg_compensation", detail=detail))
-        db.add(SystemLog(level="warning", category="execution_reconcile", message=f"单腿成交已自动补偿: {group.symbol} #{group.id}", context=detail))
-        return True
-    group.status = "manual_intervention"
-    if phase == "closing":
-        group.close_reason = f"平仓单腿成交且自动反向冲销未完成: {group.close_reason}; {detail}"
-    else:
-        group.close_reason = f"开仓单腿成交且自动反向冲销未完成: {detail}"
-    db.add(Alert(level="critical", title="单腿自动补偿未完成", message=f"{group.symbol} 对冲组 #{group.id} {detail}"))
-    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
-    return True
-
-
-def _complete_hyper_maker_with_mt5_taker(db, group, platform_orders) -> bool:
-    """Hyper maker 策略：maker 成交后补提交 MT5 taker 订单。"""
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
-    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
-    if set(platform_orders) != {leg_a_venue}:
-        return False
-    if not mapping or mapping.execution_style != "hyper_maker_mt5_taker":
-        return False
-    hyper_order = platform_orders[leg_a_venue]
-    if not _order_has_position_effect(db, hyper_order):
-        return False
-    if _has_group_event(db, group.id, "maker_fill_mt5_taker_submitted"):
-        return False
-    hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
-    hyper_target_quantity = float(group.leg_a_quantity or group.quantity or hyper_order.quantity)
-    fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
-    mt5_quantity = float(group.leg_b_quantity or group.quantity or 0.0) * fill_ratio
-    if mt5_quantity <= 0:
-        return False
-    mt5_side = "sell" if group.direction == "long_leg_a_short_leg_b" else "buy"
-    mt5_order = _submit_order_for_group(db, group, platform="mt5", side=mt5_side, quantity=mt5_quantity, order_type="market", venue_symbol=mapping.mt5_symbol)
-    detail = f"Hyperliquid maker 后续成交 {hyper_fill_quantity}/{hyper_target_quantity}，已按比例提交 MT5 taker: {mt5_order.status}"
-    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="maker_fill_mt5_taker_submitted", detail=detail))
-    if _order_has_position_effect(db, mt5_order):
-        group.status = "open"
-        group.opened_at = group.opened_at or utc_now()
-        group.fees += _orders_fee(db, [hyper_order, mt5_order])
-        actual_entry_spread = actual_entry_spread_from_fills(db, group)
-        if actual_entry_spread is not None:
-            group.entry_spread = actual_entry_spread
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="opened_reconciled", detail="Hyper maker 后续成交后 MT5 taker 补单完成"))
-    elif mt5_order.status in PENDING_ORDER_STATUSES:
-        group.status = "opening"
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="orders_pending", detail=detail))
-    else:
-        group.status = "manual_intervention"
-        db.add(Alert(level="critical", title="MT5 taker 补单失败", message=f"{group.symbol} 对冲组 #{group.id} {detail}; {mt5_order.error_message or ''}"))
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
-    return True
-
-
-def _complete_hyper_then_mt5_after_fill(db, group, platform_orders) -> bool:
-    """串行策略：Hyperliquid 成交后按比例补提交 MT5 订单。"""
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
-    leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
-    if set(platform_orders) != {leg_a_venue}:
-        return False
-    if not mapping or mapping.execution_style == "hyper_maker_mt5_taker":
-        return False
-    hyper_order = platform_orders[leg_a_venue]
-    if not _order_has_position_effect(db, hyper_order):
-        return False
-    event_type = f"{group.status}_hyper_fill_mt5_submitted"
-    if _has_group_event(db, group.id, event_type):
-        return False
-    hyper_fill_quantity = _order_fill_quantity(db, hyper_order.id)
-    hyper_target_quantity = float(group.leg_a_quantity or group.quantity or hyper_order.quantity)
-    fill_ratio = min(max(hyper_fill_quantity / hyper_target_quantity, 0.0), 1.0) if hyper_target_quantity > 0 else 0.0
-    mt5_quantity = float(group.leg_b_quantity or group.quantity or 0.0) * fill_ratio
-    if mt5_quantity <= 0:
-        return False
-    if group.status == "opening":
-        mt5_side = "sell" if group.direction == "long_leg_a_short_leg_b" else "buy"
-        order_type = mapping.mt5_open_order_type
-        reduce_only = False
-        success_status = "open"
-        success_event = "opened_reconciled"
-        pending_event = "orders_pending"
-        failure_title = "MT5 开仓补单失败"
-        success_detail = "Hyperliquid 成交后 MT5 开仓补单完成"
-    else:
-        mt5_side = "buy" if group.direction == "long_leg_a_short_leg_b" else "sell"
-        order_type = mapping.mt5_close_order_type
-        reduce_only = True
-        success_status = "closed"
-        success_event = "closed_reconciled"
-        pending_event = "close_pending"
-        failure_title = "MT5 平仓补单失败"
-        success_detail = "Hyperliquid 平仓成交后 MT5 平仓补单完成"
-    mt5_order = _submit_order_for_group(db, group, platform="mt5", side=mt5_side, quantity=mt5_quantity, order_type=order_type, venue_symbol=mapping.mt5_symbol, reduce_only=reduce_only)
-    detail = f"Hyperliquid 后续成交 {hyper_fill_quantity}/{hyper_target_quantity}，已按比例提交 MT5 {'平仓' if reduce_only else '开仓'}补单: {mt5_order.status}"
-    db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=event_type, detail=detail))
-    if _order_has_position_effect(db, mt5_order):
-        group.status = success_status
-        group.fees += _orders_fee(db, [hyper_order, mt5_order])
-        if success_status == "open":
-            group.opened_at = group.opened_at or utc_now()
-            actual_entry_spread = actual_entry_spread_from_fills(db, group)
-            if actual_entry_spread is not None:
-                group.entry_spread = actual_entry_spread
-        else:
-            group.closed_at = group.closed_at or utc_now()
-            group.realized_pnl = realized_pnl_from_fills(db, group)
-            if group.realized_pnl is None:
-                group.realized_pnl = group.unrealized_pnl - group.fees - group.funding - group.swap
-            group.unrealized_pnl = 0.0
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=success_event, detail=success_detail))
-    elif mt5_order.status in PENDING_ORDER_STATUSES:
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type=pending_event, detail=detail))
-    else:
-        group.status = "manual_intervention"
-        if reduce_only:
-            group.close_reason = f"平仓 MT5 补单失败: {group.close_reason}; {mt5_order.error_message or ''}"
-        db.add(Alert(level="critical", title=failure_title, message=f"{group.symbol} 对冲组 #{group.id} {detail}; {mt5_order.error_message or ''}"))
-        db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="manual_intervention", detail=detail))
-    return True
-
-
-def _submit_order_for_group(db, group, *, platform, side, quantity, order_type, venue_symbol, reduce_only=False) -> Order:
-    """提交订单到执行网关并记录到数据库。"""
-    order = Order(hedge_group_id=group.id, platform=platform, symbol=group.symbol, side=side, quantity=quantity, order_type=order_type, reduce_only=reduce_only, status="new")
-    db.add(order)
-    db.flush()
-    adapter = _adapter_for_order(platform, group)
-    gateway = build_execution_gateway(adapter)
-    result = gateway.submit_order(LegOrderIntent(platform=platform, symbol=group.symbol, side=side, quantity=quantity, venue_symbol=venue_symbol, order_type=order_type, reduce_only=reduce_only, hedge_group_id=group.id))
-    order.status = result.adapter_result.status
-    order.external_order_id = result.adapter_result.external_order_id
-    order.price = result.adapter_result.average_price or None
-    order.error_message = result.adapter_result.error_message
-    for fill_event in result.fill_events:
-        db.add(Fill(order_id=order.id, platform=fill_event.platform, symbol=fill_event.symbol, side=fill_event.side, quantity=fill_event.quantity, price=fill_event.price, fee=fill_event.fee))
-    return order
-
-
-def _submit_compensation_order(db, group, filled_order, mapping) -> Order:
-    """提交反向冲销补偿订单。"""
-    side = "sell" if filled_order.side == "buy" else "buy"
-    quantity = _order_fill_quantity(db, filled_order.id) or filled_order.quantity
-    venue_symbol = _venue_symbol_for_order(group, filled_order, mapping)
-    return _submit_order_for_group(db, group, platform=filled_order.platform, side=side, quantity=quantity, order_type="market", venue_symbol=venue_symbol, reduce_only=True)
-
-
-def _venue_symbol_for_order(group, order, mapping) -> str:
-    """根据订单平台和品种映射确定外部品种名。"""
-    if not mapping:
-        return order.symbol
-    if order.platform == mapping.leg_b_venue or order.platform == "mt5":
-        return mapping.mt5_symbol
-    if order.platform == mapping.leg_a_venue or order.platform == "hyperliquid":
-        return mapping.leg_a_venue_symbol
-    return group.symbol
 
 
 def _escalate_stale_unreconstructable_group(db, group, orders) -> bool:
@@ -600,9 +417,8 @@ def _escalate_stale_unreconstructable_group(db, group, orders) -> bool:
     ]
     if not stale_orders:
         return False
-    canceled = _cancel_pending_orders(group, stale_orders)
     detail = "; ".join(f"{order.platform}:{order.external_order_id}:{order.error_message}" for order in stale_orders)
-    suffix = f"外部订单状态超过 {stale_seconds}s 不可重建: {detail}; 已尝试撤销: {', '.join(canceled) or '无可撤订单'}"
+    suffix = f"外部订单状态超过 {stale_seconds}s 不可重建: {detail}; 禁止旧对账器自动撤单，请通过恢复 Intent 处理"
     group.status = "manual_intervention"
     if group.close_reason:
         group.close_reason = f"{group.close_reason}; {suffix}"
@@ -618,31 +434,29 @@ def _escalate_stale_unreconstructable_group(db, group, orders) -> bool:
 # 辅助函数
 # ---------------------------------------------------------------------------
 
-def _adapter_for_order(platform: str, group: HedgeGroup):
-    """根据平台和对冲组执行模式构建适配器。"""
-    live = group.execution_mode == "live"
-    simulated = group.execution_mode == "paper"
-    if platform == "mt5":
-        return MT5Adapter(live=live, demo=simulated)
-    adapter = HyperliquidAdapter(live=live)
-    setattr(adapter, "simulated", simulated)
-    return adapter
+def _venue_symbol_for_order(db: Session, group: HedgeGroup, order: Order) -> str:
+    """把业务组合品种转换为交易所实际品种。"""
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
+    if mapping is None:
+        return order.symbol
+    if str(mapping.leg_a_venue or "").lower() == order.platform:
+        return str(mapping.leg_a_venue_symbol or order.symbol)
+    if str(mapping.leg_b_venue or "").lower() == order.platform:
+        return str(mapping.mt5_symbol or order.symbol)
+    return order.symbol
 
 
-def _cancel_pending_orders(group: HedgeGroup, orders) -> list[str]:
-    """尝试撤销 pending 状态的订单。"""
-    canceled: list[str] = []
-    for order in orders:
-        if order.status not in PENDING_ORDER_STATUSES or not order.external_order_id:
-            continue
-        adapter = _adapter_for_order(order.platform, group)
-        gateway = build_execution_gateway(adapter)
-        if gateway.cancel_order(order.platform, order.external_order_id):
-            order.status = "canceled"
-            canceled.append(f"{order.platform}:{order.external_order_id}")
-        else:
-            order.error_message = "自动撤销未成交腿失败"
-    return canceled
+def _venue_position_side(item: VenuePosition) -> str:
+    """把统一仓位方向转换为旧数据库展示字段。"""
+    if item.position_side == PositionSide.LONG:
+        return "long"
+    if item.position_side == PositionSide.SHORT:
+        return "short"
+    signed = item.raw.get("positionAmt", item.raw.get("szi", item.quantity))
+    try:
+        return "short" if float(signed) < 0 else "long"
+    except (TypeError, ValueError):
+        return "long"
 
 
 def _residual_positions_for_group(db: Session, group: HedgeGroup) -> list[Position]:

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Empty, Table, Tag, message } from 'antd';
+import { Button, Card, Empty, Popconfirm, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { api } from '../api/client';
 import { EllipsisCell } from '../components/EllipsisCell';
@@ -8,6 +8,7 @@ import { usePageStream } from '../hooks/useLiveStream';
 import { fmtAdaptive, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
 import { venueColor, venueLabel } from '../utils/venues';
+import { QueryErrorAlert } from '../components/QueryErrorAlert';
 
 function platformTag(platform?: string) {
   return <Tag color={venueColor(platform)}>{venueLabel(platform)}</Tag>;
@@ -22,7 +23,7 @@ function sideTag(side?: string) {
 export function PositionsPage() {
   const queryClient = useQueryClient();
   const streamStatus = usePageStream('positions');
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['positions'], queryFn: async () => (await api.get('/positions')).data });
   const adopt = useMutation({
@@ -44,12 +45,13 @@ export function PositionsPage() {
     { title: '当前价', dataIndex: 'mark_price', render: fmtMoney },
     { title: '未实现盈亏', dataIndex: 'unrealized_pnl', align: 'right', render: (v) => <span style={{ color: fmtPnlColor(v) }}>{fmtPnlSigned(v)}</span> },
     { title: '强平价', dataIndex: 'liquidation_price', render: (v) => (v == null ? '-' : fmtMoney(v)) },
-    { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Button size="small" loading={adopt.isPending} disabled={!!row.hedge_group_id || row.adoptable === false || typeof row.id !== 'number'} onClick={() => adopt.mutate(row.id)}>接管</Button> }
+    { title: '操作', fixed: 'right', width: 100, render: (_, row) => <Popconfirm title={`接管 ${row.platform} ${row.symbol} 仓位？`} description={`方向 ${row.side}，数量 ${row.quantity}。接管后将创建人工介入对冲组。`} okText="确认接管" cancelText="取消" onConfirm={() => adopt.mutate(row.id)}><Button size="small" loading={adopt.isPending && adopt.variables === row.id} disabled={!!row.hedge_group_id || row.adoptable === false || typeof row.id !== 'number' || (adopt.isPending && adopt.variables !== row.id)}>接管</Button></Popconfirm> }
   ];
   const rows = query.data || [];
   return (
     <div className="page-fill page-stack positions-page">
       {contextHolder}
+      <QueryErrorAlert error={query.error} onRetry={() => query.refetch()} title="仓位加载失败" />
       <Card title="仓位" className="positions-card fill-card"><Table rowKey="id" columns={columns} dataSource={rows} loading={query.isLoading} tableLayout="fixed" scroll={tableScrollAutoY(900, rows.length, 'calc(100vh - 314px)', 8)} pagination={{ pageSize: 10, size: 'small' }} locale={{ emptyText: <Empty description="暂无仓位" /> }} /></Card>
     </div>
   );

@@ -11,7 +11,7 @@ CrossHedge 配置系统
 - ScannerSettings    —— 扫描器调度间隔
 - HyperliquidSettings —— Hyperliquid 交易所专属配置
 - MT5Settings        —— MetaTrader 5 终端连接与交易参数
-- NautilusSettings   —— NautilusTrader 可选组件配置
+- VenueSettings      —— 原生交易所运行时配置
 - Settings           —— 根配置，聚合上述所有子配置
 
 环境变量映射
@@ -129,8 +129,6 @@ class ScannerSettings:
     interval_seconds: int = 15
     # 主扫描循环间隔 / 毫秒，>0 时覆盖 interval_seconds（SCANNER_INTERVAL_MS）
     interval_ms: int = 0
-    # 候选扫描间隔 / 秒（CANDIDATE_INTERVAL_SECONDS）
-    candidate_interval_seconds: int = 5
     # 状态持久化间隔 / 毫秒（SCAN_PERSIST_INTERVAL_MS）
     persist_interval_ms: int = 1000
     # 执行维护间隔 / 毫秒（EXECUTION_MAINTENANCE_INTERVAL_MS）
@@ -149,8 +147,6 @@ class HyperliquidSettings:
     info_url: str = HYPERLIQUID_MAINNET_INFO_URL
     # WebSocket 端点（HYPERLIQUID_WS_URL）
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
-    # 行情数据源：native / nautilus（HYPERLIQUID_MARKET_DATA_SOURCE）
-    market_data_source: str = "native"
     # 是否启用 L2Book 快速通道（HYPERLIQUID_L2BOOK_FAST_ENABLED）
     l2book_fast_enabled: bool = True
     # 默认 Taker 费率（HYPERLIQUID_DEFAULT_TAKER_FEE_RATE）
@@ -159,8 +155,6 @@ class HyperliquidSettings:
     default_maker_fee_rate: float = 0.00015
     # 默认最小名义价值（HYPERLIQUID_DEFAULT_MIN_NOTIONAL）
     default_min_notional: float = 10.0
-    # 往返费率倍数（HYPERLIQUID_FEE_ROUND_TRIPS）
-    fee_round_trips: float = 2.0
     # 钱包地址（HYPERLIQUID_ACCOUNT_ADDRESS）
     account_address: str = ""
     # API 签名密钥（HYPERLIQUID_SECRET_KEY）
@@ -189,14 +183,8 @@ class MT5Settings:
     order_deviation_points: int = 20
     # EA Magic Number（MT5_ORDER_MAGIC）
     order_magic: int = 260620
-    # 默认佣金费率（MT5_DEFAULT_COMMISSION_RATE）
-    default_commission_rate: float = 0.0
-    # 点差返佣费率（MT5_SPREAD_REBATE_RATE）
-    spread_rebate_rate: float = 0.20
-    # 是否无隔夜利息（MT5_SWAP_FREE）
-    swap_free: bool = True
-    # 会话缓存 TTL / 秒（MT5_SESSION_CACHE_TTL_SECONDS）
-    session_cache_ttl_seconds: int = 30
+    # 活跃订单轮询间隔 / 毫秒（MT5_ORDER_POLL_INTERVAL_MS）
+    order_poll_interval_ms: int = 75
     # 会话 Tick 过期阈值 / 秒（MT5_SESSION_TICK_STALE_SECONDS）
     session_tick_stale_seconds: int = 120
     # 交易能力缓存 TTL / 毫秒（MT5_TRADABILITY_CACHE_TTL_MS）
@@ -238,21 +226,15 @@ class PaperLiveSettings:
 
 
 @dataclass
-class NautilusSettings:
-    """NautilusTrader 可选组件配置 —— 启用开关、行情轮询、venue 与凭证"""
+class VenueSettings:
+    """原生交易所运行时配置。"""
 
-    # 是否启用 NautilusTrader（NAUTILUS_ENABLED）
-    enabled: bool = False
-    # 是否启用只读同步模式（NAUTILUS_READ_ONLY_SYNC_ENABLED）
-    read_only_sync_enabled: bool = True
-    # 行情轮询间隔 / 毫秒（NAUTILUS_QUOTE_POLL_INTERVAL_MS）
-    quote_poll_interval_ms: int = 1000
-    # 允许的 venue 列表，逗号分隔（NAUTILUS_ALLOWED_VENUES）
-    allowed_venues: str = "binance,okx,bybit"
-    # 运行环境：sandbox / live（NAUTILUS_ENVIRONMENT）
-    environment: str = "sandbox"
-    # 凭证 JSON 字符串（NAUTILUS_CREDENTIALS_JSON）
-    credentials_json: str = "{}"
+    # 连接器启动超时 / 秒（VENUE_STARTUP_TIMEOUT_SECONDS）
+    startup_timeout_seconds: float = 30.0
+    # 品种、费率与资金费定时刷新间隔 / 秒（VENUE_INSTRUMENT_REFRESH_SECONDS）
+    instrument_refresh_seconds: int = 21600
+    # 账户快照兜底对账间隔 / 秒（VENUE_ACCOUNT_RECONCILE_SECONDS）
+    account_reconcile_seconds: int = 60
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +274,6 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     # --- ScannerSettings ---
     "SCANNER_INTERVAL_SECONDS":          ("scanner", "interval_seconds"),
     "SCANNER_INTERVAL_MS":               ("scanner", "interval_ms"),
-    "CANDIDATE_INTERVAL_SECONDS":        ("scanner", "candidate_interval_seconds"),
     "SCAN_PERSIST_INTERVAL_MS":          ("scanner", "persist_interval_ms"),
     "EXECUTION_MAINTENANCE_INTERVAL_MS": ("scanner", "execution_maintenance_interval_ms"),
     "SPREAD_HISTORY_INTERVAL_SECONDS":   ("scanner", "spread_history_interval_seconds"),
@@ -300,12 +281,10 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     # --- HyperliquidSettings ---
     "HYPERLIQUID_INFO_URL":              ("hyperliquid", "info_url"),
     "HYPERLIQUID_WS_URL":                ("hyperliquid", "ws_url"),
-    "HYPERLIQUID_MARKET_DATA_SOURCE":    ("hyperliquid", "market_data_source"),
     "HYPERLIQUID_L2BOOK_FAST_ENABLED":   ("hyperliquid", "l2book_fast_enabled"),
     "HYPERLIQUID_DEFAULT_TAKER_FEE_RATE": ("hyperliquid", "default_taker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MAKER_FEE_RATE": ("hyperliquid", "default_maker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MIN_NOTIONAL":  ("hyperliquid", "default_min_notional"),
-    "HYPERLIQUID_FEE_ROUND_TRIPS":       ("hyperliquid", "fee_round_trips"),
     "HYPERLIQUID_ACCOUNT_ADDRESS":       ("hyperliquid", "account_address"),
     "HYPERLIQUID_SECRET_KEY":            ("hyperliquid", "secret_key"),
     "HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED": ("hyperliquid", "paper_live_order_enabled"),
@@ -318,10 +297,7 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "MT5_DEMO_ORDER_ENABLED":            ("mt5", "demo_order_enabled"),
     "MT5_ORDER_DEVIATION_POINTS":        ("mt5", "order_deviation_points"),
     "MT5_ORDER_MAGIC":                   ("mt5", "order_magic"),
-    "MT5_DEFAULT_COMMISSION_RATE":       ("mt5", "default_commission_rate"),
-    "MT5_SPREAD_REBATE_RATE":            ("mt5", "spread_rebate_rate"),
-    "MT5_SWAP_FREE":                     ("mt5", "swap_free"),
-    "MT5_SESSION_CACHE_TTL_SECONDS":     ("mt5", "session_cache_ttl_seconds"),
+    "MT5_ORDER_POLL_INTERVAL_MS":        ("mt5", "order_poll_interval_ms"),
     "MT5_SESSION_TICK_STALE_SECONDS":    ("mt5", "session_tick_stale_seconds"),
     "MT5_TRADABILITY_CACHE_TTL_MS":      ("mt5", "tradability_cache_ttl_ms"),
     "MT5_TRADABILITY_REFRESH_SECONDS":   ("mt5", "tradability_refresh_seconds"),
@@ -337,13 +313,10 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "PAPER_LIVE_PROBE_ENABLED":          ("paper_live", "probe_enabled"),
     "PAPER_LIVE_PROBE_VENUES":           ("paper_live", "probe_venues"),
     "PAPER_LIVE_PARALLEL_EXECUTION":     ("paper_live", "parallel_execution"),
-    # --- NautilusSettings ---
-    "NAUTILUS_ENABLED":                  ("nautilus", "enabled"),
-    "NAUTILUS_READ_ONLY_SYNC_ENABLED":   ("nautilus", "read_only_sync_enabled"),
-    "NAUTILUS_QUOTE_POLL_INTERVAL_MS":   ("nautilus", "quote_poll_interval_ms"),
-    "NAUTILUS_ALLOWED_VENUES":           ("nautilus", "allowed_venues"),
-    "NAUTILUS_ENVIRONMENT":              ("nautilus", "environment"),
-    "NAUTILUS_CREDENTIALS_JSON":         ("nautilus", "credentials_json"),
+    # --- VenueSettings ---
+    "VENUE_STARTUP_TIMEOUT_SECONDS":     ("venues", "startup_timeout_seconds"),
+    "VENUE_INSTRUMENT_REFRESH_SECONDS":  ("venues", "instrument_refresh_seconds"),
+    "VENUE_ACCOUNT_RECONCILE_SECONDS":   ("venues", "account_reconcile_seconds"),
     # --- 执行对账 ---
     "EXECUTION_RECONCILE_PENDING_STALE_SECONDS": ("execution", "reconcile_pending_stale_seconds"),
 }
@@ -390,8 +363,8 @@ class Settings:
     cost: CostSettings = field(default_factory=CostSettings)
     # Paper-live 探针配置
     paper_live: PaperLiveSettings = field(default_factory=PaperLiveSettings)
-    # NautilusTrader 可选配置
-    nautilus: NautilusSettings = field(default_factory=NautilusSettings)
+    # 原生交易所运行时配置
+    venues: VenueSettings = field(default_factory=VenueSettings)
     # 通用执行参数
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
 
@@ -434,6 +407,32 @@ def _get_sub_settings(settings: Settings) -> dict[str, Any]:
         if hasattr(sub, "__dataclass_fields__"):
             result[f.name] = sub
     return result
+
+
+def _validate_settings(settings: Settings) -> None:
+    """在启动阶段校验关键枚举和时间参数，避免无效配置进入运行期。"""
+    if settings.security.default_execution_mode not in {"dry_run", "paper", "live"}:
+        raise ValueError("DEFAULT_EXECUTION_MODE 必须是 dry_run、paper 或 live")
+    if settings.quote.source_mode not in {"paper", "live"}:
+        raise ValueError("QUOTE_SOURCE_MODE 必须是 paper 或 live")
+    positive_values = {
+        "PAPER_QUOTE_INTERVAL_MS": settings.quote.paper_quote_interval_ms,
+        "MT5_QUOTE_POLL_INTERVAL_MS": settings.quote.mt5_quote_poll_interval_ms,
+        "LOOSE_QUOTE_SYNC_MS": settings.quote.loose_sync_ms,
+        "STRICT_QUOTE_SYNC_MS": settings.quote.strict_sync_ms,
+        "QUOTE_STALE_MS": settings.quote.stale_ms,
+        "STREAM_INTERVAL_MS": settings.quote.stream_interval_ms,
+        "SCAN_PERSIST_INTERVAL_MS": settings.scanner.persist_interval_ms,
+        "EXECUTION_MAINTENANCE_INTERVAL_MS": settings.scanner.execution_maintenance_interval_ms,
+        "SPREAD_HISTORY_INTERVAL_SECONDS": settings.scanner.spread_history_interval_seconds,
+        "SPREAD_BUCKET_SECONDS": settings.scanner.spread_bucket_seconds,
+        "COST_CACHE_TTL_SECONDS": settings.cost.cost_cache_ttl_seconds,
+    }
+    invalid = [name for name, value in positive_values.items() if value <= 0]
+    if invalid:
+        raise ValueError(f"配置必须大于 0: {', '.join(invalid)}")
+    if settings.quote.strict_sync_ms > settings.quote.loose_sync_ms:
+        raise ValueError("STRICT_QUOTE_SYNC_MS 不能大于 LOOSE_QUOTE_SYNC_MS")
 
 
 # ---------------------------------------------------------------------------
@@ -534,4 +533,6 @@ def get_settings() -> Settings:
         sub_cls = type(sub_map[parent_name])
         init_kwargs[parent_name] = sub_cls(**child_overrides)
 
-    return Settings(**init_kwargs)
+    settings = Settings(**init_kwargs)
+    _validate_settings(settings)
+    return settings

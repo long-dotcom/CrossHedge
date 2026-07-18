@@ -30,7 +30,7 @@ if (-not $SkipBackend) {
     Write-Host "Installing backend packages..."
     & $VenvPython -m pip install --upgrade pip setuptools wheel
     & $VenvPython -m pip install -r $Requirements
-    & $VenvPython -m pip show nautilus_trader MetaTrader5
+    & $VenvPython -m pip show MetaTrader5 hyperliquid-python-sdk
 }
 
 if (-not $SkipFrontend) {

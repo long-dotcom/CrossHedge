@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.models import (
     ArbitrageOpportunity, Base, SpreadCurrent, SpreadDirectionCurrent,
-    StrategySetting, SymbolMapping,
+    RiskSetting, StrategySetting, SymbolMapping,
 )
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
@@ -23,7 +23,8 @@ from app.strategy.live_costs import _estimate_mt5_swap_cost, _hyperliquid_effect
 from app.strategy.signals import evaluate_signal
 from app.strategy.spread_math import spreads_for_direction
 from app.risk.engine import pre_trade_check
-from app.api import router as api_router
+from app.api import markets as markets_api
+from app.api import settings_api
 from app.schemas import SymbolMappingIn
 from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
 
@@ -70,18 +71,13 @@ def test_hyperliquid_maker_open_taker_close_fee() -> None:
     )
     assert cost.leg_a_fee == 0.6
 
-def test_live_market_data_starts_hyperliquid_ws_without_http_polling(monkeypatch) -> None:
+def test_live_market_data_starts_single_native_projection_thread(monkeypatch) -> None:
     manager = MarketDataManager()
-    started = []
-
-    monkeypatch.setattr(
-        "app.workers.market_data.get_settings",
-        lambda: SimpleNamespace(quote_source_mode="live"),
-    )
-    monkeypatch.setattr(manager, "_start_thread", lambda name, target: started.append(name))
+    monkeypatch.setattr(manager, "_run", lambda: None)
     try:
         manager.start()
-        assert started == ["hyperliquid-ws", "mt5-polling", "nautilus-polling"]
+        assert manager._thread is not None
+        assert manager._thread.name == "native-market-data"
     finally:
         manager.stop()
 
@@ -106,7 +102,7 @@ def test_delete_symbol_mapping_clears_current_scan_state() -> None:
     db.commit()
     scan_state_store.update([{"symbol": "BTC"}], [{"symbol": "BTC", "status": "candidate"}])
 
-    api_router.delete_symbol_mapping(mapping.id, SimpleNamespace(id=1), db)
+    settings_api.delete_symbol_mapping(mapping.id, SimpleNamespace(id=1), db)
 
     state = scan_state_store.snapshot()
     assert state["spreads"] == []
@@ -173,7 +169,11 @@ symbols:
 """,
         encoding="utf-8",
     )
-    monkeypatch.setattr(symbol_module, "get_settings", lambda: type("Settings", (), {"symbol_mapping_path": str(mapping_file)})())
+    monkeypatch.setattr(
+        symbol_module,
+        "get_settings",
+        lambda: SimpleNamespace(security=SimpleNamespace(symbol_mapping_path=str(mapping_file))),
+    )
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -285,7 +285,7 @@ def test_create_current_symbol_opportunity_uses_best_executable_direction() -> N
     )
     db.commit()
 
-    opportunity = api_router._create_current_symbol_opportunity(db, "btc", "tester")
+    opportunity = markets_api._create_current_symbol_opportunity(db, "btc", "tester")
 
     assert opportunity.direction == "long_leg_b_short_leg_a"
     assert opportunity.status == "executable"
@@ -471,7 +471,7 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     )
     monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
     monkeypatch.setattr(scanner_module, "mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
-    monkeypatch.setattr(scanner_module, "leg_a_cost_inputs", lambda symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0))
+    monkeypatch.setattr(scanner_module, "venue_cost_inputs", lambda venue, symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0, funding_interval_hours=1))
     monkeypatch.setattr(scanner_module, "mt5_cost_inputs", lambda *args, **kwargs: SimpleNamespace(source="test", commission_rate=0, swap_cost=0))
     monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
 

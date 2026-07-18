@@ -1,12 +1,13 @@
 import { createContext, useContext, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { StreamStatusLight } from './StreamStatusLight';
+import type { StreamStatus } from '../hooks/useLiveStream';
 
-const HeaderStreamStatusValueContext = createContext<boolean | null>(null);
-const HeaderStreamStatusSetterContext = createContext<((online: boolean | null) => void) | null>(null);
+const HeaderStreamStatusValueContext = createContext<StreamStatus | null>(null);
+const HeaderStreamStatusSetterContext = createContext<((status: StreamStatus | null) => void) | null>(null);
 
 export function HeaderStreamStatusProvider({ children }: { children: ReactNode }) {
-  const [online, setOnline] = useState<boolean | null>(null);
+  const [online, setOnline] = useState<StreamStatus | null>(null);
   return (
     <HeaderStreamStatusSetterContext.Provider value={setOnline}>
       <HeaderStreamStatusValueContext.Provider value={online}>{children}</HeaderStreamStatusValueContext.Provider>
@@ -17,15 +18,15 @@ export function HeaderStreamStatusProvider({ children }: { children: ReactNode }
 export function HeaderStreamStatus() {
   const online = useContext(HeaderStreamStatusValueContext);
   if (online === null) return null;
-  return <StreamStatusLight online={online} />;
+  return <StreamStatusLight status={online} />;
 }
 
-export function useHeaderStreamStatus(online: boolean | null) {
+export function useHeaderStreamStatus(status: StreamStatus | boolean | null) {
   const setOnline = useContext(HeaderStreamStatusSetterContext);
 
   useEffect(() => {
     if (!setOnline) return;
-    setOnline(online);
+    setOnline(typeof status === 'boolean' ? { online: status, lastPushSeconds: null, latencySeconds: null } : status);
     return () => setOnline(null);
-  }, [setOnline, online]);
+  }, [setOnline, status]);
 }

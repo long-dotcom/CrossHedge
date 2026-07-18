@@ -12,6 +12,7 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RunDir = Join-Path $Root ".run"
 $PidFiles = @(
     (Join-Path $RunDir "backend.pid"),
+    (Join-Path $RunDir "execution-worker.pid"),
     (Join-Path $RunDir "frontend.pid")
 )
 

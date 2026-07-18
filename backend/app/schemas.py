@@ -96,6 +96,22 @@ class RiskSettingsIn(BaseModel):
     max_slippage_bps: float
     max_market_age_seconds: int
     max_api_errors: int
+    max_total_open_notional: float = 10000.0
+    max_global_open_groups: int = 3
+    max_pending_open_groups: int = 2
+    max_daily_loss: float = 0.0
+
+    @model_validator(mode="after")
+    def validate_capacity_limits(self) -> "RiskSettingsIn":
+        if self.max_order_notional <= 0 or self.max_total_open_notional <= 0:
+            raise ValueError("单笔和全局累计名义金额上限必须大于 0")
+        if self.max_global_open_groups < 1 or self.max_pending_open_groups < 1:
+            raise ValueError("全局未平和在途开仓组上限必须至少为 1")
+        if self.max_pending_open_groups > self.max_global_open_groups:
+            raise ValueError("在途开仓组上限不能大于全局未平对冲组上限")
+        if self.max_daily_loss < 0:
+            raise ValueError("单日亏损上限不能为负数")
+        return self
 
 
 class RiskModeIn(BaseModel):
@@ -128,7 +144,7 @@ class ExchangeCredentialIn(BaseModel):
     """交易所 API 凭据创建/更新请求体。"""
     venue: str
     display_name: str = ""
-    environment: str = "sandbox"
+    environment: str = "live"
     enabled: bool = False
     read_only: bool = True
     credentials: dict[str, Any] = {}
@@ -147,6 +163,12 @@ class CloseHedgeGroupIn(BaseModel):
     """关闭对冲组请求体。"""
     reason: str = "manual"
     force: bool = False
+
+
+class RecoverHedgeGroupIn(BaseModel):
+    """异常对冲组恢复请求；confirmation 防止误触真实回平。"""
+    reason: str = "manual recovery flatten"
+    confirmation: str
 
 
 class AdoptPositionIn(BaseModel):
@@ -173,6 +195,17 @@ class VenueProbeTestIn(BaseModel):
     @field_validator("symbol", "venue", "side", "confirmation")
     @classmethod
     def strip_probe_text(cls, value: str) -> str:
+        return value.strip()
+
+
+class ReplayExecutionIntentIn(BaseModel):
+    """从不可变事件重建执行投影的显式确认请求。"""
+
+    confirmation: str
+
+    @field_validator("confirmation")
+    @classmethod
+    def strip_replay_confirmation(cls, value: str) -> str:
         return value.strip()
 
 
@@ -205,7 +238,21 @@ class SymbolMappingIn(BaseModel):
     mt5_min_base_size: float = 0.0
     leg_a_min_base_size: float = 0.0
     leg_a_min_notional: float = 10.0
-    execution_style: str = "taker_taker"
+    target_notional: float = 1000.0
+    max_open_notional: float = 5000.0
+    max_open_groups: int = 1
+    open_cooldown_seconds: int = 30
+    max_daily_opens: int = 0
+    max_daily_open_notional: float = 0.0
+    allow_opposite_direction: bool = False
+    max_holding_minutes: int = 240
+    execution_style: str = "simultaneous_market"
+    maker_leg: str = "a"
+    maker_offset_bps: float = 1.0
+    maker_order_ttl_seconds: int = 3
+    maker_unfilled_action: str = "cancel"
+    leg_a_close_order_type: str = "market"
+    leg_b_close_order_type: str = "market"
     hl_open_order_type: str = "market"
     hl_close_order_type: str = "market"
     hl_post_only: bool = False
@@ -248,6 +295,10 @@ class SymbolMappingIn(BaseModel):
         """规范化双腿 venue 并校验 Hyperliquid symbol 格式。"""
         self.leg_a_venue = (self.leg_a_venue or "").strip().lower()
         self.leg_b_venue = (self.leg_b_venue or "mt5").strip().lower()
+        supported_venues = {"hyperliquid", "mt5", "binance"}
+        unsupported = {self.leg_a_venue, self.leg_b_venue} - supported_venues
+        if unsupported:
+            raise ValueError(f"当前仅支持交易场所: {', '.join(sorted(supported_venues))}")
         self.leg_a_symbol = (self.leg_a_symbol or self.leg_a_venue_symbol).strip()
         self.leg_b_symbol = (self.leg_b_symbol or self.mt5_symbol).strip()
         if self.leg_a_venue == self.leg_b_venue:
@@ -256,6 +307,54 @@ class SymbolMappingIn(BaseModel):
             raise ValueError("两条腿都必须填写 venue symbol")
         if not self.leg_a_venue_symbol.strip():
             raise ValueError("leg_a_venue_symbol 不能为空")
+        # 历史字段名仍保留在数据库中，但语义统一为 Leg A / Leg B。
+        # 执行策略是最高层选择，保存时同步订单类型，避免成本估算与真实下单方式脱节。
+        legacy_styles = {
+            "taker_taker": "simultaneous_market",
+            "hyper_maker_mt5_taker": "maker_then_market",
+        }
+        self.execution_style = legacy_styles.get(self.execution_style, self.execution_style)
+        if self.execution_style not in {"simultaneous_market", "maker_then_market"}:
+            raise ValueError("执行模式必须是 simultaneous_market 或 maker_then_market")
+        self.maker_leg = (self.maker_leg or "a").strip().lower()
+        if self.maker_leg not in {"a", "b"}:
+            raise ValueError("Maker 腿必须是 a 或 b")
+        maker_venue = self.leg_a_venue if self.maker_leg == "a" else self.leg_b_venue
+        if self.execution_style == "maker_then_market" and maker_venue == "mt5":
+            raise ValueError("MT5 当前仅支持市价单，不能选作 Maker 腿")
+        if self.maker_unfilled_action not in {"cancel", "market_fallback"}:
+            raise ValueError("Maker 未成交动作必须是 cancel 或 market_fallback")
+        if self.execution_style == "maker_then_market" and self.maker_order_ttl_seconds < 1:
+            raise ValueError("Maker 挂单 TTL 必须至少为 1 秒")
+        if self.maker_offset_bps < 0:
+            raise ValueError("Maker 挂单偏移不能为负数")
+        if self.target_notional <= 0:
+            raise ValueError("单次目标名义金额必须大于 0")
+        if self.max_open_notional < self.target_notional:
+            raise ValueError("单品种累计名义金额上限不能小于单次目标名义金额")
+        if self.max_open_groups < 1:
+            raise ValueError("单品种未平对冲组上限必须至少为 1")
+        if self.open_cooldown_seconds < 0 or self.max_daily_opens < 0 or self.max_daily_open_notional < 0:
+            raise ValueError("开仓冷却和每日限额不能为负数")
+        if self.max_holding_minutes < 1:
+            raise ValueError("最大持仓时间必须至少为 1 分钟")
+        if self.execution_style == "simultaneous_market":
+            self.hl_open_order_type = "market"
+            self.mt5_open_order_type = "market"
+            self.hl_post_only = False
+        elif self.execution_style == "maker_then_market":
+            self.hl_open_order_type = "limit" if self.maker_leg == "a" else "market"
+            self.mt5_open_order_type = "limit" if self.maker_leg == "b" else "market"
+            self.hl_post_only = True
+        # 同步历史字段，保证旧版本进程滚动升级期间仍能读取一致配置。
+        self.hl_maker_offset_bps = self.maker_offset_bps
+        self.hl_order_ttl_seconds = self.maker_order_ttl_seconds
+        self.hl_unfilled_action = "taker_fallback" if self.maker_unfilled_action == "market_fallback" else "cancel"
+        # 平仓跟随开仓执行模式；Maker 平仓价格由执行时实时盘口生成。
+        self.leg_a_close_order_type = self.hl_open_order_type
+        self.leg_b_close_order_type = self.mt5_open_order_type
+        self.hl_close_order_type = self.leg_a_close_order_type
+        self.mt5_close_order_type = self.leg_b_close_order_type
         if self.leg_a_venue == "hyperliquid" and not re.match(
             r'^[A-Z][A-Z0-9]*(-[A-Z0-9]+)?$', self.leg_a_venue_symbol
         ) and ":" not in self.leg_a_venue_symbol:

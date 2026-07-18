@@ -116,7 +116,7 @@ def funding_history(db: Session, symbol: str, range_value: str, bucket: str) -> 
                 source_error = str(exc)
         else:
             supported = False
-            source_error = "缺少已启用的 Binance 交易所配置，无法通过 Nautilus 读取资金费历史"
+            source_error = "缺少已启用的 Binance 交易所配置，无法读取资金费历史"
     else:
         source_error = "当前品种映射没有已支持 funding 的永续交易所腿，资金费历史暂不支持该 venue 组合"
 
@@ -190,7 +190,7 @@ def fetch_funding_history(coin: str, start_ms: int, end_ms: int) -> list[Funding
 
 
 def fetch_binance_funding_history(credential: ExchangeCredential, symbol: str, start_ms: int, end_ms: int) -> list[FundingPoint]:
-    """从 Binance（通过 Nautilus）拉取资金费历史。
+    """从 Binance 原生 REST 接口拉取资金费历史。
 
     参数:
         credential: 交易所凭证行

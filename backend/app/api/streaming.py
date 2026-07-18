@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -23,7 +25,8 @@ from app.accounts.sync import latest_account_snapshots
 from app.api.deps import (
     _enabled_symbol_names,
     _leg_metadata_for_symbol,
-    _row_with_leg_metadata,
+    _rows_with_leg_metadata,
+    _leg_metadata_by_symbol,
     as_dict,
     bearer_token_from_request,
     json_default,
@@ -50,6 +53,11 @@ from app.market.scan_state import scan_state_store
 
 router = APIRouter()
 
+# 同一 channel/分页参数的所有客户端共享序列化快照，避免每个 SSE 连接重复查库。
+_snapshot_cache: dict[str, tuple[float, str]] = {}
+_snapshot_locks: dict[str, threading.Lock] = {}
+_snapshot_locks_guard = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # 内部辅助：各 channel 的 payload 组装
@@ -62,11 +70,13 @@ def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> di
     query = db.query(HedgeGroup)
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
+    metadata = _leg_metadata_by_symbol(db, {row.symbol for row in rows})
     active_by_id = {s.id: s for s in hedge_pool.snapshot_groups()}
     items = []
     for row in rows:
         snapshot = active_by_id.get(row.id)
-        items.append(_hedge_group_payload(db, snapshot if snapshot and snapshot.symbol == row.symbol else row))
+        selected = snapshot if snapshot and snapshot.symbol == row.symbol else row
+        items.append(_hedge_group_payload(db, selected, metadata.get(row.symbol.upper())))
     return {"total": total, "page": page, "page_size": page_size, "items": items}
 
 
@@ -87,7 +97,7 @@ def _orders_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str
     query = db.query(Order)
     total = query.count()
     rows = query.order_by(desc(Order.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "page": page, "page_size": page_size, "items": [_row_with_leg_metadata(db, r) for r in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": _rows_with_leg_metadata(db, rows)}
 
 
 def _fills_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
@@ -95,7 +105,7 @@ def _fills_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str,
     query = db.query(Fill)
     total = query.count()
     rows = query.order_by(desc(Fill.created_at)).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "page": page, "page_size": page_size, "items": [_row_with_leg_metadata(db, r) for r in rows]}
+    return {"total": total, "page": page, "page_size": page_size, "items": _rows_with_leg_metadata(db, rows)}
 
 
 def _logs_payload(db: Session, page: int = 1, page_size: int = 20, level: str = "", keyword: str = "") -> dict[str, Any]:
@@ -213,8 +223,8 @@ def _stream_snapshot(
     if state["ready"]:
         spread_rows = [r for r in state["spreads"] if str(r.get("symbol", "")).upper() in enabled_symbols]
         opportunity_rows = [r for r in state["opportunities"] if str(r.get("symbol", "")).upper() in enabled_symbols]
-        spreads_payload = {"total": len(spread_rows), "items": [_row_with_leg_metadata(db, r) for r in spread_rows]}
-        opportunities_payload = {"total": len(opportunity_rows), "items": [_row_with_leg_metadata(db, r) for r in opportunity_rows]}
+        spreads_payload = {"total": len(spread_rows), "items": _rows_with_leg_metadata(db, spread_rows)}
+        opportunities_payload = {"total": len(opportunity_rows), "items": _rows_with_leg_metadata(db, opportunity_rows)}
     else:
         spread_rows = db.query(SpreadCurrent).filter(SpreadCurrent.symbol.in_(enabled_symbols)).order_by(SpreadCurrent.symbol).all() if enabled_symbols else []
         opportunity_rows = (
@@ -229,8 +239,8 @@ def _stream_snapshot(
             if enabled_symbols
             else []
         )
-        spreads_payload = {"total": len(spread_rows), "items": [_row_with_leg_metadata(db, r) for r in spread_rows]}
-        opportunities_payload = {"total": len(opportunity_rows), "items": [_row_with_leg_metadata(db, r) for r in opportunity_rows]}
+        spreads_payload = {"total": len(spread_rows), "items": _rows_with_leg_metadata(db, spread_rows)}
+        opportunities_payload = {"total": len(opportunity_rows), "items": _rows_with_leg_metadata(db, opportunity_rows)}
 
     account_rows = latest_account_snapshots(db)
     latest_bucket = db.query(SpreadBucket).order_by(desc(SpreadBucket.id)).first()
@@ -241,6 +251,43 @@ def _stream_snapshot(
         "latest_bucket_id": latest_bucket.id if latest_bucket else 0,
         "pipeline": build_pipeline_diagnostics(db),
     }
+
+
+def _snapshot_cache_key(**params: Any) -> str:
+    """生成稳定缓存键，隔离不同 channel、分页和筛选参数。"""
+    return json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _cached_stream_event(cache_seconds: float, **params: Any) -> str:
+    """在线程中生成并缓存序列化快照；同键并发只允许一个生产者。"""
+    key = _snapshot_cache_key(**params)
+    now = time.monotonic()
+    cached = _snapshot_cache.get(key)
+    if cached and now - cached[0] < cache_seconds:
+        return cached[1]
+    with _snapshot_locks_guard:
+        lock = _snapshot_locks.setdefault(key, threading.Lock())
+    with lock:
+        now = time.monotonic()
+        cached = _snapshot_cache.get(key)
+        if cached and now - cached[0] < cache_seconds:
+            return cached[1]
+        session = SessionLocal()
+        try:
+            snapshot = _stream_snapshot(session, **params)
+            serialized = json.dumps(snapshot, default=json_default, separators=(",", ":"))
+        finally:
+            session.close()
+        stored_at = time.monotonic()
+        _snapshot_cache[key] = (stored_at, serialized)
+        # 防止恶意组合筛选参数导致缓存键和锁无限增长。
+        with _snapshot_locks_guard:
+            if len(_snapshot_cache) > 256:
+                ordered = sorted(_snapshot_cache.items(), key=lambda item: item[1][0])
+                for stale_key, _ in ordered[: len(ordered) - 256]:
+                    _snapshot_cache.pop(stale_key, None)
+                    _snapshot_locks.pop(stale_key, None)
+        return serialized
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +310,12 @@ async def stream(
     max_lag_ms: int = 2000,
 ) -> StreamingResponse:
     """SSE 实时推送端点。"""
+    page = max(int(page), 1)
+    fill_page = max(int(fill_page), 1)
+    alert_page = max(int(alert_page), 1)
+    page_size = min(max(int(page_size), 1), 100)
+    window_seconds = min(max(int(window_seconds), 1), 86400)
+    max_lag_ms = min(max(int(max_lag_ms), 1), 60000)
     # SSE 不走 Depends，手动验证 Token
     token = bearer_token_from_request(request)
     try:
@@ -279,26 +332,26 @@ async def stream(
 
     async def event_generator():
         interval = max(get_settings().quote.stream_interval_ms, 250) / 1000
+        cache_seconds = max(interval * 0.8, 0.2)
+        params = {
+            "channel": channel,
+            "page": page,
+            "page_size": page_size,
+            "fill_page": fill_page,
+            "alert_page": alert_page,
+            "symbol": symbol,
+            "window_seconds": window_seconds,
+            "threshold_bps": threshold_bps,
+            "min_move": min_move,
+            "follow_ratio": follow_ratio,
+            "max_lag_ms": max_lag_ms,
+        }
         while True:
-            session = SessionLocal()
             try:
-                event = _stream_snapshot(
-                    session,
-                    channel=channel,
-                    page=page,
-                    page_size=page_size,
-                    fill_page=fill_page,
-                    alert_page=alert_page,
-                    symbol=symbol,
-                    window_seconds=window_seconds,
-                    threshold_bps=threshold_bps,
-                    min_move=min_move,
-                    follow_ratio=follow_ratio,
-                    max_lag_ms=max_lag_ms,
-                )
-                yield f"event: snapshot\ndata: {json.dumps(event, default=json_default, separators=(',', ':'))}\n\n"
-            finally:
-                session.close()
+                serialized = await asyncio.to_thread(_cached_stream_event, cache_seconds, **params)
+                yield f"event: snapshot\ndata: {serialized}\n\n"
+            except asyncio.CancelledError:
+                break
             await asyncio.sleep(interval)
 
     return StreamingResponse(

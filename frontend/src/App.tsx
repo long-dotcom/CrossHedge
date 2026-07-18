@@ -1,19 +1,22 @@
+import { lazy, Suspense } from 'react';
+import { Spin } from 'antd';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AppLayout } from './layouts/AppLayout';
-import { LoginPage } from './pages/LoginPage';
-import { DashboardPage } from './pages/DashboardPage';
-import { SpreadAnalyticsPage } from './pages/SpreadAnalyticsPage';
-import { VenueSpreadsPage } from './pages/VenueSpreadsPage';
-import { FundingAnalyticsPage } from './pages/FundingAnalyticsPage';
-import { LeadLagPage } from './pages/LeadLagPage';
-import { PipelinePage } from './pages/PipelinePage';
-import { HedgeGroupsPage } from './pages/HedgeGroupsPage';
-import { ExecutionPage } from './pages/ExecutionPage';
-import { AccountsPage } from './pages/AccountsPage';
-import { PositionsPage } from './pages/PositionsPage';
-import { RiskPage } from './pages/RiskPage';
-import { LogsPage } from './pages/LogsPage';
-import { SettingsPage } from './pages/SettingsPage';
+
+const LoginPage = lazy(() => import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })));
+const DashboardPage = lazy(() => import('./pages/DashboardPage').then((m) => ({ default: m.DashboardPage })));
+const SpreadAnalyticsPage = lazy(() => import('./pages/SpreadAnalyticsPage').then((m) => ({ default: m.SpreadAnalyticsPage })));
+const VenueSpreadsPage = lazy(() => import('./pages/VenueSpreadsPage').then((m) => ({ default: m.VenueSpreadsPage })));
+const FundingAnalyticsPage = lazy(() => import('./pages/FundingAnalyticsPage').then((m) => ({ default: m.FundingAnalyticsPage })));
+const LeadLagPage = lazy(() => import('./pages/LeadLagPage').then((m) => ({ default: m.LeadLagPage })));
+const PipelinePage = lazy(() => import('./pages/PipelinePage').then((m) => ({ default: m.PipelinePage })));
+const HedgeGroupsPage = lazy(() => import('./pages/HedgeGroupsPage').then((m) => ({ default: m.HedgeGroupsPage })));
+const ExecutionPage = lazy(() => import('./pages/ExecutionPage').then((m) => ({ default: m.ExecutionPage })));
+const AccountsPage = lazy(() => import('./pages/AccountsPage').then((m) => ({ default: m.AccountsPage })));
+const PositionsPage = lazy(() => import('./pages/PositionsPage').then((m) => ({ default: m.PositionsPage })));
+const RiskPage = lazy(() => import('./pages/RiskPage').then((m) => ({ default: m.RiskPage })));
+const LogsPage = lazy(() => import('./pages/LogsPage').then((m) => ({ default: m.LogsPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((m) => ({ default: m.SettingsPage })));
 
 function ProtectedRoute() {
   const token = localStorage.getItem('token');
@@ -24,7 +27,7 @@ function ProtectedRoute() {
 export default function App() {
   return (
     <BrowserRouter>
-      <Routes>
+      <Suspense fallback={<div className="route-loading"><Spin size="large" tip="页面加载中" /></div>}><Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route element={<ProtectedRoute />}>
           <Route path="/" element={<DashboardPage />} />
@@ -41,7 +44,8 @@ export default function App() {
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
-      </Routes>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes></Suspense>
     </BrowserRouter>
   );
 }

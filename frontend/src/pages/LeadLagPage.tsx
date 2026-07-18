@@ -72,7 +72,7 @@ export function LeadLagPage() {
     cacheKey: leadLagQueryKey,
     enabled: Boolean(activeSymbol),
   });
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const query = useQuery({
     queryKey: leadLagQueryKey,
     enabled: Boolean(activeSymbol),

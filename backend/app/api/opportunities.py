@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
@@ -25,7 +25,7 @@ from app.api.deps import (
 from app.auth.dependencies import get_current_user, require_admin
 from app.db.models import ArbitrageOpportunity, User
 from app.db.session import get_db
-from app.execution.engine import open_hedge_group
+from app.execution.coordinator import create_open_intent
 from app.market.scan_state import scan_state_store
 
 router = APIRouter()
@@ -76,15 +76,23 @@ def opportunity_detail(
     return _row_with_leg_metadata(db, row)
 
 
-@router.post("/{opportunity_id}/execute")
+@router.post("/{opportunity_id}/execute", status_code=202)
 def execute_opportunity(
     opportunity_id: int,
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
 ) -> dict[str, Any]:
-    """执行套利机会，开仓。"""
+    """创建异步 OPEN Intent。"""
     try:
-        group = open_hedge_group(db, opportunity_id, source=user.username)
-        return as_dict(group)
+        result = create_open_intent(
+            db,
+            opportunity_id=opportunity_id,
+            requested_by=f"user:{user.id}",
+            idempotency_key=idempotency_key,
+            source=user.username,
+        )
+        db.commit()
+        return {"accepted": True, "created": result.created, "intent": as_dict(result.intent)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

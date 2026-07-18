@@ -8,11 +8,13 @@
 - **scan_persistence_job** — 扫描状态持久化
 - **execution_maintenance_job** — 执行维护（自动开仓 + 自动平仓 + 对账）
 - **carry_cost_job** — 资金费/过夜费同步
-- **execution_persistence_job** — 对冲池事件持久化
+- 执行 Outbox 由独立 OS Worker 处理，本调度器禁止触碰交易所
 - **signal_stats_job** — 统计信号缓存刷新
 - **mt5_tradability_job** — MT5 交易能力缓存刷新
 - **mt5_session_template_job** — MT5 交易时段模板同步
 - **cb_config_job** — 断路器配置刷新
+- **venue_metadata_job** — 品种规格、费率和资金费刷新
+- **account_snapshot_job** — 账户余额定时兜底快照
 
 使用 ``db_session`` 替代 ``SessionLocal + try/except``，
 使用 ``get_logger`` 替代 ``from loguru import logger``。
@@ -37,12 +39,13 @@ from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
 from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.circuit_breaker import reload_config as reload_cb_config
-from app.execution.persistence import persist_hedge_pool_events
 from app.execution.reconciler import run_execution_reconcile
 from app.market.mt5_schedule import sync_mt5_session_templates
 from app.market.mt5_tradability import refresh_mt5_tradability_cache
 from app.market.scanner import persist_scan_state, run_scan
 from app.strategy.statistical_signal import refresh_signal_stats_cache
+from app.accounts.sync import sync_account_snapshots
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -57,8 +60,9 @@ _session_template_timer: Optional[threading.Timer] = None
 _scan_persistence_timer: Optional[threading.Timer] = None
 _execution_timer: Optional[threading.Timer] = None
 _carry_cost_timer: Optional[threading.Timer] = None
-_execution_persistence_timer: Optional[threading.Timer] = None
 _cb_config_timer: Optional[threading.Timer] = None
+_venue_metadata_timer: Optional[threading.Timer] = None
+_account_snapshot_timer: Optional[threading.Timer] = None
 
 _running = False
 _stats_refreshing = False
@@ -67,8 +71,9 @@ _session_template_refreshing = False
 _scan_persisting = False
 _execution_running = False
 _carry_cost_running = False
-_execution_persisting = False
 _cb_config_running = False
+_venue_metadata_running = False
+_account_snapshot_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +98,17 @@ def execution_maintenance_job() -> None:
         return
     _execution_running = True
     try:
-        with db_session() as db:
-            run_auto_execute(db)
-            run_auto_close(db)
-            run_execution_reconcile(db)
-    except Exception as exc:
-        logger.exception("执行维护任务失败: {}", exc)
+        # 三个阶段使用独立事务，单个阶段失败不再阻断后续平仓或对账。
+        for name, task in (
+            ("auto_execute", run_auto_execute),
+            ("auto_close", run_auto_close),
+            ("execution_reconcile", run_execution_reconcile),
+        ):
+            try:
+                with db_session() as db:
+                    task(db)
+            except Exception as exc:
+                logger.exception("执行维护阶段失败: stage={}, error={}", name, exc)
     finally:
         _execution_running = False
     _schedule_next_execution()
@@ -119,23 +129,6 @@ def carry_cost_job() -> None:
     finally:
         _carry_cost_running = False
     _schedule_next_carry_cost()
-
-
-def execution_persistence_job() -> None:
-    """对冲池执行事件持久化任务。"""
-    global _execution_persisting
-    if _execution_persisting:
-        _schedule_next_execution_persistence()
-        return
-    _execution_persisting = True
-    try:
-        with db_session() as db:
-            persist_hedge_pool_events(db)
-    except Exception as exc:
-        logger.exception("对冲池执行事件持久化失败: {}", exc)
-    finally:
-        _execution_persisting = False
-    _schedule_next_execution_persistence()
 
 
 def scan_persistence_job() -> None:
@@ -223,6 +216,43 @@ def cb_config_job() -> None:
     _schedule_next_cb_config()
 
 
+def venue_metadata_job() -> None:
+    """定时刷新最小交易量、步进、手续费和资金费。"""
+    global _venue_metadata_running
+    if _venue_metadata_running:
+        _schedule_next_venue_metadata()
+        return
+    _venue_metadata_running = True
+    try:
+        for venue in ("hyperliquid", "mt5", "binance"):
+            try:
+                connector = native_venue_manager.connector_for(venue, "live")
+                for symbol in native_venue_manager.configured_symbols(venue):
+                    connector.get_instrument(symbol, refresh=True)
+            except Exception as exc:
+                logger.warning("交易所元数据刷新失败: venue={}, error={}", venue, exc)
+    finally:
+        _venue_metadata_running = False
+    _schedule_next_venue_metadata()
+
+
+def account_snapshot_job() -> None:
+    """定时保存账户余额快照，作为私有事件之外的兜底对账。"""
+    global _account_snapshot_running
+    if _account_snapshot_running:
+        _schedule_next_account_snapshot()
+        return
+    _account_snapshot_running = True
+    try:
+        with db_session() as db:
+            sync_account_snapshots(db)
+    except Exception as exc:
+        logger.exception("账户快照同步失败: {}", exc)
+    finally:
+        _account_snapshot_running = False
+    _schedule_next_account_snapshot()
+
+
 # ---------------------------------------------------------------------------
 # 调度函数
 # ---------------------------------------------------------------------------
@@ -287,16 +317,6 @@ def _schedule_next_carry_cost() -> None:
     _carry_cost_timer.start()
 
 
-def _schedule_next_execution_persistence() -> None:
-    """调度下一轮对冲池事件持久化。"""
-    global _execution_persistence_timer
-    if not _running:
-        return
-    _execution_persistence_timer = threading.Timer(1.0, execution_persistence_job)
-    _execution_persistence_timer.daemon = True
-    _execution_persistence_timer.start()
-
-
 def _schedule_next_tradability() -> None:
     """调度下一轮 MT5 交易能力刷新。"""
     global _tradability_timer
@@ -331,6 +351,26 @@ def _schedule_next_cb_config() -> None:
     _cb_config_timer.start()
 
 
+def _schedule_next_venue_metadata() -> None:
+    global _venue_metadata_timer
+    if not _running:
+        return
+    interval = max(get_settings().venues.instrument_refresh_seconds, 60)
+    _venue_metadata_timer = threading.Timer(interval, venue_metadata_job)
+    _venue_metadata_timer.daemon = True
+    _venue_metadata_timer.start()
+
+
+def _schedule_next_account_snapshot() -> None:
+    global _account_snapshot_timer
+    if not _running:
+        return
+    interval = max(get_settings().venues.account_reconcile_seconds, 10)
+    _account_snapshot_timer = threading.Timer(interval, account_snapshot_job)
+    _account_snapshot_timer.daemon = True
+    _account_snapshot_timer.start()
+
+
 # ---------------------------------------------------------------------------
 # 启停接口
 # ---------------------------------------------------------------------------
@@ -344,11 +384,12 @@ def start_scheduler() -> None:
         _schedule_next_scan_persistence()
         _schedule_next_execution()
         _schedule_next_carry_cost()
-        _schedule_next_execution_persistence()
         _schedule_next_stats()
         _schedule_next_tradability()
         _schedule_next_session_templates()
         _schedule_next_cb_config()
+        _schedule_next_venue_metadata()
+        _schedule_next_account_snapshot()
         logger.info("定时任务调度器已启动")
 
 
@@ -370,8 +411,10 @@ def stop_scheduler() -> None:
         _execution_timer.cancel()
     if _carry_cost_timer:
         _carry_cost_timer.cancel()
-    if _execution_persistence_timer:
-        _execution_persistence_timer.cancel()
     if _cb_config_timer:
         _cb_config_timer.cancel()
+    if _venue_metadata_timer:
+        _venue_metadata_timer.cancel()
+    if _account_snapshot_timer:
+        _account_snapshot_timer.cancel()
     logger.info("定时任务调度器已停止")

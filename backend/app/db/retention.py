@@ -5,10 +5,17 @@
 防止数据库无限增长。
 """
 
+import threading
+import time
+
 from sqlalchemy.orm import Session
 
 
-def prune_table_by_id(db: Session, model, keep: int = 1000) -> None:
+_last_prune_at: dict[str, float] = {}
+_prune_lock = threading.Lock()
+
+
+def prune_table_by_id(db: Session, model, keep: int = 1000, min_interval_seconds: float = 60.0) -> None:
     """按 ID 降序保留最近 N 条记录，删除其余旧数据。
 
     参数：
@@ -22,6 +29,12 @@ def prune_table_by_id(db: Session, model, keep: int = 1000) -> None:
     """
     if keep <= 0:
         return
+    key = str(getattr(model, "__tablename__", model))
+    now = time.monotonic()
+    with _prune_lock:
+        if now - _last_prune_at.get(key, 0.0) < max(min_interval_seconds, 0.0):
+            return
+        _last_prune_at[key] = now
     cutoff_id = db.query(model.id).order_by(model.id.desc()).offset(keep).limit(1).scalar()
     if cutoff_id:
         db.query(model).filter(model.id <= cutoff_id).delete(synchronize_session=False)

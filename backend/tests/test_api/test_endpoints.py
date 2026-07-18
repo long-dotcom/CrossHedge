@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -13,7 +14,12 @@ from app.db.models import (
     SpreadDirectionCurrent, StrategySetting, SymbolMapping, SystemLog,
     SystemSetting, User,
 )
-from app.api import router as api_router
+from app.api import dashboard as dashboard_api
+from app.api import execution as execution_api
+from app.api import hedge_groups as hedge_groups_api
+from app.api import markets as markets_api
+from app.api import opportunities as opportunities_api
+from app.api import streaming as streaming_api
 from app.execution.hedge_pool import hedge_pool
 from app.market.quotes import quote_cache
 from app.market.scan_state import scan_state_store
@@ -52,7 +58,7 @@ def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
     db.add(AccountSnapshot(platform="mt5", equity=200, available_balance=180, margin_used=20, margin_ratio=10))
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="dashboard")
+    event = streaming_api._stream_snapshot(db, channel="dashboard")
 
     assert set(event) == {"dashboard_summary", "equity_curve"}
     assert event["dashboard_summary"]["equity"] == 200
@@ -71,7 +77,7 @@ def test_hedge_groups_stream_channel_returns_only_current_page() -> None:
     )
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="hedge-groups", page=1, page_size=1)
+    event = streaming_api._stream_snapshot(db, channel="hedge-groups", page=1, page_size=1)
 
     assert set(event) == {"hedge_groups"}
     assert event["hedge_groups"]["total"] == 2
@@ -87,7 +93,7 @@ def test_risk_stream_channel_returns_status_and_current_event_page() -> None:
     db.add(RiskEvent(level="warning", rule="latency", message="slow", symbol="OIL"))
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="risk", page=1, page_size=10)
+    event = streaming_api._stream_snapshot(db, channel="risk", page=1, page_size=10)
 
     assert set(event) == {"risk_status", "risk_events"}
     assert event["risk_status"]["mode"] == "paused"
@@ -119,14 +125,14 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
     quote_cache.put("hyperliquid", "DASH-PNL", bid=100, ask=101, depth_notional=1000, source="test")
     quote_cache.put("mt5", "DASH-PNL", bid=115, ask=116, depth_notional=1000, source="test")
 
-    result = api_router.dashboard_summary(User(username="admin", password_hash="x", role="admin"), db)
+    result = dashboard_api.dashboard_summary(User(username="admin", password_hash="x", role="admin"), db)
 
     assert result["equity"] == 100
     assert result["realized_pnl"] == 3
     assert result["unrealized_pnl"] == 8
     assert result["today_pnl"] == 11
 
-def test_positions_stream_channel_returns_only_positions() -> None:
+def test_positions_stream_channel_returns_only_positions(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -134,7 +140,14 @@ def test_positions_stream_channel_returns_only_positions() -> None:
     db.add(Position(platform="mt5", symbol="USOIL", side="short", quantity=0.2, entry_price=76, mark_price=77, unrealized_pnl=-2.5))
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="positions")
+    monkeypatch.setattr(
+        "app.positions.live.live_positions_payload",
+        lambda session: [{
+            "platform": "mt5", "symbol": "USOIL", "side": "short",
+            "quantity": 0.2, "unrealized_pnl": -2.5,
+        }],
+    )
+    event = streaming_api._stream_snapshot(db, channel="positions")
 
     assert set(event) == {"positions"}
     assert len(event["positions"]) == 1
@@ -154,7 +167,7 @@ def test_accounts_stream_channel_returns_only_latest_accounts() -> None:
     )
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="accounts")
+    event = streaming_api._stream_snapshot(db, channel="accounts")
 
     assert set(event) == {"accounts"}
     assert {item["platform"] for item in event["accounts"]} == {"hyperliquid", "mt5"}
@@ -169,9 +182,9 @@ def test_execution_reconcile_api_runs_reconciler_and_audits(monkeypatch) -> None
     db.add(user)
     db.commit()
     db.refresh(user)
-    monkeypatch.setattr(api_router, "run_execution_reconcile", lambda session: 3)
+    monkeypatch.setattr(execution_api, "run_execution_reconcile", lambda session: 3)
 
-    result = api_router.execution_reconcile(user=user, db=db)
+    result = execution_api.execution_reconcile(user=user, db=db)
 
     assert result == {"status": "ok", "changed": 3, "cost_changed": 0}
     assert db.query(AuditLog).filter(AuditLog.action == "run_execution_reconcile", AuditLog.detail == "3").count() == 1
@@ -182,7 +195,7 @@ def test_lead_lag_stream_channel_returns_only_report() -> None:
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
 
-    event = api_router._stream_snapshot(db, channel="lead-lag", symbol="JP225", window_seconds=60, threshold_bps=3, min_move=0, max_lag_ms=2000)
+    event = streaming_api._stream_snapshot(db, channel="lead-lag", symbol="JP225", window_seconds=60, threshold_bps=3, min_move=0, max_lag_ms=2000)
 
     assert set(event) == {"lead_lag"}
     assert event["lead_lag"]["symbol"] == "JP225"
@@ -211,7 +224,7 @@ def test_hedge_groups_api_returns_realtime_spreads() -> None:
     quote_cache.put("hyperliquid", "OIL", bid=99, ask=101, depth_notional=1000, source="test")
     quote_cache.put("mt5", "OIL", bid=110, ask=111, depth_notional=1000, source="test")
 
-    result = api_router.hedge_groups(user, db, page=1, page_size=20)
+    result = hedge_groups_api.hedge_groups(user, db, page=1, page_size=20)
 
     item = result["items"][0]
     assert item["entry_spread"] == 12
@@ -231,7 +244,7 @@ def test_execution_stream_channel_returns_current_order_and_fill_pages() -> None
     db.add(Fill(order_id=order.id, platform="hyperliquid", symbol="OIL", side="buy", quantity=1, price=80, fee=0.1))
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="execution", page=1, fill_page=1, page_size=20)
+    event = streaming_api._stream_snapshot(db, channel="execution", page=1, fill_page=1, page_size=20)
 
     assert set(event) == {"orders", "fills"}
     assert event["orders"]["total"] == 1
@@ -239,7 +252,7 @@ def test_execution_stream_channel_returns_current_order_and_fill_pages() -> None
     assert event["fills"]["total"] == 1
     assert event["fills"]["items"][0]["price"] == 80
 
-def test_close_group_api_routes_manual_intervention_to_engine(monkeypatch) -> None:
+def test_close_group_api_rejects_manual_intervention_without_confirmed_exposure(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -258,23 +271,17 @@ def test_close_group_api_routes_manual_intervention_to_engine(monkeypatch) -> No
     db.commit()
     db.refresh(user)
     db.refresh(group)
-    called = []
+    with pytest.raises(HTTPException, match="恢复计划|敞口") as exc_info:
+        hedge_groups_api.close_group(
+            group.id,
+            SimpleNamespace(reason="manual close", force=True),
+            user=user,
+            db=db,
+            idempotency_key="manual-close-unknown-exposure",
+        )
+    assert exc_info.value.status_code == 400
 
-    def fake_engine_close(session, group_id, reason):
-        called.append((group_id, reason))
-        row = session.get(HedgeGroup, group_id)
-        row.status = "closed"
-        return row
-
-    monkeypatch.setattr(api_router, "close_hedge_group", fake_engine_close)
-    monkeypatch.setattr(api_router, "close_hedge_group_from_pool", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("manual close must not use pool path")))
-    monkeypatch.setattr(api_router, "persist_hedge_pool_events", lambda db: 0)
-
-    result = api_router.close_group(group.id, SimpleNamespace(reason="manual close", force=True), user=user, db=db)
-
-    assert called == [(group.id, "manual close")]
-    assert result["status"] == "closed"
-    assert db.query(AuditLog).filter(AuditLog.action == "close_hedge_group").count() == 1
+    assert db.query(AuditLog).filter(AuditLog.action == "close_hedge_group").count() == 0
 
 def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
@@ -301,7 +308,7 @@ def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
     quote_cache.put("hyperliquid", "GROUP-PNL", bid=100, ask=101, depth_notional=1000, source="test")
     quote_cache.put("mt5", "GROUP-PNL", bid=115, ask=116, depth_notional=1000, source="test")
 
-    result = api_router.hedge_groups(user, db, page=1, page_size=20)
+    result = hedge_groups_api.hedge_groups(user, db, page=1, page_size=20)
 
     item = result["items"][0]
     assert item["current_close_spread"] == 16
@@ -369,8 +376,8 @@ def test_spread_and_opportunity_apis_prefer_memory_scan_state() -> None:
         ],
     )
 
-    spreads_payload = api_router.spreads(SimpleNamespace(), db, page=1, page_size=20)
-    opportunities_payload = api_router.opportunities(SimpleNamespace(), db, page=1, page_size=20)
+    spreads_payload = markets_api.spreads(SimpleNamespace(), db, page=1, page_size=20)
+    opportunities_payload = opportunities_api.opportunities(SimpleNamespace(), db, page=1, page_size=20)
 
     assert spreads_payload["items"][0]["symbol"] == "BTC"
     assert opportunities_payload["items"][0]["symbol"] == "ETH"
@@ -392,7 +399,7 @@ def test_equity_curve_aggregates_platform_snapshots_by_sync_batch() -> None:
     )
     db.commit()
 
-    curve = api_router._equity_curve_payload(db)
+    curve = streaming_api._equity_curve_payload(db)
 
     assert [point["platform"] for point in curve] == ["total", "total"]
     assert [point["equity"] for point in curve] == [50000, 50000]
@@ -427,7 +434,7 @@ def test_logs_stream_channel_returns_current_log_and_alert_pages() -> None:
     db.add(Alert(level="critical", title="risk", message="check"))
     db.commit()
 
-    event = api_router._stream_snapshot(db, channel="logs", page=1, alert_page=1, page_size=20)
+    event = streaming_api._stream_snapshot(db, channel="logs", page=1, alert_page=1, page_size=20)
 
     assert set(event) == {"logs", "alerts"}
     assert event["logs"]["total"] == 1

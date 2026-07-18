@@ -2,9 +2,8 @@
 对冲组内存池模块
 ================
 
-维护对冲组的内存快照缓存，避免每次操作都查询数据库：
+维护对冲组的只读内存快照缓存，避免行情估值时反复查询数据库：
 - ``HedgeGroupSnapshot`` —— 对冲组的不可变内存快照
-- ``CloseResultEvent`` —— 平仓结果事件（待持久化）
 - ``HedgePoolStore`` —— 线程安全的对冲组内存池
 
 内存池用于自动平仓、自动执行等高频读取场景，
@@ -20,11 +19,10 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from threading import RLock
-from typing import Deque, Iterable
+from typing import Iterable
 
 from sqlalchemy.orm import Session
 
@@ -105,54 +103,6 @@ class HedgeGroupSnapshot:
         return replace(self, **kwargs)
 
 
-@dataclass(frozen=True)
-class CloseFillSnapshot:
-    """平仓成交快照。"""
-    platform: str
-    symbol: str
-    side: str
-    quantity: float
-    price: float
-    fee: float
-    external_order_id: str
-
-
-@dataclass(frozen=True)
-class CloseOrderSnapshot:
-    """平仓订单快照。"""
-    platform: str
-    symbol: str
-    side: str
-    quantity: float
-    order_type: str
-    price: float | None
-    post_only: bool
-    reduce_only: bool
-    ttl_seconds: int
-    status: str
-    external_order_id: str
-    average_price: float | None
-    error_message: str
-    filled_quantity: float
-    fee: float
-    fills: tuple[CloseFillSnapshot, ...] = ()
-
-
-@dataclass(frozen=True)
-class CloseResultEvent:
-    """平仓结果事件，待持久化到数据库。"""
-    group_id: int
-    status: str
-    close_reason: str
-    event_type: str
-    event_detail: str
-    realized_pnl: float | None
-    unrealized_pnl: float | None
-    fees_delta: float
-    closed_at: datetime | None
-    orders: tuple[CloseOrderSnapshot, ...] = ()
-
-
 class HedgePoolStore:
     """线程安全的对冲组内存池。
 
@@ -160,13 +110,12 @@ class HedgePoolStore:
     主要用途：
     - 自动平仓循环读取 ``snapshot_open_groups()``
     - 执行完成后通过 ``upsert_group()`` 同步状态
-    - 平仓结果通过 ``enqueue_close_result()`` 暂存，由持久化循环消费
+    - 数据库状态变化后通过 ``upsert_group()`` 刷新缓存
     """
 
     def __init__(self) -> None:
         self._lock = RLock()
         self._groups: dict[int, HedgeGroupSnapshot] = {}
-        self._pending_close_results: Deque[CloseResultEvent] = deque()
 
     def load_from_db(self, db: Session) -> int:
         """从数据库加载所有活跃对冲组到内存池。
@@ -295,29 +244,6 @@ class HedgePoolStore:
             current = self._groups.get(int(group_id))
             if current and current.status == "closed":
                 self._groups.pop(int(group_id), None)
-
-    def enqueue_close_result(self, event: CloseResultEvent) -> None:
-        """将平仓结果事件加入待持久化队列。"""
-        with self._lock:
-            self._pending_close_results.append(event)
-
-    def drain_close_results(self, limit: int = 100) -> list[CloseResultEvent]:
-        """从待持久化队列中取出最多 limit 个平仓结果事件。"""
-        drained: list[CloseResultEvent] = []
-        with self._lock:
-            while self._pending_close_results and len(drained) < limit:
-                drained.append(self._pending_close_results.popleft())
-        return drained
-
-    def requeue_close_results(self, events: Iterable[CloseResultEvent]) -> None:
-        """将未成功持久化的平仓结果事件重新放回队列头部。"""
-        items = list(events)
-        if not items:
-            return
-        with self._lock:
-            for event in reversed(items):
-                self._pending_close_results.appendleft(event)
-
 
 # 全局单例内存池
 hedge_pool = HedgePoolStore()

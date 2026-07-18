@@ -16,7 +16,7 @@ export function LogsPage() {
   const [logPage, setLogPage] = useState(1);
   const [alertPage, setAlertPage] = useState(1);
   const streamStatus = usePageStream('logs', { page: logPage, alertPage, pageSize: PAGE_SIZE });
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const logs = useQuery({ queryKey: ['logs', logPage], queryFn: async () => (await api.get('/logs', { params: { page: logPage, page_size: PAGE_SIZE } })).data });
   const alerts = useQuery({ queryKey: ['alerts', alertPage], queryFn: async () => (await api.get('/alerts', { params: { page: alertPage, page_size: PAGE_SIZE } })).data });
   const logRows = logs.data?.items || [];

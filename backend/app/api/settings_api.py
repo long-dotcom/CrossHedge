@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import as_dict, _leg_metadata_for_symbol, _row_with_leg_metadata, audit
+from app.venues.manager import native_venue_manager
 from app.auth.dependencies import get_current_user, require_admin
 from app.config.settings import get_settings
 from app.db.models import (
@@ -214,6 +215,7 @@ def put_symbol_mappings(
     audit(db, user.id, "update_symbol_mappings", "settings")
     db.commit()
     clear_symbol_mapping_cache()
+    native_venue_manager.invalidate()
     clear_signal_stats_cache()
     return [_row_with_leg_metadata(db, r) for r in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
 
@@ -232,6 +234,7 @@ def create_symbol_mapping(
     audit(db, user.id, "create_symbol_mapping", "settings", payload.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    native_venue_manager.invalidate()
     clear_signal_stats_cache()
     db.refresh(row)
     return _row_with_leg_metadata(db, row)
@@ -263,6 +266,7 @@ def update_symbol_mapping(
     audit(db, user.id, "update_symbol_mapping", "settings", payload.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    native_venue_manager.invalidate()
     clear_signal_stats_cache()
     db.refresh(row)
     return _row_with_leg_metadata(db, row)
@@ -284,6 +288,7 @@ def delete_symbol_mapping(
     audit(db, user.id, "delete_symbol_mapping", "settings", symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    native_venue_manager.invalidate()
     clear_signal_stats_cache()
     return {"status": "ok"}
 
@@ -408,6 +413,7 @@ def create_exchange_credential(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     audit(db, user.id, "upsert_exchange_credential", "settings", row.venue)
     db.commit()
+    native_venue_manager.invalidate(row.venue)
     db.refresh(row)
     return public_exchange_credential(row)
 
@@ -428,6 +434,7 @@ def update_exchange_credential(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     audit(db, user.id, "update_exchange_credential", "settings", row.venue)
     db.commit()
+    native_venue_manager.invalidate(row.venue)
     db.refresh(row)
     return public_exchange_credential(row)
 
@@ -445,6 +452,7 @@ def delete_exchange_credential(
     db.delete(row)
     audit(db, user.id, "delete_exchange_credential", "settings", venue)
     db.commit()
+    native_venue_manager.invalidate(venue)
     return {"status": "ok"}
 
 

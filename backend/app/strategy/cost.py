@@ -5,8 +5,8 @@
 提供 ``CostBreakdown`` 数据类和 ``estimate_cost`` 函数，
 用于估算跨交易所对冲策略的完整交易成本，包括：
 
-- Leg A（Hyperliquid）手续费、点差、funding
-- Leg B（MT5）手续费、点差、隔夜利息
+- 两条腿各自的开/平仓手续费与 funding
+- MT5 等经纪商腿的隔夜利息
 - 滑点成本、外汇转换成本
 
 使用方式::
@@ -28,14 +28,15 @@ class CostBreakdown:
 
     包含两腿各项成本分量及汇总属性 ``total``。
     """
-    leg_a_fee: float          # Leg A（Hyperliquid）开/平仓手续费
-    leg_a_spread: float       # Leg A 买卖点差成本
+    leg_a_fee: float          # Leg A 开/平仓手续费
+    leg_a_spread: float       # Leg A 买卖点差成本（兼容旧模型）
     leg_a_funding: float      # Leg A 资金费率成本（持仓收益/支出）
-    leg_b_spread: float       # Leg B（MT5）买卖点差成本
-    leg_b_commission: float   # Leg B 佣金
+    leg_b_spread: float       # Leg B 买卖点差成本（兼容旧模型）
+    leg_b_commission: float   # Leg B 开/平仓手续费（兼容旧字段名）
     leg_b_swap: float         # Leg B 隔夜利息
     slippage: float           # 滑点成本
     fx_cost: float            # 外汇转换成本
+    leg_b_funding: float = 0.0  # Leg B 资金费率成本
     leg_a_fee_rate: float = 0.00045       # Leg A 手续费率（记录用）
     leg_a_funding_rate: float = 0.00010   # Leg A 资金费率（记录用）
     leg_b_commission_rate: float = 0.00035  # Leg B 佣金率（记录用）
@@ -75,10 +76,91 @@ class CostBreakdown:
             + self.leg_a_funding
             + self.leg_b_spread
             + self.leg_b_commission
+            + self.leg_b_funding
             + self.leg_b_swap
             + self.slippage
             + self.fx_cost
         )
+
+    @property
+    def leg_b_fee(self) -> float:
+        """Leg B 手续费的语义化别名。"""
+        return self.leg_b_commission
+
+    def as_dict(self) -> dict[str, float | str]:
+        """返回稳定的成本明细结构，供日志、API 和测试复用。"""
+        return {
+            "leg_a_fee": self.leg_a_fee,
+            "leg_a_funding": self.leg_a_funding,
+            "leg_b_fee": self.leg_b_commission,
+            "leg_b_funding": self.leg_b_funding,
+            "leg_b_swap": self.leg_b_swap,
+            "slippage": self.slippage,
+            "fx_cost": self.fx_cost,
+            "total": self.total,
+            "source": self.source,
+        }
+
+
+def estimate_pair_cost(
+    *,
+    notional: float,
+    holding_hours: float,
+    max_slippage_bps: float,
+    leg_a_open_fee_rate: float,
+    leg_a_close_fee_rate: float,
+    leg_a_funding_rate: float,
+    leg_a_funding_interval_hours: float,
+    leg_a_side: str,
+    leg_b_open_fee_rate: float,
+    leg_b_close_fee_rate: float,
+    leg_b_funding_rate: float,
+    leg_b_funding_interval_hours: float,
+    leg_b_side: str,
+    leg_b_swap_cost: float = 0.0,
+    fx_cost_rate: float = 0.0,
+    source: str = "venue",
+) -> CostBreakdown:
+    """按两条腿的 venue 数据估算完整持仓周期成本。
+
+    入场价差和平仓目标均使用可成交 bid/ask，因此本函数不再次加入
+    bid/ask 点差，避免把开仓穿越点差重复计入成本。
+    """
+    hours = max(float(holding_hours or 0.0), 0.0)
+    value = max(float(notional or 0.0), 0.0)
+    return CostBreakdown(
+        leg_a_fee=value * (float(leg_a_open_fee_rate or 0.0) + float(leg_a_close_fee_rate or 0.0)),
+        leg_a_spread=0.0,
+        leg_a_funding=_funding_cost(
+            value, leg_a_funding_rate, leg_a_funding_interval_hours, hours, leg_a_side,
+        ),
+        leg_b_spread=0.0,
+        leg_b_commission=value * (float(leg_b_open_fee_rate or 0.0) + float(leg_b_close_fee_rate or 0.0)),
+        leg_b_funding=_funding_cost(
+            value, leg_b_funding_rate, leg_b_funding_interval_hours, hours, leg_b_side,
+        ),
+        leg_b_swap=float(leg_b_swap_cost or 0.0),
+        slippage=value * max(float(max_slippage_bps or 0.0), 0.0) / 10_000,
+        fx_cost=value * max(float(fx_cost_rate or 0.0), 0.0),
+        leg_a_fee_rate=float(leg_a_open_fee_rate or 0.0),
+        leg_a_funding_rate=float(leg_a_funding_rate or 0.0),
+        leg_b_commission_rate=float(leg_b_open_fee_rate or 0.0),
+        source=source,
+    )
+
+
+def _funding_cost(
+    notional: float,
+    rate_per_interval: float,
+    interval_hours: float,
+    holding_hours: float,
+    side: str,
+) -> float:
+    """把每结算周期 funding 归一为预计持仓时长成本。"""
+    interval = max(float(interval_hours or 0.0), 1e-9)
+    direction = 1.0 if str(side).lower() in {"buy", "long"} else -1.0
+    expected_intervals = max(float(holding_hours or 0.0), 0.0) / interval
+    return float(notional) * float(rate_per_interval or 0.0) * expected_intervals * direction
 
 
 def estimate_cost(

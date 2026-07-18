@@ -9,7 +9,7 @@ import type { PipelineDiagnostics } from './pipeline/types';
 
 export function PipelinePage() {
   const streamStatus = usePageStream('pipeline');
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const query = useQuery<PipelineDiagnostics>({
     queryKey: ['pipeline-diagnostics'],
     queryFn: async () => (await api.get('/diagnostics/pipeline')).data

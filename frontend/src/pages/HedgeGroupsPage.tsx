@@ -9,6 +9,7 @@ import { usePageStream } from '../hooks/useLiveStream';
 import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
 import { legTitle, venueLabel } from '../utils/venues';
+import { QueryErrorAlert } from '../components/QueryErrorAlert';
 
 function statusTag(status: string) {
   const map: Record<string, { label: string; color: string }> = {
@@ -56,7 +57,12 @@ function hasTriggerPrices(row: any) {
 }
 
 function detailItems(row: any) {
+  const execution = row.execution_summary;
   return [
+    { key: 'execution_intent', label: '最近执行 Intent', children: execution ? `#${execution.intent_id} ${execution.intent_type} / ${execution.status}` : '-' },
+    { key: 'execution_event', label: '最近执行阶段', children: execution?.latest_event_type || '-' },
+    { key: 'execution_pending', label: '待确认订单', children: execution ? `${execution.pending_orders}/${execution.total_orders}` : '-' },
+    { key: 'execution_error', label: '执行信息/失败原因', children: <EllipsisCell value={execution?.error_message || '-'} /> },
     { key: 'leg_b_quantity', label: `${legTitle(row, 'b')} 数量`, children: fmtAdaptive(row.leg_b_quantity, 2, 6) },
     { key: 'leg_a_quantity', label: `${legTitle(row, 'a')} 数量`, children: fmtAdaptive(row.leg_a_quantity, 4, 8) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },
@@ -85,14 +91,18 @@ function detailItems(row: any) {
 export function HedgeGroupsPage() {
   const [page, setPage] = useState(1);
   const streamStatus = usePageStream('hedge-groups', { page, pageSize: 20 });
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const query = useQuery({ queryKey: ['hedge-groups', page], queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20 } })).data });
   const close = useMutation({
-    mutationFn: async (id: number) => (await api.post(`/hedge-groups/${id}/close`, { reason: 'manual force close from ui', force: true })).data,
+    mutationFn: async (id: number) => (await api.post(
+      `/hedge-groups/${id}/close`,
+      { reason: 'manual force close from ui', force: true },
+      { headers: { 'Idempotency-Key': `close:${id}:${crypto.randomUUID()}` } }
+    )).data,
     onSuccess: () => {
-      messageApi.success('对冲组已平仓');
+      messageApi.success('平仓请求已提交，请等待成交确认');
       queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '平仓失败')
@@ -109,6 +119,19 @@ export function HedgeGroupsPage() {
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '同步失败')
   });
+  const recover = useMutation({
+    mutationFn: async (id: number) => (await api.post(
+      `/hedge-groups/${id}/recover`,
+      { reason: 'manual recovery flatten from ui', confirmation: `RECOVER ${id}` },
+      { headers: { 'Idempotency-Key': `recover:${id}:${crypto.randomUUID()}` } }
+    )).data,
+    onSuccess: () => {
+      messageApi.success('恢复 Intent 已提交，仅回平本组确认成交残量');
+      queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '恢复请求失败')
+  });
   const columns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 64, align: 'right' },
     { title: '品种', dataIndex: 'symbol', width: 82, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
@@ -123,22 +146,45 @@ export function HedgeGroupsPage() {
     { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_a_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_b_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
-    { title: '操作', fixed: 'right', width: 110, render: (_, row) => (
-      <Popconfirm
-        title={`强制平仓 #${row.id}?`}
-        description="将跳过退出线和最小盈利检查，但仍执行报价、会话和 reduce-only 平仓保护。"
-        okText="强制平仓"
-        cancelText="取消"
-        onConfirm={() => close.mutate(row.id)}
-      >
-        <Button size="small" danger loading={close.isPending} disabled={!['open', 'open_partial', 'manual_intervention'].includes(row.status)}>平仓</Button>
-      </Popconfirm>
+    { title: '操作', fixed: 'right', width: 170, render: (_, row) => (
+      <Space size={4}>
+        <Popconfirm
+          title={`强制平仓 #${row.id}?`}
+          description={row.available_actions?.close?.reason || '服务端尚未确认该组可以平仓'}
+          okText="强制平仓"
+          cancelText="取消"
+          onConfirm={() => close.mutate(row.id)}
+        >
+          <Button
+            size="small"
+            danger
+            title={row.available_actions?.close?.reason}
+            loading={close.isPending && close.variables === row.id}
+            disabled={!row.available_actions?.close?.allowed || (close.isPending && close.variables !== row.id)}
+          >平仓</Button>
+        </Popconfirm>
+        <Popconfirm
+          title={`恢复异常组 #${row.id}?`}
+          description="只按本组已确认 Fill 残量回平；存在未确认订单时服务端会拒绝。"
+          okText="创建恢复 Intent"
+          cancelText="取消"
+          onConfirm={() => recover.mutate(row.id)}
+        >
+          <Button
+            size="small"
+            title={row.available_actions?.recover?.reason}
+            loading={recover.isPending && recover.variables === row.id}
+            disabled={!row.available_actions?.recover?.allowed || (recover.isPending && recover.variables !== row.id)}
+          >恢复</Button>
+        </Popconfirm>
+      </Space>
     ) }
   ];
   const rows = query.data?.items || [];
   return (
     <div className="page-fill page-stack">
       {contextHolder}
+      <QueryErrorAlert error={query.error} onRetry={() => query.refetch()} title="对冲组加载失败" />
       <Card
         title="对冲组"
         className="fill-card"

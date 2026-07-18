@@ -7,10 +7,11 @@ import { DataCard } from '../components/DataCard';
 import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtChartDateTime, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/format';
+import { QueryErrorAlert } from '../components/QueryErrorAlert';
 
 export function DashboardPage() {
   const streamStatus = usePageStream('dashboard');
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const summary = useQuery({ queryKey: ['dashboard-summary'], queryFn: async () => (await api.get('/dashboard/summary')).data });
   const curve = useQuery({ queryKey: ['equity-curve'], queryFn: async () => (await api.get('/dashboard/equity-curve')).data });
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: async () => (await api.get('/accounts')).data });
@@ -19,6 +20,7 @@ export function DashboardPage() {
 
   return (
     <Space direction="vertical" size={16} className="full-width">
+      <QueryErrorAlert error={summary.error || curve.error || accounts.error} onRetry={() => { summary.refetch(); curve.refetch(); accounts.refetch(); }} title="仪表盘数据加载失败" />
       {data.risk_mode === 'emergency_stop' && <Alert type="error" showIcon message="系统处于紧急停止模式" />}
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8} xl={4}><DataCard title="总权益" value={fmtMoney(data.equity)} /></Col>

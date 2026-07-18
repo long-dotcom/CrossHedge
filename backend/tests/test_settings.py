@@ -1,5 +1,7 @@
 """配置管理测试：Settings 加载、运行时安全策略、数据库 URL 解析、默认值验证。"""
 
+from importlib import reload
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -7,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.auth.security import hash_password
 from app.db.models import Base, User
 from app.db import init_db as init_db_module
-from app.config.settings import Settings, enforce_runtime_security, insecure_runtime_reasons
+from app.config.settings import SecuritySettings, Settings, enforce_runtime_security, insecure_runtime_reasons
 
 
 def test_runtime_security_allows_local_defaults() -> None:
@@ -18,7 +20,7 @@ def test_runtime_security_allows_local_defaults() -> None:
     assert insecure_runtime_reasons(settings)
 
 def test_runtime_security_rejects_live_defaults_even_in_local() -> None:
-    settings = Settings(environment="local", live_trading_enabled=True)
+    settings = Settings(environment="local", security=SecuritySettings(live_trading_enabled=True))
 
     with pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
         enforce_runtime_security(settings)
@@ -32,8 +34,10 @@ def test_runtime_security_rejects_production_defaults() -> None:
 def test_runtime_security_accepts_production_custom_secrets() -> None:
     settings = Settings(
         environment="production",
-        jwt_secret="a-prod-secret-with-enough-entropy",
-        admin_password="not-the-default-password",
+        security=SecuritySettings(
+            jwt_secret="a-prod-secret-with-enough-entropy",
+            admin_password="not-the-default-password",
+        ),
     )
 
     enforce_runtime_security(settings)
@@ -64,7 +68,10 @@ def test_seed_defaults_rejects_existing_default_admin_in_secure_runtime(monkeypa
     monkeypatch.setattr(
         init_db_module,
         "get_settings",
-        lambda: Settings(environment="production", jwt_secret="strong-secret", admin_password="changed-password"),
+        lambda: Settings(
+            environment="production",
+            security=SecuritySettings(jwt_secret="strong-secret", admin_password="changed-password"),
+        ),
     )
 
     with pytest.raises(RuntimeError, match="默认密码"):

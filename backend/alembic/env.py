@@ -9,9 +9,16 @@
 """
 
 from logging.config import fileConfig
+from pathlib import Path
+import sys
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+# 从项目根目录执行 alembic 时，显式加入 backend 包目录。
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
 
 from app.config.settings import get_settings
 from app.db.models import Base
@@ -25,7 +32,7 @@ if config.config_file_name is not None:
 
 # 从应用设置中获取数据库连接 URL，覆盖 alembic.ini 中的默认值
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+config.set_main_option("sqlalchemy.url", settings.database.url)
 
 # 将 ORM 模型的 metadata 绑定为 Alembic 的目标元数据
 # autogenerate 时会对比数据库实际结构与此 metadata 的差异

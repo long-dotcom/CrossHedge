@@ -27,16 +27,18 @@ from importlib import import_module
 
 from sqlalchemy.orm import Session
 
-from app.adapters.venue import NATIVE_VENUES
 from app.config.settings import Settings, get_settings
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
 from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.db.models import ExchangeCredential, HedgeGroup, Position, SymbolMapping, SystemSetting
-from app.execution.probe import NAUTILUS_PROBE_SUPPORTED_VENUES
 from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_probe_enabled
 
 logger = get_logger(__name__)
+
+# 原生连接器当前支持的交易场所。
+SUPPORTED_VENUES = {"hyperliquid", "mt5", "binance"}
+PROBE_SUPPORTED_VENUES = SUPPORTED_VENUES - {"mt5"}
 
 
 @dataclass(frozen=True)
@@ -60,10 +62,15 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
         ``{"status": str, "ready": bool, "checks": [...]}``
     """
     settings = settings or get_settings()
+    mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
+    venues = _mapped_venues(mappings)
     checks: list[ReadinessCheck] = []
     checks.extend(_global_live_checks(db))
-    checks.extend(_hyperliquid_live_checks(settings))
-    checks.extend(_mt5_checks(settings))
+    if "hyperliquid" in venues:
+        checks.extend(_hyperliquid_live_checks(settings))
+    if "mt5" in venues:
+        checks.extend(_mt5_checks(settings))
+    checks.extend(_generic_live_venue_checks(db, venues - {"hyperliquid", "mt5"}))
     checks.extend(_symbol_mapping_checks(db))
     checks.extend(_position_safety_checks(db))
     overall = _overall_status(checks)
@@ -87,9 +94,15 @@ def paper_execution_readiness(db: Session, settings: Settings | None = None) -> 
         ``{"status": str, "ready": bool, "checks": [...]}``
     """
     settings = settings or get_settings()
+    mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
+    venues = _mapped_venues(mappings)
     checks: list[ReadinessCheck] = []
-    checks.extend(_hyperliquid_paper_checks(db, settings))
-    checks.extend(_mt5_demo_checks(settings))
+    if "hyperliquid" in venues:
+        checks.extend(_hyperliquid_paper_checks(db, settings))
+    else:
+        checks.extend(_generic_paper_live_probe_checks(db, mappings, settings))
+    if "mt5" in venues:
+        checks.extend(_mt5_demo_checks(settings))
     checks.extend(_symbol_mapping_checks(db))
     overall = _overall_status(checks)
     return {
@@ -102,6 +115,32 @@ def paper_execution_readiness(db: Session, settings: Settings | None = None) -> 
 # ---------------------------------------------------------------------------
 # 内部检查函数
 # ---------------------------------------------------------------------------
+
+def _mapped_venues(mappings: list[SymbolMapping]) -> set[str]:
+    """提取当前实际启用的交易 venue。"""
+    return {
+        venue
+        for mapping in mappings
+        for venue in (str(mapping.leg_a_venue or "").strip().lower(), str(mapping.leg_b_venue or "").strip().lower())
+        if venue
+    }
+
+
+def _generic_live_venue_checks(db: Session, venues: set[str]) -> list[ReadinessCheck]:
+    """检查数据库管理的原生交易所实盘凭证。"""
+    checks: list[ReadinessCheck] = []
+    for venue in sorted(venues):
+        credential = db.query(ExchangeCredential).filter(
+            ExchangeCredential.venue == venue,
+            ExchangeCredential.enabled.is_(True),
+        ).first()
+        ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        checks.append(ReadinessCheck(
+            f"{venue}_live_credentials",
+            "ok" if ready else "block",
+            f"{venue} 实盘凭证已启用且允许交易" if ready else f"{venue} 需要启用交易所配置、填写凭证并关闭只读模式",
+        ))
+    return checks
 
 def _global_live_checks(db: Session) -> list[ReadinessCheck]:
     """检查实盘交易总开关。"""
@@ -125,7 +164,11 @@ def _hyperliquid_live_checks(settings: Settings) -> list[ReadinessCheck]:
             "ok" if user else "block",
             "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 未配置，无法做账户级回查",
         ),
-        ReadinessCheck("hyperliquid_live_order_submit", "block", "Hyperliquid 实盘下单 SDK 已移除，当前只允许只读账户/仓位检查"),
+        ReadinessCheck(
+            "hyperliquid_live_order_submit",
+            "ok" if settings.hyperliquid.secret_key else "block",
+            "Hyperliquid 原生签名下单已配置" if settings.hyperliquid.secret_key else "HYPERLIQUID_SECRET_KEY 未配置，无法实盘下单",
+        ),
     ]
     if user:
         checks.append(_hyperliquid_read_probe(settings, user))
@@ -187,7 +230,7 @@ def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping],
             f"通用 paper-live 探针 venue 已启用: {', '.join(enabled_mapped)}" if enabled_mapped else "PAPER_LIVE_PROBE_ENABLED 已开启，但当前启用品种映射未命中 PAPER_LIVE_PROBE_VENUES",
         )
     ]
-    unsupported = sorted(mapped_venues - {"hyperliquid"} - NAUTILUS_PROBE_SUPPORTED_VENUES)
+    unsupported = sorted(mapped_venues - PROBE_SUPPORTED_VENUES - {"mt5"})
     if unsupported:
         checks.append(
             ReadinessCheck(
@@ -196,7 +239,7 @@ def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping],
                 f"以下 venue 已进入通用探针框架，但真实探针下单 adapter 尚未实现: {', '.join(unsupported)}",
             )
         )
-    for venue in sorted(mapped_venues & NAUTILUS_PROBE_SUPPORTED_VENUES):
+    for venue in sorted((mapped_venues & PROBE_SUPPORTED_VENUES) - {"hyperliquid"}):
         credential = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue, ExchangeCredential.enabled.is_(True)).first()
         ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
         checks.append(
@@ -274,7 +317,7 @@ def _symbol_mapping_checks(db: Session) -> list[ReadinessCheck]:
 
 def _position_safety_checks(db: Session) -> list[ReadinessCheck]:
     """检查外部仓位安全性 —— 检测残余仓位和孤儿仓位。"""
-    positions = db.query(Position).filter(Position.platform.in_(list(NATIVE_VENUES))).all()
+    positions = db.query(Position).filter(Position.platform.in_(list(SUPPORTED_VENUES))).all()
     active_positions = [row for row in positions if abs(row.quantity) > 0]
     if not active_positions:
         return [ReadinessCheck("live_position_management", "ok", "当前未发现已同步 live 仓位")]

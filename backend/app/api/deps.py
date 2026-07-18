@@ -72,6 +72,25 @@ def _leg_metadata_for_symbol(db: Session, symbol: str) -> dict[str, str]:
     return _leg_metadata(mapping)
 
 
+def _leg_metadata_by_symbol(db: Session, symbols: set[str] | list[str]) -> dict[str, dict[str, str]]:
+    """一次查询多个品种的双腿元信息，避免列表接口逐行查询。"""
+    normalized = {str(symbol or "").upper() for symbol in symbols if symbol}
+    if not normalized:
+        return {}
+    mappings = db.query(SymbolMapping).filter(SymbolMapping.symbol.in_(normalized)).all()
+    return {mapping.symbol.upper(): _leg_metadata(mapping) for mapping in mappings}
+
+
+def _rows_with_leg_metadata(db: Session, rows: list[Any]) -> list[dict[str, Any]]:
+    """批量附加双腿元信息；缺失映射时使用默认元信息。"""
+    data_rows = [as_dict(row) if not isinstance(row, dict) else dict(row) for row in rows]
+    metadata = _leg_metadata_by_symbol(db, {str(row.get("symbol") or "") for row in data_rows})
+    fallback = _leg_metadata(None)
+    for data in data_rows:
+        data.update(metadata.get(str(data.get("symbol") or "").upper(), fallback))
+    return data_rows
+
+
 def _row_with_leg_metadata(db: Session, row: Any) -> dict[str, Any]:
     """在 as_dict 基础上附加双腿元信息列。"""
     data = as_dict(row) if not isinstance(row, dict) else dict(row)

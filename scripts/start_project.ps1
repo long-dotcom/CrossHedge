@@ -17,6 +17,7 @@ $BackendDir = Join-Path $Root "backend"
 $FrontendDir = Join-Path $Root "frontend"
 $RunDir = Join-Path $Root ".run"
 $BackendPidFile = Join-Path $RunDir "backend.pid"
+$ExecutionWorkerPidFile = Join-Path $RunDir "execution-worker.pid"
 $FrontendPidFile = Join-Path $RunDir "frontend.pid"
 $LogDir = Join-Path $RunDir "logs"
 
@@ -54,6 +55,15 @@ $BackendArgs = @(
 $BackendProcess = Start-Process powershell.exe -ArgumentList $BackendArgs -PassThru -WindowStyle Normal
 $BackendProcess.Id | Set-Content $BackendPidFile
 
+$ExecutionWorkerArgs = @(
+    "-NoExit",
+    "-ExecutionPolicy", "Bypass",
+    "-Command",
+    "Set-Location '$BackendDir'; & '$VenvPython' -m app.execution.worker_main"
+)
+$ExecutionWorkerProcess = Start-Process powershell.exe -ArgumentList $ExecutionWorkerArgs -PassThru -WindowStyle Normal
+$ExecutionWorkerProcess.Id | Set-Content $ExecutionWorkerPidFile
+
 $FrontendArgs = @(
     "-NoExit",
     "-ExecutionPolicy", "Bypass",
@@ -64,6 +74,7 @@ $FrontendProcess = Start-Process powershell.exe -ArgumentList $FrontendArgs -Pas
 $FrontendProcess.Id | Set-Content $FrontendPidFile
 
 Write-Host "Backend started: http://127.0.0.1:$BackendPort"
+Write-Host "Execution worker started: PID=$($ExecutionWorkerProcess.Id)"
 Write-Host "Frontend started: http://127.0.0.1:$FrontendPort"
 Write-Host "PID files: $RunDir"
 

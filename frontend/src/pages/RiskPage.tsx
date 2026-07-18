@@ -1,6 +1,6 @@
 import { ThunderboltOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Descriptions, Space, Table, Tag, message } from 'antd';
+import { Alert, Button, Card, Descriptions, Input, Modal, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
@@ -9,6 +9,7 @@ import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
 import { fmtLocalTime, fmtMoney, fmtPct, riskModeLabel, riskModeColor } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
+import { QueryErrorAlert } from '../components/QueryErrorAlert';
 
 const EVENT_PAGE_SIZE = 10;
 
@@ -16,8 +17,10 @@ export function RiskPage() {
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const [eventPage, setEventPage] = useState(1);
+  const [stopOpen, setStopOpen] = useState(false);
+  const [stopText, setStopText] = useState('');
   const streamStatus = usePageStream('risk', { page: eventPage, pageSize: EVENT_PAGE_SIZE });
-  useHeaderStreamStatus(streamStatus.online);
+  useHeaderStreamStatus(streamStatus);
   const status = useQuery({ queryKey: ['risk-status'], queryFn: async () => (await api.get('/risk/status')).data });
   const events = useQuery({ queryKey: ['risk-events', eventPage], queryFn: async () => (await api.get('/risk/events', { params: { page: eventPage, page_size: EVENT_PAGE_SIZE } })).data });
   const eventRows = events.data?.items || [];
@@ -25,6 +28,8 @@ export function RiskPage() {
     mutationFn: async () => (await api.post('/risk/emergency-stop')).data,
     onSuccess: () => {
       messageApi.success('已触发紧急停止');
+      setStopOpen(false);
+      setStopText('');
       queryClient.invalidateQueries({ queryKey: ['risk-status'] });
     }
   });
@@ -41,8 +46,9 @@ export function RiskPage() {
       {contextHolder}
       <Card
         title="风控中心"
-        extra={<Button danger icon={<ThunderboltOutlined />} loading={stop.isPending} onClick={() => stop.mutate()}>紧急停止</Button>}
+        extra={<Button danger icon={<ThunderboltOutlined />} loading={stop.isPending} onClick={() => setStopOpen(true)}>紧急停止</Button>}
       >
+        <QueryErrorAlert error={status.error} onRetry={() => status.refetch()} title="风控状态加载失败" />
         <Descriptions column={4} size="small">
           <Descriptions.Item label="模式"><Tag color={riskModeColor(risk.mode)}>{riskModeLabel(risk.mode)}</Tag></Descriptions.Item>
           <Descriptions.Item label="单笔上限">{fmtMoney(risk.max_order_notional)}</Descriptions.Item>
@@ -56,6 +62,7 @@ export function RiskPage() {
           <Descriptions.Item label="API 错误">{risk.max_api_errors}</Descriptions.Item>
         </Descriptions>
       </Card>
+      <QueryErrorAlert error={events.error} onRetry={() => events.refetch()} title="风控事件加载失败" />
       <Card title="风控事件" className="risk-events-card fill-card">
         <Table
           rowKey="id"
@@ -67,6 +74,10 @@ export function RiskPage() {
           pagination={{ current: eventPage, pageSize: EVENT_PAGE_SIZE, total: events.data?.total || 0, onChange: setEventPage }}
         />
       </Card>
+      <Modal title="确认紧急停止" open={stopOpen} okText="确认停止" okButtonProps={{ danger: true, disabled: stopText !== 'STOP', loading: stop.isPending }} onOk={() => stop.mutate()} onCancel={() => { setStopOpen(false); setStopText(''); }}>
+        <Alert type="error" showIcon message="该操作会禁止所有新开仓" description="现有仓位不会自动消失，请继续关注对冲组和平仓状态。输入 STOP 后才能确认。" />
+        <Input className="danger-confirm-input" value={stopText} onChange={(event) => setStopText(event.target.value)} placeholder="输入 STOP" autoComplete="off" />
+      </Modal>
     </div>
   );
 }

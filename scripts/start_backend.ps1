@@ -14,6 +14,11 @@ $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 $BackendDir = Join-Path $Root "backend"
 $RunDir = Join-Path $Root ".run"
 $BackendPidFile = Join-Path $RunDir "backend.pid"
+$ExecutionWorkerPidFile = Join-Path $RunDir "execution-worker.pid"
+$BackendStdout = Join-Path $RunDir "backend-current.out.log"
+$BackendStderr = Join-Path $RunDir "backend-current.err.log"
+$ExecutionWorkerStdout = Join-Path $RunDir "execution-worker-current.out.log"
+$ExecutionWorkerStderr = Join-Path $RunDir "execution-worker-current.err.log"
 
 function Assert-File($Path, $Message) {
     if (-not (Test-Path $Path)) {
@@ -35,15 +40,25 @@ if (Test-PortInUse $BackendPort) {
     throw "Backend port $BackendPort is already in use. Run stop_project.cmd or close the process manually."
 }
 
+$ExecutionWorkerArgs = @(
+    "-ExecutionPolicy", "Bypass",
+    "-Command",
+    "Set-Location '$BackendDir'; & '$VenvPython' -m app.execution.worker_main"
+)
+$ExecutionWorkerProcess = Start-Process powershell.exe -ArgumentList $ExecutionWorkerArgs -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $ExecutionWorkerStdout -RedirectStandardError $ExecutionWorkerStderr
+$ExecutionWorkerProcess.Id | Set-Content $ExecutionWorkerPidFile
+
 $BackendArgs = @(
-    "-NoExit",
     "-ExecutionPolicy", "Bypass",
     "-Command",
     # 使用虚拟环境中的 Python 启动 uvicorn 后端服务
     "Set-Location '$BackendDir'; & '$VenvPython' -m uvicorn app.main:app --host 127.0.0.1 --port $BackendPort"
 )
-$BackendProcess = Start-Process powershell.exe -ArgumentList $BackendArgs -PassThru -WindowStyle Normal
+$BackendProcess = Start-Process powershell.exe -ArgumentList $BackendArgs -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $BackendStdout -RedirectStandardError $BackendStderr
 $BackendProcess.Id | Set-Content $BackendPidFile
 
 Write-Host "Backend started: http://127.0.0.1:$BackendPort"
+Write-Host "Execution worker started: PID=$($ExecutionWorkerProcess.Id)"
 Write-Host "Frontend should be served by Nginx from frontend\dist."

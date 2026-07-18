@@ -89,7 +89,7 @@ def positions(
 ) -> list[dict[str, Any]]:
     """实时持仓列表。
 
-    页面展示直接读取各 adapter 当前状态；非原生交易所从 Nautilus runtime/cache 读取。
+    页面展示直接读取各原生连接器当前状态。
     """
     return live_positions_payload(db)
 

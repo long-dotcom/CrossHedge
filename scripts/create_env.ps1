@@ -23,7 +23,6 @@ if ((Test-Path $EnvFile) -and (-not $Force)) {
 Copy-Item -Path $EnvExample -Destination $EnvFile -Force
 
 $content = Get-Content $EnvFile -Raw
-$content = $content -replace "NAUTILUS_HYPERLIQUID_ENVIRONMENT=testnet", "NAUTILUS_HYPERLIQUID_ENVIRONMENT=mainnet"
 $content = $content -replace "QUOTE_SOURCE_MODE=paper", "QUOTE_SOURCE_MODE=live"
 $content | Set-Content -Path $EnvFile -Encoding utf8
 

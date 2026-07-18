@@ -65,7 +65,14 @@ export function SpreadAnalyticsPage() {
     queryFn: async () => (await api.get('/analytics/spread-series', { params: { symbol: activeSymbol, direction, range, basis } })).data
   });
   const executeCurrent = useMutation({
-    mutationFn: async () => (await api.post(`/markets/spreads/${activeSymbol}/execute`, null, { params: { direction, force: true } })).data,
+    mutationFn: async () => (await api.post(
+      `/markets/spreads/${activeSymbol}/execute`,
+      null,
+      {
+        params: { direction, force: true },
+        headers: { 'Idempotency-Key': `open:${activeSymbol}:${direction}:${crypto.randomUUID()}` }
+      }
+    )).data,
     onSuccess: (data) => {
       messageApi.success(`已提交 ${activeSymbol} 下单，对冲组 #${data.id}`);
       queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });

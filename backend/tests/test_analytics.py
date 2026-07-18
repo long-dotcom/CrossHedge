@@ -16,6 +16,7 @@ from app.analytics.funding import FundingPoint, bucket_funding_points, funding_h
 from app.analytics.lead_lag import lead_lag_report
 from app.strategy.statistical_signal import evaluate_entry_signal, refresh_signal_stats_cache
 from app.market.quotes import quote_cache
+from app.market import scanner as scanner_module
 import time
 
 
@@ -518,7 +519,7 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
 
     assert [point.spread for point in points] == [100]
 
-def test_funding_history_uses_binance_funding_via_nautilus(monkeypatch) -> None:
+def test_funding_history_uses_binance_native_funding(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)

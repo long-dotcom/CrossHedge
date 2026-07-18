@@ -1292,6 +1292,203 @@ body,
   margin-bottom: 16px;
 }
 
+.symbol-mapping-modal .ant-modal-content {
+  overflow: hidden;
+  padding: 0;
+}
+
+.symbol-mapping-modal .ant-modal-header {
+  margin: 0;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.symbol-mapping-modal .ant-modal-body {
+  max-height: min(720px, calc(100vh - 180px));
+  overflow-y: auto;
+  padding: 0 24px 20px;
+  background: #f8fafc;
+}
+
+.symbol-mapping-modal .ant-modal-footer {
+  margin: 0;
+  padding: 14px 24px;
+  border-top: 1px solid #eef2f7;
+  background: #fff;
+}
+
+.symbol-mapping-form .ant-input,
+.symbol-mapping-form .ant-input-number,
+.symbol-mapping-form .ant-select {
+  width: 100%;
+}
+
+.symbol-mapping-tabs > .ant-tabs-nav {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+  margin: 0 -24px 18px;
+  padding: 0 24px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(8px);
+}
+
+.mapping-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #eff6ff 0%, #f8fbff 100%);
+}
+
+.mapping-toolbar-title {
+  color: #172554;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.mapping-toolbar-subtitle,
+.mapping-section-note {
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.mapping-toolbar .ant-form-item {
+  margin: 0;
+}
+
+.mapping-section {
+  margin-bottom: 14px;
+  padding: 16px 18px 2px;
+  border: 1px solid #e5eaf1;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+}
+
+.mapping-section-muted {
+  background: #fbfcfe;
+}
+
+.mapping-section-title {
+  margin-bottom: 14px;
+  color: #1e293b;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.mapping-section-note {
+  margin-top: -10px;
+  margin-bottom: 14px;
+}
+
+.mapping-field-grid {
+  display: grid;
+  gap: 0 16px;
+  align-items: start;
+}
+
+.mapping-field-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mapping-field-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.mapping-field-grid-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.mapping-field-grid .ant-form-item,
+.mapping-leg-card .ant-form-item {
+  min-width: 0;
+  margin-bottom: 14px;
+}
+
+.mapping-leg-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.mapping-leg-card {
+  padding: 14px 14px 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  background: #fbfdff;
+}
+
+.mapping-leg-a {
+  border-top: 3px solid #1677ff;
+}
+
+.mapping-leg-b {
+  border-top: 3px solid #13a8a8;
+}
+
+.mapping-leg-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: #334155;
+  font-weight: 700;
+}
+
+.mapping-leg-heading span {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: #e8f3ff;
+  color: #1677ff;
+  font-size: 12px;
+}
+
+.mapping-leg-b .mapping-leg-heading span {
+  background: #e6fffb;
+  color: #08979c;
+}
+
+.mapping-leg-link {
+  position: relative;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.mapping-leg-link::before,
+.mapping-leg-link::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 1px;
+  background: #94a3b8;
+}
+
+.mapping-leg-link::before {
+  left: 0;
+}
+
+.mapping-leg-link::after {
+  right: 0;
+}
+
+.mapping-tab-alert {
+  margin-bottom: 14px;
+}
+
 @media (max-width: 1280px) {
   .settings-group-grid,
   .settings-risk-grid {
@@ -1302,6 +1499,26 @@ body,
 @media (max-width: 760px) {
   .settings-field-grid {
     grid-template-columns: 1fr;
+  }
+
+  .symbol-mapping-modal {
+    max-width: calc(100vw - 20px);
+  }
+
+  .mapping-field-grid-2,
+  .mapping-field-grid-3,
+  .mapping-field-grid-4,
+  .mapping-leg-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mapping-leg-link {
+    padding: 2px 0;
+  }
+
+  .mapping-leg-link::before,
+  .mapping-leg-link::after {
+    display: none;
   }
 }
 
@@ -3044,4 +3261,15 @@ body,
   .pool-flow {
     grid-template-columns: 86px 78px minmax(360px, 1fr) 78px 92px;
   }
+}
+/* 通用路由加载与危险确认交互 */
+.route-loading {
+  min-height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.danger-confirm-input {
+  margin-top: 16px;
 }

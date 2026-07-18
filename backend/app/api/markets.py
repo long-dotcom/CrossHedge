@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
@@ -31,12 +31,11 @@ from app.db.models import (
     ArbitrageOpportunity,
     SpreadCurrent,
     SpreadDirectionCurrent,
-    StrategySetting,
     SymbolMapping,
     User,
 )
 from app.db.session import get_db
-from app.execution.engine import open_hedge_group
+from app.execution.coordinator import create_open_intent
 from app.market.quotes import quote_cache
 from app.market.scan_state import scan_state_store
 from app.market.scanner import run_scan
@@ -50,9 +49,9 @@ router = APIRouter()
 # 内部辅助：从价差创建套利机会
 # ---------------------------------------------------------------------------
 
-def _current_row_notional(row: SpreadDirectionCurrent, strategy: StrategySetting) -> float:
+def _current_row_notional(row: SpreadDirectionCurrent, mapping: SymbolMapping) -> float:
     """根据价差行和策略设置估算名义价值。"""
-    configured = float(strategy.default_notional or 0.0)
+    configured = float(mapping.target_notional or 0.0)
     leg_a_mid = (float(row.leg_a_bid or 0.0) + float(row.leg_a_ask or 0.0)) / 2
     estimated = leg_a_mid * float(row.leg_a_quantity or row.quantity or 0.0)
     return max(configured, estimated, 0.0)
@@ -97,11 +96,10 @@ def _create_current_symbol_opportunity(
         raise HTTPException(status_code=400, detail="当前品种没有方向快照")
 
     row = executable[0] if executable else rows[0]
-    strategy = db.query(StrategySetting).first() or StrategySetting()
     opportunity = ArbitrageOpportunity(
         symbol=normalized,
         direction=row.direction,
-        notional=_current_row_notional(row, strategy),
+        notional=_current_row_notional(row, mapping),
         quantity=row.quantity,
         leg_b_quantity=row.leg_b_quantity or row.quantity,
         leg_a_quantity=row.leg_a_quantity or row.quantity,
@@ -227,21 +225,30 @@ def spreads(
     return {"total": total, "items": [_row_with_leg_metadata(db, r) for r in rows]}
 
 
-@router.post("/spreads/{symbol}/execute")
+@router.post("/spreads/{symbol}/execute", status_code=202)
 def execute_current_symbol(
     symbol: str,
     direction: str = "",
     force: bool = False,
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
 ) -> dict[str, Any]:
-    """从当前价差直接创建机会并执行开仓。"""
+    """从当前价差创建机会和异步 OPEN Intent。"""
     opportunity = _create_current_symbol_opportunity(
         db, symbol, user.username, direction=direction, force=force,
     )
     try:
-        group = open_hedge_group(db, opportunity.id, source=user.username, force_strategy_checks=force)
+        result = create_open_intent(
+            db,
+            opportunity_id=opportunity.id,
+            requested_by=f"user:{user.id}",
+            idempotency_key=idempotency_key,
+            source=user.username,
+            force_strategy_checks=force,
+        )
+        db.commit()
         from app.api.deps import as_dict
-        return as_dict(group)
+        return {"accepted": True, "created": result.created, "intent": as_dict(result.intent)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

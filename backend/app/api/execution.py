@@ -4,6 +4,7 @@
 
 - POST /execution/reconcile          —— 执行对账
 - POST /execution/venue-probe-test   —— Venue 探针测试
+- POST /execution/intents/{id}/replay —— 从不可变事件重建投影
 - GET  /orders                       —— 订单列表（分页）
 - GET  /fills                        —— 成交列表（分页）
 
@@ -17,21 +18,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
-from app.adapters.base import AdapterOrder
-from app.adapters.hyperliquid import HyperliquidAdapter, _load_hyperliquid_exchange
-from app.adapters.venue import build_market_adapter, mapping_leg
+from app.adapters.venue import mapping_leg
 from app.api.deps import _leg_metadata_for_symbol, _row_with_leg_metadata, audit
 from app.auth.dependencies import get_current_user, require_admin
-from app.config.settings import get_settings
-from app.db.models import Fill, Order, SymbolMapping, User
+from app.db.models import Fill, Order, ProbeRun, SymbolMapping, User
 from app.db.session import get_db
 from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.reconciler import run_execution_reconcile
-from app.schemas import VenueProbeTestIn
+from app.execution.probe_runs import create_probe_run, probe_run_payload
+from app.execution.replay import rebuild_intent_projection
+from app.venues.manager import native_venue_manager
+from app.schemas import ReplayExecutionIntentIn, VenueProbeTestIn
 
 # 带 /execution 前缀的路由器
 execution_router = APIRouter()
@@ -59,10 +60,12 @@ def execution_reconcile(
 @execution_router.post("/venue-probe-test")
 def venue_probe_test(
     payload: VenueProbeTestIn,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Venue 探针测试：模拟或真实提交一笔订单以验证连通性。"""
+    """Venue 探针测试；真实提交只创建可自动回平的独立 ProbeRun。"""
     side = payload.side.lower()
     if side not in {"buy", "sell"}:
         raise HTTPException(status_code=400, detail="side 必须是 buy 或 sell")
@@ -81,88 +84,110 @@ def venue_probe_test(
     else:
         venue_symbol = payload.symbol
 
-    settings = get_settings()
-    adapter = build_market_adapter(venue, live=True)
-    adapter.paper_price_probe = True
-    slippage = float(payload.slippage if payload.slippage is not None else settings.hyperliquid.paper_live_slippage)
-
     try:
-        if payload.quantity is not None:
-            probe_quantity = float(payload.quantity)
-        elif venue == "hyperliquid" and hasattr(adapter, "_probe_quantity"):
-            probe_quantity = adapter._probe_quantity(venue_symbol)
-        else:
-            # Nautilus venue 的真实最小下单量由 runtime 在提交时根据 instrument 规格计算；
-            # 这里的数量只作为 paper 账本测试数量展示。
-            probe_quantity = 1.0
-        if venue == "hyperliquid":
-            exchange = _load_hyperliquid_exchange(settings)
-            slippage_price = exchange._slippage_price(venue_symbol, side == "buy", slippage, None)
-        else:
-            exchange = None
-            slippage_price = 0.0
+        connector = native_venue_manager.connector_for(venue, "live")
+        instrument = connector.get_instrument(venue_symbol)
+        ticker = connector.get_ticker(venue_symbol)
+        reference_price = ticker.ask if side == "buy" else ticker.bid
+        probe_quantity = instrument.minimum_quantity
+        if instrument.minimum_notional > 0 and reference_price > 0:
+            probe_quantity = max(probe_quantity, instrument.minimum_notional / reference_price)
+            steps = (probe_quantity / instrument.quantity_step).to_integral_value(rounding="ROUND_CEILING")
+            probe_quantity = steps * instrument.quantity_step
+        probe_quantity = float(probe_quantity)
 
-        response: dict[str, Any] = {
+        preview: dict[str, Any] = {
             "symbol": payload.symbol,
             "venue": venue,
             "venue_symbol": venue_symbol,
             "side": side,
-            "reduce_only": payload.reduce_only,
+            "reduce_only": False,
             "submit": payload.submit,
             "probe_quantity": probe_quantity,
-            "slippage": slippage,
-            "slippage_price": slippage_price,
-            "asset": exchange.info.coin_to_asset.get(venue_symbol) if exchange else None,
             "status": "dry_run_ok",
+            "message": "真实提交将自动创建入口与明确反向退出 Intent，并验证仓位恢复基线",
         }
 
         if not payload.submit:
             audit(db, user.id, "venue_probe_dry_run", "execution", f"{venue}:{venue_symbol} {side} {probe_quantity}")
             db.commit()
-            return response
+            return preview
 
         confirmation_phrase = f"SUBMIT {venue.upper()} PROBE"
         if payload.confirmation != confirmation_phrase:
             raise HTTPException(status_code=400, detail=f"真实提交必须传 confirmation='{confirmation_phrase}'")
 
-        order_result = adapter.place_order(
-            AdapterOrder(
-                platform=venue,
-                symbol=payload.symbol,
-                venue_symbol=venue_symbol,
-                side=side,
-                quantity=probe_quantity,
-                order_type="market",
-                reduce_only=payload.reduce_only,
-            )
+        if not idempotency_key:
+            raise HTTPException(status_code=400, detail="真实 Probe 必须提供 Idempotency-Key")
+        if payload.reduce_only:
+            raise HTTPException(status_code=400, detail="Probe 不接受客户端 reduce_only；Binance Hedge Mode 由服务端使用明确 PositionId")
+        if payload.quantity is not None:
+            raise HTTPException(status_code=400, detail="Probe 数量必须由交易所 instrument 最小量自动计算，禁止客户端覆盖")
+        run, result = create_probe_run(
+            db,
+            symbol=payload.symbol,
+            venue=venue,
+            side=side,
+            purpose="CONNECTIVITY",
+            requested_by=f"user:{user.id}",
+            idempotency_key=idempotency_key,
         )
-        response.update({
-            "status": order_result.status,
-            "success": order_result.success,
-            "external_order_id": order_result.external_order_id,
-            "filled_quantity": order_result.filled_quantity,
-            "average_price": order_result.average_price,
-            "fee": order_result.fee,
-            "message": order_result.error_message,
-        })
-        audit(db, user.id, "venue_probe_submit", "execution", f"{venue}:{venue_symbol} {side} {probe_quantity} {order_result.status}")
+        audit(db, user.id, "probe_run_created", "execution", f"probe_run={run.id} intent={result.intent.id} {venue}:{venue_symbol} {side}")
         db.commit()
-        return response
+        db.refresh(run)
+        response.status_code = 202
+        return {**probe_run_payload(db, run), "created": result.created}
 
     except HTTPException:
         raise
     except Exception as exc:
-        return {
-            "symbol": payload.symbol,
-            "venue": venue,
-            "venue_symbol": venue_symbol,
-            "side": side,
-            "reduce_only": payload.reduce_only,
-            "submit": payload.submit,
-            "status": "failed",
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-        }
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@execution_router.get("/probe-runs/{probe_run_id}")
+def get_probe_run(
+    probe_run_id: int,
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """读取独立探针的入口、退出、残量与仓位基线确认状态。"""
+    run = db.get(ProbeRun, probe_run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="ProbeRun 不存在")
+    return probe_run_payload(db, run)
+
+
+@execution_router.post("/intents/{intent_id}/replay")
+def replay_execution_intent(
+    intent_id: int,
+    payload: ReplayExecutionIntentIn,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """仅重建数据库投影；不创建 Outbox，也不向任何交易场所发送命令。"""
+    confirmation = f"REPLAY {intent_id}"
+    if payload.confirmation != confirmation:
+        raise HTTPException(status_code=400, detail=f"重建必须传 confirmation='{confirmation}'")
+    try:
+        result = rebuild_intent_projection(db, intent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit(
+        db,
+        user.id,
+        "replay_execution_intent",
+        "execution_intent",
+        f"intent={result.intent_id} events={result.event_count} orders={result.order_count} status={result.intent_status}",
+    )
+    db.commit()
+    return {
+        "status": "ok",
+        "intent_id": result.intent_id,
+        "event_count": result.event_count,
+        "order_count": result.order_count,
+        "intent_status": result.intent_status,
+        "external_commands_created": 0,
+    }
 
 
 # ---------------------------------------------------------------------------

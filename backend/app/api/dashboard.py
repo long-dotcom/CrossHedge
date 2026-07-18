@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from app.accounts.sync import latest_account_snapshots
@@ -76,11 +76,11 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     ).count()
     alerts = db.query(Alert).filter(Alert.acknowledged.is_(False)).count()
     risk = db.query(RiskSetting).first()
-    realized_pnl = sum(
-        float(value or 0.0)
-        for (value,) in db.query(HedgeGroup.realized_pnl)
+    realized_pnl = float(
+        db.query(func.coalesce(func.sum(HedgeGroup.realized_pnl), 0.0))
         .filter(HedgeGroup.status == "closed")
-        .all()
+        .scalar()
+        or 0.0
     )
     unrealized_pnl = _runtime_open_unrealized_pnl(db)
     return {
