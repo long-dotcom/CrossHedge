@@ -118,14 +118,18 @@ class NativeVenueManager:
                 venues.append(venue)
         loaded = []
         for venue in venues:
-            connector = self.connector_for(venue, "live")
-            if start:
-                connector.start()
-            if subscribe_market_data:
-                symbols = self.configured_symbols(venue)
-                if symbols:
-                    connector.subscribe_market_data(symbols)
-            loaded.append(venue)
+            try:
+                connector = self.connector_for(venue, "live")
+                if start:
+                    connector.start()
+                if subscribe_market_data:
+                    symbols = self.configured_symbols(venue)
+                    if symbols:
+                        connector.subscribe_market_data(symbols)
+                loaded.append(venue)
+            except Exception as exc:
+                # 独立 Gateway 或单一交易所不可用时，不影响其他连接器和 Paper 服务启动。
+                logger.warning("原生连接器预热跳过: venue={}, error={}", venue, exc)
         return loaded
 
     def configured_symbols(self, venue: str) -> tuple[str, ...]:

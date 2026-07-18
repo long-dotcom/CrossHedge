@@ -348,7 +348,7 @@ def test_pipeline_pool_payload_accepts_hedge_group_snapshot() -> None:
     assert item["id"] == 10
     assert item["age_ms"] == 0
 
-def test_spread_and_opportunity_apis_prefer_memory_scan_state() -> None:
+def test_spread_and_opportunity_apis_prefer_shared_scan_state() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)

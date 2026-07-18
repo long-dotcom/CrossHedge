@@ -10,7 +10,7 @@ MT5 连接初始化模块
 
 使用方式::
 
-    from app.core.mt5_bootstrap import ensure_mt5_connected, ensure_mt5_symbol_selected
+    from mt5_gateway.mt5_bootstrap import ensure_mt5_connected, ensure_mt5_symbol_selected
 
     if ensure_mt5_connected():
         if ensure_mt5_symbol_selected("EURUSD"):

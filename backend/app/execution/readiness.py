@@ -8,7 +8,7 @@
 - 外部仓位安全性（孤儿仓位、残余仓位检测）
 - Paper-live 探针凭证检查
 
-使用 ``ensure_mt5_connected`` 统一 MT5 连接初始化，
+通过 Redis 心跳和快照检查 MT5 Gateway，
 使用 ``post_hyperliquid_info`` 统一 Hyperliquid HTTP 调用。
 
 使用方式::
@@ -23,16 +23,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib import import_module
 
 from sqlalchemy.orm import Session
 
 from app.config.settings import Settings, get_settings
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.db.models import ExchangeCredential, HedgeGroup, Position, SymbolMapping, SystemSetting
 from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_probe_enabled
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -261,12 +260,7 @@ def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
             "MT5 实盘下单开关已开启" if settings.mt5.live_order_enabled else "MT5_LIVE_ORDER_ENABLED 未开启",
         )
     ]
-    try:
-        mt5 = import_module("MetaTrader5")
-        checks.append(ReadinessCheck("metatrader5_import", "ok", "MetaTrader5 Python 包可导入"))
-        checks.append(_mt5_read_probe(mt5, settings))
-    except Exception as exc:
-        checks.append(ReadinessCheck("metatrader5_import", "block", f"MetaTrader5 Python 包不可导入: {exc}"))
+    checks.append(_mt5_gateway_probe(expect_demo=False))
     if settings.mt5.login and settings.mt5.server:
         checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置"))
     else:
@@ -283,12 +277,7 @@ def _mt5_demo_checks(settings: Settings) -> list[ReadinessCheck]:
             "MT5 demo 下单开关已开启" if settings.mt5.demo_order_enabled else "MT5_DEMO_ORDER_ENABLED 未开启",
         )
     ]
-    try:
-        mt5 = import_module("MetaTrader5")
-        checks.append(ReadinessCheck("metatrader5_import", "ok", "MetaTrader5 Python 包可导入"))
-        checks.append(_mt5_demo_probe(mt5, settings))
-    except Exception as exc:
-        checks.append(ReadinessCheck("metatrader5_import", "block", f"MetaTrader5 Python 包不可导入: {exc}"))
+    checks.append(_mt5_gateway_probe(expect_demo=True))
     if settings.mt5.login and settings.mt5.server:
         checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置，并会用于锁定 demo 账户身份"))
     else:
@@ -436,51 +425,22 @@ def _hyperliquid_read_probe(settings: Settings, user: str) -> ReadinessCheck:
         return ReadinessCheck("hyperliquid_read_probe", "block", f"Hyperliquid clearinghouseState 只读探测失败: {exc}")
 
 
-def _mt5_read_probe(mt5, settings: Settings) -> ReadinessCheck:
-    """MT5 只读探测 —— 使用 ``ensure_mt5_connected`` 连接后查询账户信息。"""
+def _mt5_gateway_probe(*, expect_demo: bool) -> ReadinessCheck:
+    """通过 Redis 心跳和账户快照检查独立 MT5 Gateway。"""
     try:
-        connected = ensure_mt5_connected(
-            login=settings.mt5.login or None,
-            password=settings.mt5.password or None,
-            server=settings.mt5.server or None,
-        )
-        if not connected:
-            return ReadinessCheck("mt5_read_probe", "block", f"MT5 initialize 失败: {mt5.last_error()}")
-        info = mt5.account_info()
-        if not info:
-            return ReadinessCheck("mt5_read_probe", "block", f"MT5 account_info 为空: {mt5.last_error()}")
-        login = getattr(info, "login", "")
-        server = getattr(info, "server", "")
-        return ReadinessCheck("mt5_read_probe", "ok", f"MT5 account_info 只读探测成功: {login} {server}".strip())
+        connector = native_venue_manager.connector_for("mt5", "live")
+        health = connector.health()
+        if not health.get("connected"):
+            return ReadinessCheck("mt5_gateway", "block", str(health.get("error") or "MT5 Gateway 未连接"))
+        account = connector.get_account()
+        if expect_demo:
+            trade_mode = int(account.raw.get("trade_mode", -1))
+            if trade_mode != 0:
+                return ReadinessCheck("mt5_demo_account", "block", f"MT5 Gateway 当前不是 Demo 账户: {account.account_id}")
+        name = "mt5_demo_account" if expect_demo else "mt5_read_probe"
+        return ReadinessCheck(name, "ok", f"MT5 Gateway 账户快照可读: {account.account_id}".strip())
     except Exception as exc:
-        return ReadinessCheck("mt5_read_probe", "block", f"MT5 account_info 只读探测失败: {exc}")
-    finally:
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-
-
-def _mt5_demo_probe(mt5, settings: Settings) -> ReadinessCheck:
-    """MT5 demo 账户探测 —— 使用 ``ensure_mt5_connected`` 连接后检查 demo 下单能力。"""
-    try:
-        connected = ensure_mt5_connected(
-            login=settings.mt5.login or None,
-            password=settings.mt5.password or None,
-            server=settings.mt5.server or None,
-        )
-        if not connected:
-            return ReadinessCheck("mt5_demo_account", "block", f"MT5 initialize 失败: {mt5.last_error()}")
-        from app.adapters.mt5 import mt5_demo_order_check
-        check = mt5_demo_order_check(mt5, settings)
-        return ReadinessCheck("mt5_demo_account", "ok" if check.allowed else "block", check.message)
-    except Exception as exc:
-        return ReadinessCheck("mt5_demo_account", "block", f"MT5 demo 账户检查失败: {exc}")
-    finally:
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
+        return ReadinessCheck("mt5_gateway", "block", f"MT5 Gateway 探测失败: {exc}")
 
 
 def _overall_status(checks: list[ReadinessCheck]) -> str:

@@ -84,7 +84,7 @@ def _reconcile_impl(db: Session) -> int:
     reconciled += reconcile_orphan_positions(db)
     # 分批回填历史订单；幂等事件 ID 保证重启或重复扫描不会重复写入。
     project_unmirrored_legacy_orders(db)
-    # 同步完成后刷新内存对冲池
+    # 同步完成后刷新 Redis 对冲组快照
     hedge_pool.load_from_db(db)
     return reconciled
 

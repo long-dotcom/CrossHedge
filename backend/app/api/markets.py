@@ -202,7 +202,7 @@ def spreads(
     page_size: int = 20,
     symbol: str = "",
 ) -> dict[str, Any]:
-    """当前价差列表（分页）。优先使用内存中的扫描状态。"""
+    """当前价差列表（分页）。优先使用 Redis 中的扫描状态。"""
     enabled_symbols = _enabled_symbol_names(db)
     state = scan_state_store.snapshot()
     if state["ready"]:

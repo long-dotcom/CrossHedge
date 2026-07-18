@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from time import monotonic
 from types import SimpleNamespace
 
 import yaml
@@ -25,13 +24,16 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.logging import get_logger
+from app.core.cache import TTLCache
 from app.db.models import SymbolMapping
 
 logger = get_logger(__name__)
 
 # 品种映射缓存：(bind_id, 缓存时间, 缓存数据)
-_mapping_cache: tuple[int, float, list[SimpleNamespace]] = (0, 0.0, [])
 _MAPPING_CACHE_TTL_SECONDS = 2.0
+_mapping_cache: TTLCache[list[SimpleNamespace]] = TTLCache(
+    ttl_seconds=_MAPPING_CACHE_TTL_SECONDS, namespace="symbol-mappings",
+)
 
 
 def load_symbol_mapping_file() -> list[dict]:
@@ -132,8 +134,7 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
 
 def clear_symbol_mapping_cache() -> None:
     """清空品种映射缓存，强制下次查询重新从数据库加载。"""
-    global _mapping_cache
-    _mapping_cache = (0, 0.0, [])
+    _mapping_cache.clear()
 
 
 def enabled_mappings(db: Session) -> list[SimpleNamespace]:
@@ -150,11 +151,12 @@ def enabled_mappings(db: Session) -> list[SimpleNamespace]:
     返回:
         已启用品种映射的 SimpleNamespace 列表，按 symbol 排序。
     """
-    global _mapping_cache
-    now = monotonic()
-    bind_id = id(db.get_bind())
-    cached_bind_id, cached_at, cached = _mapping_cache
-    if cached and cached_bind_id == bind_id and now - cached_at < _MAPPING_CACHE_TTL_SECONDS:
+    bind = db.get_bind()
+    bind_key = str(bind.url)
+    if bind_key.endswith(":memory:"):
+        bind_key = f"{bind_key}:{id(bind)}"
+    cached = _mapping_cache.get(bind_key)
+    if cached:
         return cached
 
     rows = (
@@ -164,7 +166,7 @@ def enabled_mappings(db: Session) -> list[SimpleNamespace]:
         .all()
     )
     cached = [_snapshot_mapping(row) for row in rows]
-    _mapping_cache = (bind_id, now, cached)
+    _mapping_cache.set(bind_key, cached)
     return cached
 
 

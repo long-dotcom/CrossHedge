@@ -102,7 +102,7 @@ _scan_timings: dict[str, dict[str, float]] = {}
 
 # 策略配置缓存：使用 TTLCache 替代手写 tuple+monotonic
 from app.core.cache import TTLCache
-_strategy_cache: TTLCache[SimpleNamespace] = TTLCache(ttl_seconds=2.0)
+_strategy_cache: TTLCache[SimpleNamespace] = TTLCache(ttl_seconds=2.0, namespace="strategy-settings")
 
 
 def clear_strategy_setting_cache() -> None:
@@ -113,9 +113,13 @@ def clear_strategy_setting_cache() -> None:
 def get_strategy_setting(db: Session) -> SimpleNamespace:
     """获取策略配置（带 2 秒 TTL 缓存）。
 
-    缓存键使用 db bind id，确保不同会话不共享。
+    生产数据库使用稳定 URL 键，供 API 与 Worker 共享；内存数据库按实例隔离。
     """
-    cache_key = f"strategy_{id(db.get_bind())}"
+    bind = db.get_bind()
+    bind_key = str(bind.url)
+    if bind_key.endswith(":memory:"):
+        bind_key = f"{bind_key}:{id(bind)}"
+    cache_key = f"strategy_{bind_key}"
     cached = _strategy_cache.get(cache_key)
     if cached:
         return cached

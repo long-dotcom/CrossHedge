@@ -8,19 +8,17 @@
 - Leg B（MT5）：通过 symbol_info_tick 刷新
 
 使用 ``post_hyperliquid_info`` 统一 HTTP 调用，
-使用 ``ensure_mt5_connected`` 替代手写 MT5 初始化。
+MT5 报价通过 Redis Gateway 代理读取。
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from app.config.settings import get_settings
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.market.orderbook import order_book_cache, parse_l2_levels
 from app.market.quotes import quote_cache
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -89,32 +87,14 @@ def _write_leg_a_levels(symbol: str, levels, source: str) -> None:
 
 
 def _refresh_leg_b_quote(mapping) -> bool:
-    """通过 MT5 symbol_info_tick 刷新 Leg B 报价。"""
+    """通过独立 MT5 Gateway 刷新 Leg B 报价。"""
     try:
-        import MetaTrader5 as mt5  # type: ignore
-    except Exception:
-        return False
-    settings = get_settings()
-    if not ensure_mt5_connected(
-        login=settings.mt5.login,
-        password=settings.mt5.password,
-        server=settings.mt5.server,
-    ):
-        return False
-    try:
-        if not mt5.symbol_select(mapping.mt5_symbol, True):
-            return False
-        tick = mt5.symbol_info_tick(mapping.mt5_symbol)
-        if not tick:
-            return False
-        exchange_ts = (
-            datetime.utcfromtimestamp(getattr(tick, "time_msc", 0) / 1000)
-            if getattr(tick, "time_msc", 0)
-            else None
-        )
+        connector = native_venue_manager.connector_for("mt5", "live")
+        tick = connector.get_ticker(mapping.mt5_symbol)
+        depth = min(tick.bid * tick.bid_quantity, tick.ask * tick.ask_quantity)
         quote_cache.put(
-            "mt5", mapping.symbol, tick.bid, tick.ask, 0.0,
-            "mt5_symbol_info_tick_execution_refresh", exchange_ts,
+            "mt5", mapping.symbol, float(tick.bid), float(tick.ask), float(depth),
+            "mt5_gateway_execution_refresh", tick.exchange_time,
         )
         return True
     except Exception:

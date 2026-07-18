@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.time_utils import utc_now
+from app.core.cache import TTLCache
 from app.venues.binance.rest import BinanceApiError, BinanceFuturesRestClient, normalize_symbol
 from app.venues.binance.websocket import BinanceWebSocketRuntime
 from app.venues.domain.capabilities import VenueCapabilities
@@ -61,9 +62,13 @@ class BinanceFuturesConnector:
             api_secret=str(values.get("api_secret") or ""),
             environment=environment,
         )
-        self._instrument_cache: dict[str, Instrument] = {}
+        self._instrument_cache: TTLCache[Instrument] = TTLCache(
+            ttl_seconds=21600, namespace=f"binance-instruments-{environment}",
+        )
         self._event_handlers: list[EventHandler] = []
-        self._ticker_cache: dict[str, Ticker] = {}
+        self._ticker_cache: TTLCache[Ticker] = TTLCache(
+            ttl_seconds=10, namespace=f"binance-tickers-{environment}",
+        )
         self._ws = BinanceWebSocketRuntime(
             self.rest,
             on_ticker=self._cache_ticker,
@@ -151,14 +156,15 @@ class BinanceFuturesConnector:
             if requested is not None and symbol not in requested:
                 continue
             instrument = self._instrument_from_payload(item)
-            self._instrument_cache[symbol] = instrument
+            self._instrument_cache.set(symbol, instrument)
             rows.append(instrument)
         return rows
 
     def get_instrument(self, symbol: str, *, refresh: bool = False) -> Instrument:
         key = normalize_symbol(symbol)
-        if not refresh and key in self._instrument_cache:
-            return self._instrument_cache[key]
+        cached = self._instrument_cache.get(key) if not refresh else None
+        if cached is not None:
+            return cached
         rows = self.get_instruments([key])
         if not rows:
             raise LookupError(f"Binance Futures 品种不存在: {key}")
@@ -177,7 +183,7 @@ class BinanceFuturesConnector:
             )
         except BinanceApiError:
             pass
-        self._instrument_cache[key] = instrument
+        self._instrument_cache.set(key, instrument)
         return instrument
 
     def get_ticker(self, symbol: str) -> Ticker:
@@ -326,7 +332,7 @@ class BinanceFuturesConnector:
         return CredentialCheck(self.venue, self.environment, account_id, valid, can_read, can_trade, tuple(items))
 
     def _cache_ticker(self, ticker: Ticker) -> None:
-        self._ticker_cache[ticker.symbol] = ticker
+        self._ticker_cache.set(ticker.symbol, ticker)
 
     def _instrument_from_payload(self, item: dict[str, Any]) -> Instrument:
         filters = {str(value.get("filterType")): value for value in item.get("filters", [])}

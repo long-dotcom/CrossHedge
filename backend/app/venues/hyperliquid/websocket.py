@@ -89,6 +89,7 @@ class HyperliquidWebSocketRuntime:
 
     def health(self) -> dict[str, Any]:
         return {
+            "ws_running": bool(self._thread and self._thread.is_alive()),
             "ws_connected": self._connected,
             "message_age_seconds": time.monotonic() - self._last_message_at if self._last_message_at else None,
             "symbols": sorted(self._symbols),

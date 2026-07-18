@@ -11,6 +11,7 @@ from app.db.models import (
     ArbitrageOpportunity, Base, SpreadCurrent, SpreadDirectionCurrent,
     RiskSetting, StrategySetting, SymbolMapping,
 )
+from app.core.time_utils import utc_now
 from app.market import scanner as scanner_module
 from app.market import symbols as symbol_module
 from app.market.orderbook import order_book_cache, simulate_market_fill
@@ -33,8 +34,8 @@ def test_quote_synchronizer_rejects_unsynced_quotes() -> None:
     cache = QuoteCache()
     sync = QuoteSynchronizer(cache)
     cache.put("hyperliquid", "BTC", 100, 101, 10000, "test")
-    quote = cache.put("mt5", "BTC", 102, 103, 10000, "test")
-    object.__setattr__(quote, "local_recv_ts", quote.local_recv_ts.replace(year=quote.local_recv_ts.year - 1))
+    current = utc_now()
+    cache.put("mt5", "BTC", 102, 103, 10000, "test", local_recv_ts=current.replace(year=current.year - 1))
     synced, reason = sync.synchronized("BTC", "strict", max_time_diff_ms=100, max_age_ms=1000)
     assert synced is None
     assert "过期" in reason or "未对齐" in reason

@@ -56,7 +56,7 @@ def run_auto_close(db: Session) -> int:
     mappings = {mapping.symbol: mapping for mapping in enabled_mappings(db)}
     for snapshot in hedge_pool.snapshot_open_groups(modes):
         try:
-            # 数据库是权威状态；内存池只能用于候选遍历。
+            # 数据库是权威状态；Redis 快照池只用于候选遍历。
             group = db.get(HedgeGroup, snapshot.id)
             if group is None or group.status not in {"open", "open_partial"}:
                 continue

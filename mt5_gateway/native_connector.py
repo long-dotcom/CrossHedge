@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from app.core.mt5_bootstrap import ensure_mt5_connected
+from mt5_gateway.mt5_bootstrap import ensure_mt5_connected
 from app.core.time_utils import utc_now
 from app.venues.domain.capabilities import VenueCapabilities
 from app.venues.domain.models import (
@@ -32,7 +32,7 @@ from app.venues.domain.models import (
     Side,
     Ticker,
 )
-from app.venues.mt5.poller import MT5OrderPoller
+from mt5_gateway.poller import MT5OrderPoller
 from app.venues.protocols import EventHandler
 
 

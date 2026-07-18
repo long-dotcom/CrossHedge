@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.config.settings import HYPERLIQUID_MAINNET_API_URL
+from app.core.cache import TTLCache
 from app.core.http_client import post_hyperliquid_info
 from app.core.time_utils import utc_now
 from app.venues.domain.capabilities import VenueCapabilities
@@ -73,7 +74,8 @@ class HyperliquidConnector:
         self._info_transport = info_transport or post_hyperliquid_info
         self._exchange_factory = exchange_factory
         self._exchange = None
-        self._instruments: dict[str, Instrument] = {}
+        namespace = f"hl-instruments:{self.environment}:{hashlib.sha256(self.info_url.encode()).hexdigest()[:12]}"
+        self._instruments: TTLCache[Instrument] = TTLCache(ttl_seconds=21600, namespace=namespace)
         self._ws = HyperliquidWebSocketRuntime(
             ws_url=self.ws_url,
             account_address=self.account_address,
@@ -86,11 +88,15 @@ class HyperliquidConnector:
         self._ws.stop()
 
     def health(self) -> dict:
-        try:
-            self._info({"type": "meta"})
-            return {"venue": self.venue, "status": "ok", **self._ws.health()}
-        except Exception as exc:
-            return {"venue": self.venue, "status": "degraded", "error": str(exc), **self._ws.health()}
+        """只读取本地 WebSocket 状态，健康轮询不得消耗 REST 配额。"""
+        websocket = self._ws.health()
+        connected = bool(websocket.get("ws_connected"))
+        return {
+            "venue": self.venue,
+            "status": "ok" if connected else "degraded",
+            "error": "" if connected else "Hyperliquid WebSocket 未连接",
+            **websocket,
+        }
 
     def get_account(self) -> AccountSnapshot:
         self._require_account()
@@ -181,13 +187,14 @@ class HyperliquidConnector:
                 trading_enabled=not bool(item.get("isDelisted", False)),
                 raw={"meta": item, "context": context},
             )
-            self._instruments[symbol] = instrument
+            self._instruments.set(symbol, instrument)
             rows.append(instrument)
         return rows
 
     def get_instrument(self, symbol: str, *, refresh: bool = False) -> Instrument:
-        if not refresh and symbol in self._instruments:
-            return self._instruments[symbol]
+        cached = None if refresh else self._instruments.get(symbol)
+        if cached is not None:
+            return cached
         rows = self.get_instruments([symbol])
         if not rows:
             raise LookupError(f"Hyperliquid 品种不存在: {symbol}")

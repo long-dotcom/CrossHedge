@@ -6,10 +6,8 @@ MT5 会话状态管理模块
 
 数据来源优先级:
 1. 本地时段模板（``mt5_schedule.local_schedule_state``）
-2. MT5 终端 session API（``symbol_info_session_trade`` / ``symbol_info_session_quote``）
-3. MT5 tick 新鲜度 + trade_mode 兜底
+2. MT5 Gateway 的 tick 新鲜度 + trade_mode 兜底
 
-使用 ``ensure_mt5_connected`` 替代手写 MT5 初始化，
 使用 ``TTLCache`` 替代手写 dict+Lock+TTL 缓存。
 
 使用方式::
@@ -30,7 +28,6 @@ from typing import Any
 from app.config.settings import get_settings
 from app.core.cache import TTLCache
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.db.models import SymbolMapping
 from app.market.mt5_schedule import LocalScheduleState, local_schedule_state
 
@@ -80,7 +77,7 @@ class MT5SessionState:
 
 
 # 会话状态缓存：使用 TTLCache 替代手写 dict+monotonic+Lock
-_session_cache: TTLCache[MT5SessionState] = TTLCache(ttl_seconds=30.0)
+_session_cache: TTLCache[MT5SessionState] = TTLCache(ttl_seconds=30.0, namespace="mt5-sessions")
 
 
 def _mt5_leg(mapping: SymbolMapping) -> str:
@@ -139,114 +136,39 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
     cached = _session_cache.get(cache_key)
     if cached:
         return cached
-    # 尝试连接 MT5 终端
     try:
-        import MetaTrader5 as mt5  # type: ignore
+        from app.venues.manager import native_venue_manager
+        connector = native_venue_manager.connector_for("mt5", "live")
+        info = connector.get_instrument(mapping.mt5_symbol)
+        tick = connector.get_ticker(mapping.mt5_symbol)
+        return _remember_session(cache_key, _gateway_tick_state(mapping, info.raw, tick, current))
     except Exception as exc:
-        return _fallback_closed(mapping, f"MetaTrader5 包不可用: {exc}")
+        return _remember_session(cache_key, _fallback_closed(mapping, f"MT5 Gateway 会话读取失败: {exc}"))
 
-    if not ensure_mt5_connected(
-        login=settings.mt5.login,
-        password=settings.mt5.password,
-        server=settings.mt5.server,
-    ):
-        return _fallback_closed(mapping, f"MT5 初始化失败")
 
-    try:
-        mt5.symbol_select(mapping.mt5_symbol, True)
-        info = mt5.symbol_info(mapping.mt5_symbol)
-        if not info:
-            return _remember_session(cache_key, _fallback_closed(mapping, "MT5 品种不可见或不存在"))
-
-        # 如果 MT5 Python 包不支持 session API，使用 tick 兜底
-        if not hasattr(mt5, "symbol_info_session_trade") or not hasattr(mt5, "symbol_info_session_quote"):
-            return _remember_session(cache_key, _fallback_from_tick(mt5, mapping, info, current))
-
-        trade_windows = _read_sessions(mt5, mapping.mt5_symbol, current, "trade")
-        quote_windows = _read_sessions(mt5, mapping.mt5_symbol, current, "quote")
-        in_trade, seconds_to_close, seconds_to_open = _window_state(trade_windows, current)
-        in_quote, _, quote_seconds_to_open = _window_state(quote_windows or trade_windows, current)
-        trade_mode = _trade_mode_name(mt5, int(getattr(info, "trade_mode", -1)))
-        mode_permissions = _permissions_from_trade_mode(mt5, trade_mode, int(getattr(info, "trade_mode", -1)))
-
-        # 不在报价时段
-        if not in_quote:
-            return _remember_session(cache_key, MT5SessionState(
-                symbol=mapping.symbol,
-                status="closed",
-                reason="MT5 当前不在报价时段",
-                can_quote=False,
-                can_open_long=False,
-                can_open_short=False,
-                can_close_long=False,
-                can_close_short=False,
-                seconds_to_open=quote_seconds_to_open or seconds_to_open,
-                seconds_to_close=seconds_to_close,
-                trade_mode=trade_mode,
-                session_source="mt5_session",
-                mt5_leg=mt5_leg,
-            ))
-
-        # 仅有报价但不在交易时段
-        if not in_trade:
-            return _remember_session(cache_key, MT5SessionState(
-                symbol=mapping.symbol,
-                status="quote_only",
-                reason="MT5 当前仅有报价或不在交易时段",
-                can_quote=True,
-                can_open_long=False,
-                can_open_short=False,
-                can_close_long=False,
-                can_close_short=False,
-                seconds_to_open=seconds_to_open,
-                seconds_to_close=seconds_to_close,
-                trade_mode=trade_mode,
-                session_source="mt5_session",
-                mt5_leg=mt5_leg,
-            ))
-
-        can_open_long, can_open_short, can_close_long, can_close_short = mode_permissions
-        status = "normal_trade"
-        reason = "MT5 当前处于正常交易时段"
-
-        # 只允许平仓模式
-        if trade_mode == "close_only":
-            status = "reduce_only"
-            reason = "MT5 当前只允许平仓"
-        elif not can_open_long and not can_open_short:
-            status = "reduce_only"
-            reason = "MT5 当前不允许新开仓"
-
-        # 开盘冷却期
-        if seconds_to_open is not None and seconds_to_open <= mapping.mt5_post_open_cooldown_minutes * 60:
-            status = "post_open_cooldown"
-            reason = "MT5 刚开盘，等待点差和流动性恢复"
-            can_open_long = False
-            can_open_short = False
-        # 临近休市禁止开仓
-        if seconds_to_close is not None and seconds_to_close <= mapping.mt5_pre_close_no_open_minutes * 60:
-            status = "pre_close_no_open"
-            reason = "MT5 临近休市，禁止新开仓但允许平仓"
-            can_open_long = False
-            can_open_short = False
-
-        return _remember_session(cache_key, MT5SessionState(
-            symbol=mapping.symbol,
-            status=status,
-            reason=reason,
-            can_quote=True,
-            can_open_long=can_open_long,
-            can_open_short=can_open_short,
-            can_close_long=can_close_long,
-            can_close_short=can_close_short,
-            seconds_to_open=seconds_to_open,
-            seconds_to_close=seconds_to_close,
-            trade_mode=trade_mode,
-            session_source="mt5_session",
-            mt5_leg=mt5_leg,
-        ))
-    except Exception as exc:
-        return _remember_session(cache_key, _fallback_closed(mapping, f"MT5 交易时段读取失败: {exc}"))
+def _gateway_tick_state(mapping: SymbolMapping, info: dict[str, Any], tick: Any, current: datetime) -> MT5SessionState:
+    """使用 Gateway 的品种状态和 tick 新鲜度进行会话兜底。"""
+    trade_mode_value = int(info.get("trade_mode", -1))
+    names = {0: "disabled", 1: "long_only", 2: "short_only", 3: "close_only", 4: "full"}
+    trade_mode = names.get(trade_mode_value, f"unknown:{trade_mode_value}")
+    permissions = {
+        "disabled": (False, False, False, False), "close_only": (False, False, True, True),
+        "long_only": (True, False, True, True), "short_only": (False, True, True, True),
+        "full": (True, True, True, True),
+    }.get(trade_mode, (False, False, False, False))
+    can_open_long, can_open_short, can_close_long, can_close_short = permissions
+    exchange_time = tick.exchange_time or tick.received_at
+    tick_age = (current - exchange_time).total_seconds()
+    if float(tick.bid) <= 0 or float(tick.ask) <= 0 or tick_age > get_settings().mt5.session_tick_stale_seconds:
+        return _fallback_closed(mapping, f"MT5 Gateway tick 不可用或已过期 {int(tick_age)} 秒")
+    status = "normal_trade" if can_open_long or can_open_short else "reduce_only"
+    return MT5SessionState(
+        symbol=mapping.symbol, status=status,
+        reason="MT5 Gateway tick 与 trade_mode 检查通过" if status == "normal_trade" else "MT5 当前仅允许平仓",
+        can_quote=True, can_open_long=can_open_long, can_open_short=can_open_short,
+        can_close_long=can_close_long, can_close_short=can_close_short,
+        trade_mode=trade_mode, session_source="mt5_gateway", mt5_leg=_mt5_leg(mapping),
+    )
 
 
 def mt5_action_allowed(state: MT5SessionState, direction: str, action: str) -> tuple[bool, str]:

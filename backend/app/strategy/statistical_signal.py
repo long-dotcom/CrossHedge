@@ -13,13 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import mean, pstdev
-from time import monotonic
 
 from sqlalchemy.orm import Session
 
 from app.analytics.spreads import SpreadPoint, load_spread_points
 from app.db.models import StrategySetting, SymbolMapping
 from app.strategy.signals import SignalResult, evaluate_signal
+from app.config.settings import get_settings
+from app.core.cache import TTLCache
 
 
 @dataclass
@@ -56,7 +57,10 @@ class SignalStats:
 
 
 # 信号统计缓存：key → (monotonic_time, SignalStats)
-_stats_cache: dict[tuple, tuple[float, SignalStats]] = {}
+_stats_cache: TTLCache[SignalStats] = TTLCache(
+    ttl_seconds=max(get_settings().quote.signal_stats_cache_ttl_ms / 1000, 0.001),
+    namespace="signal-stats",
+)
 
 
 def evaluate_entry_signal(
@@ -145,12 +149,11 @@ def refresh_signal_stats_cache(db: Session) -> int:
         return 0
     refreshed = 0
     symbols = [row.symbol for row in db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()]
-    now = monotonic()
     for symbol in symbols:
         for direction in ("long_leg_a_short_leg_b", "long_leg_b_short_leg_a"):
             entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
             stats = _compute_signal_stats(entry_points, close_points, strategy)
-            _stats_cache[_stats_cache_key(db, strategy, symbol, direction)] = (now, stats)
+            _stats_cache.set(_stats_cache_key(db, strategy, symbol, direction), stats)
             refreshed += 1
     return refreshed
 
@@ -160,17 +163,21 @@ def _signal_stats(db: Session, strategy: StrategySetting, symbol: str, direction
     key = _stats_cache_key(db, strategy, symbol, direction)
     cached = _stats_cache.get(key)
     if cached:
-        return cached[1]
+        return cached
     entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
     stats = _compute_signal_stats(entry_points, close_points, strategy)
-    _stats_cache[key] = (monotonic(), stats)
+    _stats_cache.set(key, stats)
     return stats
 
 
-def _stats_cache_key(db: Session, strategy: StrategySetting, symbol: str, direction: str) -> tuple:
+def _stats_cache_key(db: Session, strategy: StrategySetting, symbol: str, direction: str) -> str:
     """构造缓存键，包含所有影响计算结果的参数。"""
-    return (
-        id(db.get_bind()),
+    bind = db.get_bind()
+    bind_key = str(bind.url)
+    if bind_key.endswith(":memory:"):
+        bind_key = f"{bind_key}:{id(bind)}"
+    return repr((
+        bind_key,
         symbol.upper(),
         direction,
         strategy.statistical_lookback_range,
@@ -179,7 +186,7 @@ def _stats_cache_key(db: Session, strategy: StrategySetting, symbol: str, direct
         _strategy_float(strategy, "reachable_entry_zscore", 1.0),
         _strategy_float(strategy, "cost_guard_percentile", 0.90),
         _strategy_float(strategy, "exit_target_percentile", 0.25),
-    )
+    ))
 
 
 def _load_entry_and_close_points(db: Session, symbol: str, direction: str, range_value: str) -> tuple[list[SpreadPoint], list[SpreadPoint]]:

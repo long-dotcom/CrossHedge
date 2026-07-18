@@ -9,16 +9,19 @@
 - :class:`QuoteCache` —— 线程安全的报价缓存（支持历史查询）
 - :class:`QuoteSynchronizer` —— 跨交易所报价时间对齐器
 
-报价缓存使用 ``RLock`` 保证线程安全，支持按 ``(platform, symbol)`` 键
-存取最新报价和历史报价序列。
+报价缓存使用 Redis 保存最新值与 Stream 历史，支持 API 与 Worker 按
+``(platform, symbol)`` 键共享报价。
 """
 
 from __future__ import annotations
 
-import threading
+import json
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 
 # 同步模式类型：loose（宽松）或 strict（严格）
@@ -98,7 +101,7 @@ class SynchronizedQuote:
 # ---------------------------------------------------------------------------
 
 class QuoteCache:
-    """线程安全的报价缓存。
+    """基于 Redis 的共享报价缓存。
 
     按 ``(platform, symbol)`` 键存储报价历史，支持：
     - 写入新报价（自动维护历史长度上限）
@@ -107,11 +110,19 @@ class QuoteCache:
     - 查询已缓存的品种列表
     """
 
-    def __init__(self, max_history: int = 5000) -> None:
+    def __init__(self, max_history: int = 5000, *, namespace: str | None = None) -> None:
         self.max_history = max_history
-        self._lock = threading.RLock()
-        self._quotes: dict[tuple[str, str], list[Quote]] = {}
-        self._sequence = 0
+        # 运行时全局实例使用固定命名空间，以便 API 与 Worker 共享；测试可保持隔离。
+        self._namespace = namespace or uuid.uuid4().hex
+
+    def _latest_key(self, platform: str, symbol: str) -> str:
+        return redis_key("quotes", self._namespace, "latest", platform, symbol)
+
+    def _history_key(self, platform: str, symbol: str) -> str:
+        return redis_key("quotes", self._namespace, "history", platform, symbol)
+
+    def _symbols_key(self) -> str:
+        return redis_key("quotes", self._namespace, "symbols")
 
     def put(
         self,
@@ -122,6 +133,7 @@ class QuoteCache:
         depth_notional: float,
         source: str,
         exchange_ts=None,
+        local_recv_ts=None,
     ) -> Quote:
         """写入一条新报价。
 
@@ -137,46 +149,66 @@ class QuoteCache:
         返回:
             创建的 Quote 实例（含全局序列号和本地接收时间）。
         """
-        with self._lock:
-            self._sequence += 1
-            quote = Quote(
-                platform=platform,
-                symbol=symbol,
-                bid=float(bid),
-                ask=float(ask),
-                depth_notional=float(depth_notional),
-                exchange_ts=exchange_ts,
-                local_recv_ts=utc_now(),
-                source=source,
-                sequence=self._sequence,
-            )
-            key = (platform, symbol)
-            history = self._quotes.setdefault(key, [])
-            history.append(quote)
-            # 超出上限时裁剪旧数据
-            if len(history) > self.max_history:
-                del history[: len(history) - self.max_history]
-            return quote
+        client = redis_client()
+        sequence = int(client.incr(redis_key("quotes", "sequence")))
+        quote = Quote(
+            platform=platform, symbol=symbol, bid=float(bid), ask=float(ask),
+            depth_notional=float(depth_notional), exchange_ts=exchange_ts,
+            local_recv_ts=local_recv_ts or utc_now(), source=source, sequence=sequence,
+        )
+        serialized = _quote_json(quote)
+        pipe = client.pipeline(transaction=False)
+        pipe.set(self._latest_key(platform, symbol), serialized)
+        pipe.xadd(self._history_key(platform, symbol), {"data": serialized}, maxlen=self.max_history, approximate=False)
+        pipe.sadd(self._symbols_key(), symbol)
+        pipe.execute()
+        return quote
 
     def latest(self, platform: str, symbol: str) -> Quote | None:
         """获取指定平台和品种的最新报价。"""
-        with self._lock:
-            history = self._quotes.get((platform, symbol), [])
-            return history[-1] if history else None
+        raw = redis_client().get(self._latest_key(platform, symbol))
+        return _quote_from_json(raw) if raw else None
 
     def history(self, platform: str, symbol: str) -> list[Quote]:
         """获取指定平台和品种的历史报价列表。"""
-        with self._lock:
-            return list(self._quotes.get((platform, symbol), []))
+        rows = redis_client().xrange(self._history_key(platform, symbol))
+        return [_quote_from_json(fields["data"]) for _, fields in rows]
 
     def symbols(self) -> list[str]:
         """获取所有已缓存的品种名称（去重、排序）。"""
-        with self._lock:
-            return sorted({symbol for _, symbol in self._quotes})
+        return sorted(redis_client().smembers(self._symbols_key()))
 
 
 # 全局报价缓存单例
-quote_cache = QuoteCache()
+quote_cache = QuoteCache(namespace="shared")
+
+
+def _json_time(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _quote_json(quote: Quote) -> str:
+    return json.dumps({
+        "platform": quote.platform, "symbol": quote.symbol, "bid": quote.bid, "ask": quote.ask,
+        "depth_notional": quote.depth_notional, "exchange_ts": _json_time(quote.exchange_ts),
+        "local_recv_ts": _json_time(quote.local_recv_ts), "source": quote.source, "sequence": quote.sequence,
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_time(value):
+    if not isinstance(value, str):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return value
+
+
+def _quote_from_json(raw: str) -> Quote:
+    data = json.loads(raw)
+    data["exchange_ts"] = _parse_time(data.get("exchange_ts"))
+    data["local_recv_ts"] = _parse_time(data["local_recv_ts"])
+    return Quote(**data)
 
 
 # ---------------------------------------------------------------------------

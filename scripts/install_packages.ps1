@@ -8,8 +8,8 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
 $FrontendDir = Join-Path $Root "frontend"
-# 项目根目录结构：requirements.txt 位于项目根目录
-$Requirements = Join-Path $Root "requirements.txt"
+$Requirements = Join-Path $Root "requirements-dev.txt"
+$GatewayRequirements = Join-Path $Root "mt5_gateway\requirements.txt"
 
 function Test-Command($Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
@@ -27,10 +27,11 @@ if (-not $SkipBackend) {
         py -3.14 -m venv .venv
     }
 
-    Write-Host "Installing backend packages..."
+    Write-Host "Installing backend development and MT5 Gateway packages..."
     & $VenvPython -m pip install --upgrade pip setuptools wheel
     & $VenvPython -m pip install -r $Requirements
-    & $VenvPython -m pip show MetaTrader5 hyperliquid-python-sdk
+    & $VenvPython -m pip install -r $GatewayRequirements
+    & $VenvPython -m pip show redis MetaTrader5 hyperliquid-python-sdk
 }
 
 if (-not $SkipFrontend) {

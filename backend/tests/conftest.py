@@ -1,11 +1,28 @@
 """公共测试 fixture 和辅助函数，供所有测试文件共享。"""
 
+import os
+
+# 必须在导入 app 模块前启用隔离 Redis，禁止测试误连开发环境实例。
+os.environ["ENVIRONMENT"] = "testing"
+os.environ["REDIS_URL"] = "redis://test.invalid:6379/15"
+
 from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import Base, HedgeGroup, Order, StrategySetting, SymbolMapping, SystemSetting
 from app.market.quotes import quote_cache
+
+
+import pytest
+from app.core.redis_client import redis_client
+
+
+@pytest.fixture(autouse=True)
+def _isolate_redis_cache():
+    redis_client().flushall()
+    yield
+    redis_client().flushall()
 
 
 def _pending_reconcile_test_db(status: str):

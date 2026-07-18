@@ -8,7 +8,7 @@
 1. MT5 实时 tick（直接/间接报价）
 2. 配置中的回退汇率（``settings.cost.fx_fallback_rates``）
 
-使用 ``ensure_mt5_connected`` 替代手写 MT5 初始化，
+MT5 汇率通过 Redis Gateway 代理读取，
 使用 ``safe_float`` 进行安全的类型转换。
 
 使用方式::
@@ -22,13 +22,13 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 
 from app.config.settings import get_settings
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.core.type_utils import safe_float
+from app.core.cache import TTLCache
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -48,7 +48,7 @@ class FxRate:
 
 
 # 汇率缓存：currency → (timestamp, FxRate)
-_cache: dict[str, tuple[float, FxRate]] = {}
+_cache: TTLCache[FxRate] = TTLCache(ttl_seconds=5, namespace="fx-rates")
 
 
 def fx_to_usd(currency: str, ttl_seconds: int = 5) -> FxRate:
@@ -69,21 +69,20 @@ def fx_to_usd(currency: str, ttl_seconds: int = 5) -> FxRate:
     if normalized in {"USD", "USDC"}:
         return FxRate(normalized, 1.0, "identity")
     # 检查缓存
-    now = time.time()
     cached = _cache.get(normalized)
-    if cached and now - cached[0] < ttl_seconds:
-        return cached[1]
+    if cached:
+        return cached
     # 尝试从 MT5 获取实时汇率
     rate = _mt5_fx_to_usd(normalized)
     if rate:
         result = FxRate(normalized, rate, "mt5_tick")
-        _cache[normalized] = (now, result)
+        _cache.set(normalized, result)
         return result
     # 回退到配置中的静态汇率
     fallback = _fallback_rates().get(normalized)
     if fallback:
         result = FxRate(normalized, float(fallback), "fallback")
-        _cache[normalized] = (now, result)
+        _cache.set(normalized, result)
         return result
     raise ValueError(f"缺少 {normalized}->USD 汇率")
 
@@ -93,26 +92,16 @@ def _mt5_fx_to_usd(currency: str) -> float | None:
 
     尝试直接报价（{currency}USD）和间接报价（USD{currency}）。
     """
-    try:
-        import MetaTrader5 as mt5  # type: ignore
-    except Exception:
-        return None
-    if not ensure_mt5_connected(
-        login=get_settings().mt5.login,
-        password=get_settings().mt5.password,
-        server=get_settings().mt5.server,
-    ):
-        return None
+    connector = native_venue_manager.connector_for("mt5", "live")
     direct = f"{currency}USD"
     inverse = f"USD{currency}"
     for symbol, invert in ((direct, False), (inverse, True)):
-        if not mt5.symbol_select(symbol, True):
+        try:
+            tick = connector.get_ticker(symbol)
+        except Exception:
             continue
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            continue
-        bid = safe_float(getattr(tick, "bid", 0.0))
-        ask = safe_float(getattr(tick, "ask", 0.0))
+        bid = safe_float(tick.bid)
+        ask = safe_float(tick.ask)
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
         if mid <= 0:
             continue

@@ -87,6 +87,22 @@ def test_hyperliquid_native_account_instrument_and_order() -> None:
     assert order.venue_order_id == "123"
 
 
+def test_hyperliquid_health_does_not_call_rest_api() -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("健康检查不应调用 Hyperliquid REST")
+
+    connector = HyperliquidConnector(info_transport=forbidden)
+    connector._ws.health = lambda: {
+        "ws_running": True, "ws_connected": True,
+        "message_age_seconds": 0.5, "symbols": ["BTC"],
+    }
+
+    health = connector.health()
+
+    assert health["status"] == "ok"
+    assert health["ws_connected"] is True
+
+
 def test_hyperliquid_l2_and_private_events_are_normalized() -> None:
     runtime = HyperliquidWebSocketRuntime(ws_url="wss://example", account_address="0xabc")
     runtime.register_client_order_id("0x11111111111111111111111111111111", "business-id")

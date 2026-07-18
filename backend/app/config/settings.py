@@ -69,6 +69,18 @@ class DatabaseSettings:
 
 
 @dataclass
+class RedisSettings:
+    """Redis 缓存、Stream 与 MT5 Gateway 通信配置。"""
+
+    url: str = "redis://localhost:6379/0"
+    key_prefix: str = "crosshedge"
+    socket_timeout_seconds: float = 5.0
+    mt5_rpc_timeout_seconds: float = 15.0
+    mt5_snapshot_ttl_seconds: int = 10
+    mt5_heartbeat_ttl_seconds: int = 15
+
+
+@dataclass
 class SecuritySettings:
     """安全与认证配置 —— JWT、管理员账户、交易所密钥加密"""
 
@@ -251,6 +263,13 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "DATABASE_POOL_SIZE":                ("database", "pool_size"),
     "DATABASE_MAX_OVERFLOW":             ("database", "max_overflow"),
     "DATABASE_POOL_RECYCLE":             ("database", "pool_recycle"),
+    # --- RedisSettings ---
+    "REDIS_URL":                         ("redis", "url"),
+    "REDIS_KEY_PREFIX":                  ("redis", "key_prefix"),
+    "REDIS_SOCKET_TIMEOUT_SECONDS":      ("redis", "socket_timeout_seconds"),
+    "MT5_RPC_TIMEOUT_SECONDS":           ("redis", "mt5_rpc_timeout_seconds"),
+    "MT5_SNAPSHOT_TTL_SECONDS":          ("redis", "mt5_snapshot_ttl_seconds"),
+    "MT5_HEARTBEAT_TTL_SECONDS":         ("redis", "mt5_heartbeat_ttl_seconds"),
     # --- SecuritySettings ---
     "JWT_SECRET":                        ("security", "jwt_secret"),
     "JWT_ALGORITHM":                     ("security", "jwt_algorithm"),
@@ -349,6 +368,8 @@ class Settings:
 
     # 数据库配置
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
+    # Redis 缓存与跨进程通信
+    redis: RedisSettings = field(default_factory=RedisSettings)
     # 安全与认证配置
     security: SecuritySettings = field(default_factory=SecuritySettings)
     # 行情源与报价同步配置
@@ -427,6 +448,9 @@ def _validate_settings(settings: Settings) -> None:
         "SPREAD_HISTORY_INTERVAL_SECONDS": settings.scanner.spread_history_interval_seconds,
         "SPREAD_BUCKET_SECONDS": settings.scanner.spread_bucket_seconds,
         "COST_CACHE_TTL_SECONDS": settings.cost.cost_cache_ttl_seconds,
+        "MT5_RPC_TIMEOUT_SECONDS": settings.redis.mt5_rpc_timeout_seconds,
+        "MT5_SNAPSHOT_TTL_SECONDS": settings.redis.mt5_snapshot_ttl_seconds,
+        "MT5_HEARTBEAT_TTL_SECONDS": settings.redis.mt5_heartbeat_ttl_seconds,
     }
     invalid = [name for name, value in positive_values.items() if value <= 0]
     if invalid:

@@ -1,7 +1,7 @@
 """独立执行 Worker 进程入口。
 
 FastAPI 只创建 Intent/Outbox；本进程独占交易副作用、私有事件和订单回查。
-进程间通过数据库 Outbox 传递命令，并用健康文件向 API 暴露存活状态。
+进程间通过数据库 Outbox 传递命令，并用 Redis 心跳向 API 暴露存活状态。
 """
 
 from __future__ import annotations
@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 import os
 import signal
-import threading
 import time
-from pathlib import Path
 
-from app.config.settings import ROOT_DIR, enforce_runtime_security, get_settings
+from app.config.settings import enforce_runtime_security, get_settings
 from app.core.logging import get_logger, setup_logging
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
@@ -23,7 +22,7 @@ from app.execution.venue_events import enqueue_venue_event
 from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
-HEALTH_PATH = ROOT_DIR / ".run" / "execution-worker-health.json"
+HEALTH_KEY = redis_key("health", "execution-worker")
 _running = True
 
 
@@ -33,8 +32,7 @@ def _request_stop(*_args) -> None:
 
 
 def _write_health(*, status: str, error: str = "", processed: int = 0) -> bool:
-    """写入 Worker 心跳；Windows 短暂占用目标文件时重试但不中断交易循环。"""
-    HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """写入 Redis Worker 心跳；失败时不中断交易循环。"""
     payload = {
         "status": status,
         "pid": os.getpid(),
@@ -43,29 +41,12 @@ def _write_health(*, status: str, error: str = "", processed: int = 0) -> bool:
         "last_processed_count": processed,
         "venue_runtimes": native_venue_manager.health_snapshot(),
     }
-    # PID 和线程 ID 避免新旧 Worker 交接时同时争用同一个临时文件。
-    temporary = HEALTH_PATH.with_name(
-        f"{HEALTH_PATH.stem}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    last_error: OSError | None = None
-    for attempt in range(5):
-        try:
-            temporary.replace(HEALTH_PATH)
-            return True
-        except PermissionError as exc:
-            # Windows 的杀毒软件或健康检查读取可能在极短时间内持有文件句柄。
-            last_error = exc
-            time.sleep(0.02 * (attempt + 1))
-        except OSError as exc:
-            last_error = exc
-            break
     try:
-        temporary.unlink(missing_ok=True)
-    except OSError:
-        pass
-    logger.warning("执行 Worker 心跳写入失败，执行循环继续运行: path={}, error={}", HEALTH_PATH, last_error)
-    return False
+        redis_client().set(HEALTH_KEY, json.dumps(payload, ensure_ascii=False), ex=10)
+        return True
+    except Exception as exc:
+        logger.warning("执行 Worker Redis 心跳写入失败，执行循环继续运行: {}", exc)
+        return False
 
 
 def main() -> None:
@@ -95,7 +76,8 @@ def main() -> None:
                         error="部分交易所连接器处于降级状态" if degraded else "",
                         processed=processed,
                     )
-                    next_health_at = now + 1.0
+                    # 心跳每 2 秒刷新；各连接器 health() 只能读取本地状态，禁止发远端探测请求。
+                    next_health_at = now + 2.0
             except Exception as exc:
                 logger.exception("独立执行 Worker 循环失败: {}", exc)
                 _write_health(status="degraded", error=str(exc))

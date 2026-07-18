@@ -1,46 +1,23 @@
-"""
-扫描状态存储模块
-=================
-
-提供线程安全的扫描结果状态存储，用于在扫描器和 API 之间共享数据：
-
-- 价差数据（spreads）
-- 方向价差数据（direction_spreads）
-- 套利机会列表（opportunities）
-- 最后更新时间戳
-
-所有操作均通过内部锁保证线程安全。
-"""
+"""扫描器与 API 通过 Redis 共享当前价差和机会快照。"""
 
 from __future__ import annotations
 
-from copy import deepcopy
-from threading import Lock
-from typing import Any
+import json
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any, Callable
 
-from app.core.logging import get_logger
+from redis.exceptions import WatchError
+
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
-
-logger = get_logger(__name__)
 
 
 class ScanStateStore:
-    """扫描状态存储。
+    """使用单个 Redis JSON 快照保证三组扫描数据同步切换。"""
 
-    线程安全地存储和更新扫描器产出的价差数据和套利机会。
-    API 层通过 :meth:`snapshot` 获取当前状态的深拷贝。
-    """
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        # 全品种价差数据
-        self._spreads: list[dict[str, Any]] = []
-        # 按方向分类的价差数据
-        self._direction_spreads: list[dict[str, Any]] = []
-        # 套利机会列表
-        self._opportunities: list[dict[str, Any]] = []
-        # 最后更新时间戳
-        self._updated_at = None
+    def __init__(self, *, key: str | None = None) -> None:
+        self._key = key or redis_key("cache", "scan-state")
 
     def update(
         self,
@@ -48,80 +25,95 @@ class ScanStateStore:
         opportunities: list[dict[str, Any]],
         direction_spreads: list[dict[str, Any]] | None = None,
     ) -> None:
-        """全量更新扫描结果。
-
-        参数:
-            spreads: 全品种价差数据列表。
-            opportunities: 套利机会列表。
-            direction_spreads: 按方向分类的价差数据（为 None 时使用 spreads）。
-        """
-        with self._lock:
-            self._spreads = deepcopy(spreads)
-            self._direction_spreads = deepcopy(direction_spreads if direction_spreads is not None else spreads)
-            self._opportunities = deepcopy(opportunities)
-            self._updated_at = utc_now()
+        state = {
+            "spreads": spreads,
+            "direction_spreads": direction_spreads if direction_spreads is not None else spreads,
+            "opportunities": opportunities,
+            "updated_at": utc_now(),
+        }
+        redis_client().set(self._key, _state_json(state))
 
     def merge_opportunity_ids(self, ids_by_key: dict[tuple[str, str], int]) -> None:
-        """将数据库 ID 合并到套利机会中。
-
-        按 ``(symbol, direction)`` 键匹配，将对应的数据库 ID 写入机会记录。
-
-        参数:
-            ids_by_key: ``{(symbol_upper, direction): id}`` 映射字典。
-        """
         if not ids_by_key:
             return
-        with self._lock:
-            for row in self._opportunities:
+
+        def merge(state: dict[str, Any]) -> dict[str, Any]:
+            for row in state["opportunities"]:
                 key = (str(row.get("symbol", "")).upper(), str(row.get("direction", "")))
                 if key in ids_by_key:
                     row["id"] = ids_by_key[key]
-            self._updated_at = utc_now()
+            state["updated_at"] = utc_now()
+            return state
+        self._atomic_mutate(merge)
 
     def remove_symbols(self, symbols: set[str]) -> None:
-        """从存储中移除指定品种的所有数据。
-
-        参数:
-            symbols: 要移除的品种名称集合（不区分大小写）。
-        """
         if not symbols:
             return
         normalized = {symbol.upper() for symbol in symbols}
-        with self._lock:
-            self._spreads = [
-                row for row in self._spreads
-                if str(row.get("symbol", "")).upper() not in normalized
-            ]
-            self._direction_spreads = [
-                row for row in self._direction_spreads
-                if str(row.get("symbol", "")).upper() not in normalized
-            ]
-            self._opportunities = [
-                row for row in self._opportunities
-                if str(row.get("symbol", "")).upper() not in normalized
-            ]
-            self._updated_at = utc_now()
+
+        def remove(state: dict[str, Any]) -> dict[str, Any]:
+            for name in ("spreads", "direction_spreads", "opportunities"):
+                state[name] = [
+                    row for row in state[name]
+                    if str(row.get("symbol", "")).upper() not in normalized
+                ]
+            state["updated_at"] = utc_now()
+            return state
+        self._atomic_mutate(remove)
 
     def snapshot(self) -> dict[str, Any]:
-        """获取当前扫描状态的深拷贝快照。
-
-        返回:
-            包含以下字段的字典：
-            - ``spreads``: 全品种价差数据
-            - ``direction_spreads``: 方向价差数据
-            - ``opportunities``: 套利机会列表
-            - ``updated_at``: 最后更新时间
-            - ``ready``: 是否已有数据
-        """
-        with self._lock:
+        raw = redis_client().get(self._key)
+        if not raw:
             return {
-                "spreads": deepcopy(self._spreads),
-                "direction_spreads": deepcopy(self._direction_spreads),
-                "opportunities": deepcopy(self._opportunities),
-                "updated_at": self._updated_at,
-                "ready": self._updated_at is not None,
+                "spreads": [], "direction_spreads": [], "opportunities": [],
+                "updated_at": None, "ready": False,
             }
+        state = _state_from_json(raw)
+        state["ready"] = state.get("updated_at") is not None
+        return state
+
+    def _atomic_mutate(self, mutator: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+        client = redis_client()
+        for _ in range(5):
+            with client.pipeline() as pipe:
+                try:
+                    pipe.watch(self._key)
+                    raw = pipe.get(self._key)
+                    state = _state_from_json(raw) if raw else {
+                        "spreads": [], "direction_spreads": [], "opportunities": [], "updated_at": None,
+                    }
+                    updated = mutator(state)
+                    pipe.multi()
+                    pipe.set(self._key, _state_json(updated))
+                    pipe.execute()
+                    return
+                except WatchError:
+                    continue
+        raise RuntimeError("扫描状态 Redis 更新竞争过于频繁")
 
 
-# 全局扫描状态存储单例
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return {"__type__": "datetime", "value": value.isoformat()}
+    if isinstance(value, Decimal):
+        return {"__type__": "decimal", "value": str(value)}
+    raise TypeError(f"扫描状态包含不可序列化类型: {type(value).__name__}")
+
+
+def _json_hook(value: dict[str, Any]) -> Any:
+    if value.get("__type__") == "datetime":
+        return datetime.fromisoformat(value["value"])
+    if value.get("__type__") == "decimal":
+        return Decimal(value["value"])
+    return value
+
+
+def _state_json(state: dict[str, Any]) -> str:
+    return json.dumps(state, ensure_ascii=False, separators=(",", ":"), default=_json_default)
+
+
+def _state_from_json(raw: str) -> dict[str, Any]:
+    return json.loads(raw, object_hook=_json_hook)
+
+
 scan_state_store = ScanStateStore()

@@ -773,7 +773,7 @@ def _add_group_event_once(db: Session, group_id: int, event_type: str, detail: s
 
 
 def _refresh_hedge_pool(db: Session, intent: ExecutionIntent) -> None:
-    """事务提交后同步内存池，数据库仍是执行状态的权威来源。"""
+    """事务提交后同步 Redis 快照池，数据库仍是执行状态的权威来源。"""
     if intent.hedge_group_id is None:
         return
     group = db.get(HedgeGroup, intent.hedge_group_id)

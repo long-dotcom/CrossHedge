@@ -33,6 +33,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core.logging import get_logger
+from app.core.cache import TTLCache
 from app.core.worker_runner import run_worker
 from app.db.models import ArbitrageOpportunity, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
@@ -53,7 +54,9 @@ class OpportunityConfirmation:
 
 
 # 模块级状态仅跟踪短时信号确认；开仓冷却改为查询持久化对冲组。
-_confirmations: dict[tuple[int, str, str], OpportunityConfirmation] = {}
+_confirmations: TTLCache[OpportunityConfirmation] = TTLCache(
+    ttl_seconds=3600, namespace="auto-execute-confirmations",
+)
 
 
 def run_auto_execute(db: Session) -> int:
@@ -114,7 +117,7 @@ def run_auto_execute(db: Session) -> int:
                 idempotency_key=f"auto-open:{opportunity.id}",
                 source="auto_paper",
             )
-            _confirmations.pop(_confirmation_key(opportunity), None)
+            _confirmations.invalidate(_confirmation_key(opportunity))
             if result.created:
                 logger.info("自动开仓 Intent 已创建: symbol={} intent_id={} group_id={}", opportunity.symbol, result.intent.id, result.intent.hedge_group_id)
                 db.add(SystemLog(level="info", category="auto_execute", message=f"自动开仓已进入执行队列: {opportunity.symbol} Intent #{result.intent.id}"))
@@ -177,9 +180,9 @@ def _confirm(strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tu
     current = _confirmations.get(key)
     if not current:
         current = OpportunityConfirmation(first_seen=now, last_seen=now, ticks=0)
-        _confirmations[key] = current
     current.ticks += 1
     current.last_seen = now
+    _confirmations.set(key, current)
     hold_ms = (now - current.first_seen) * 1000
     required_ticks = max(strategy.auto_execute_confirm_ticks, 1)
     required_hold = max(strategy.auto_execute_min_hold_ms, 0)
@@ -190,9 +193,9 @@ def _confirm(strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tu
     return True, ""
 
 
-def _confirmation_key(opportunity: ArbitrageOpportunity) -> tuple[int, str, str]:
+def _confirmation_key(opportunity: ArbitrageOpportunity) -> str:
     """生成机会确认的唯一键。"""
-    return (opportunity.id, opportunity.symbol, opportunity.direction)
+    return f"{opportunity.id}:{opportunity.symbol}:{opportunity.direction}"
 
 
 def _decision_delay_ms(strategy: StrategySetting) -> int:

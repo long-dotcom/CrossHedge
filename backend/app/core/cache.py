@@ -1,90 +1,49 @@
-"""
-通用 TTL 缓存模块
-
-提供线程安全的通用 TTL（Time-To-Live）缓存，消除源项目中多种手写缓存模式的重复：
-- ``mt5_sessions.py`` 的 ``_session_cache`` (cached_time + cached_value)
-- ``live_costs.py`` 的 ``_hl_market_cache`` / ``_hl_user_fee_cache``
-- ``scanner.py`` 的 ``_strategy_cache``
-
-使用方式::
-
-    from app.core.cache import TTLCache
-
-    cache: TTLCache[dict] = TTLCache(ttl_seconds=30.0)
-    cache.set("key", {"data": 123})
-    value = cache.get("key")  # {"data": 123} 或 None（过期/不存在）
-    cache.invalidate("key")
-    cache.clear()
-"""
+"""基于 Redis 的通用 TTL 缓存。"""
 
 from __future__ import annotations
 
-import threading
-import time
+import base64
+import pickle
 from typing import Generic, TypeVar
+
+from app.core.redis_client import redis_client, redis_key
 
 T = TypeVar("T")
 
 
 class TTLCache(Generic[T]):
-    """线程安全的通用 TTL 缓存。
+    """保持原调用接口的 Redis TTL 缓存。
 
-    每个键值对在 ``set`` 时记录时间戳，``get`` 时检查是否过期。
-    过期数据不会立即删除（惰性淘汰），而是在下次 ``get`` 时返回 ``None``。
-
-    参数:
-        ttl_seconds: 缓存有效期（秒），支持浮点数。
+    值可能是 dataclass、SimpleNamespace 等内部 Python 对象，因此使用带 Base64
+    包装的 pickle。键名前缀固定且 Redis 只允许受信网络访问。
     """
 
-    def __init__(self, ttl_seconds: float) -> None:
-        self._ttl = ttl_seconds
-        # 内部存储：key → (timestamp, value)
-        self._store: dict[str, tuple[float, T]] = {}
-        self._lock = threading.Lock()
+    def __init__(self, ttl_seconds: float, namespace: str = "default") -> None:
+        self._ttl = max(float(ttl_seconds), 0.001)
+        self._namespace = namespace
+
+    def _key(self, key: str) -> str:
+        return redis_key("cache", self._namespace, key)
 
     def get(self, key: str) -> T | None:
-        """获取缓存值。
-
-        如果键不存在或已过期，返回 ``None``。
-
-        参数:
-            key: 缓存键。
-
-        返回:
-            缓存的值，或 ``None``。
-        """
-        now = time.time()
-        with self._lock:
-            entry = self._store.get(key)
-            if entry is None:
-                return None
-            cached_at, value = entry
-            if now - cached_at >= self._ttl:
-                # 已过期，惰性删除
-                del self._store[key]
-                return None
-            return value
+        raw = redis_client().get(self._key(key))
+        if raw is None:
+            return None
+        return pickle.loads(base64.b64decode(raw.encode("ascii")))
 
     def set(self, key: str, value: T) -> None:
-        """写入或更新缓存值。
-
-        参数:
-            key: 缓存键。
-            value: 要缓存的值。
-        """
-        with self._lock:
-            self._store[key] = (time.time(), value)
+        raw = base64.b64encode(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
+        redis_client().set(self._key(key), raw, px=max(int(self._ttl * 1000), 1))
 
     def invalidate(self, key: str) -> None:
-        """手动使指定键失效。
-
-        参数:
-            key: 要失效的缓存键。
-        """
-        with self._lock:
-            self._store.pop(key, None)
+        redis_client().delete(self._key(key))
 
     def clear(self) -> None:
-        """清空所有缓存。"""
-        with self._lock:
-            self._store.clear()
+        cursor: int | str = 0
+        pattern = self._key("*")
+        while True:
+            cursor, keys = redis_client().scan(cursor=cursor, match=pattern, count=200)
+            if keys:
+                redis_client().delete(*keys)
+            if int(cursor) == 0:
+                break
