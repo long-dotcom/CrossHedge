@@ -164,8 +164,6 @@ class HyperliquidSettings:
     info_url: str = HYPERLIQUID_MAINNET_INFO_URL
     # WebSocket 端点（HYPERLIQUID_WS_URL）
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
-    # 是否启用 L2Book 快速通道（HYPERLIQUID_L2BOOK_FAST_ENABLED）
-    l2book_fast_enabled: bool = True
     # 默认 Taker 费率（HYPERLIQUID_DEFAULT_TAKER_FEE_RATE）
     default_taker_fee_rate: float = 0.00045
     # 默认 Maker 费率（HYPERLIQUID_DEFAULT_MAKER_FEE_RATE）
@@ -306,7 +304,6 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "SPREAD_HISTORY_INTERVAL_SECONDS":   ("scanner", "spread_history_interval_seconds"),
     "SPREAD_BUCKET_SECONDS":             ("scanner", "spread_bucket_seconds"),
     # --- HyperliquidSettings ---
-    "HYPERLIQUID_L2BOOK_FAST_ENABLED":   ("hyperliquid", "l2book_fast_enabled"),
     "HYPERLIQUID_DEFAULT_TAKER_FEE_RATE": ("hyperliquid", "default_taker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MAKER_FEE_RATE": ("hyperliquid", "default_maker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MIN_NOTIONAL":  ("hyperliquid", "default_min_notional"),

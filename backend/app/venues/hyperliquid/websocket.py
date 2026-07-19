@@ -135,7 +135,10 @@ class HyperliquidWebSocketRuntime:
         channel = str(payload.get("channel") or "")
         data = payload.get("data") or {}
         events: list[VenueEvent] = []
-        if channel == "l2Book" and isinstance(data, dict):
+        if channel == "bbo" and isinstance(data, dict):
+            self._process_bbo(data)
+        elif channel == "l2Book" and isinstance(data, dict):
+            # 保留兼容入口，便于处理重连前已在途的旧订阅消息。
             self._process_book(data)
         elif channel == "orderUpdates":
             for item in data if isinstance(data, list) else []:
@@ -242,6 +245,33 @@ class HyperliquidWebSocketRuntime:
         if self._on_book:
             self._on_book(book)
 
+    def _process_bbo(self, data: dict[str, Any]) -> None:
+        """把 Hyperliquid 最优买卖价事件投影为统一 ticker 和单档订单簿。"""
+        symbol = str(data.get("coin") or "")
+        rows = data.get("bbo") or [None, None]
+        if not symbol or len(rows) < 2:
+            return
+        bids = _bbo_level(rows[0])
+        asks = _bbo_level(rows[1])
+        exchange_time = _millis_datetime(data.get("time"))
+        book = OrderBookSnapshot("hyperliquid", symbol, bids, asks, exchange_time=exchange_time)
+        self._books[symbol] = book
+        if bids and asks:
+            ticker = Ticker(
+                "hyperliquid",
+                symbol,
+                bids[0][0],
+                asks[0][0],
+                bids[0][1],
+                asks[0][1],
+                exchange_time=exchange_time,
+            )
+            self._tickers[symbol] = ticker
+            if self._on_ticker:
+                self._on_ticker(ticker)
+        if self._on_book:
+            self._on_book(book)
+
     def _order_event(self, item: dict[str, Any]) -> VenueEvent | None:
         raw_order = item.get("order") or {}
         status = _order_status(item.get("status"))
@@ -325,7 +355,7 @@ class HyperliquidWebSocketRuntime:
 
         backoff = 1.0
         while not self._stop.is_set():
-            subscriptions = [{"type": "l2Book", "coin": symbol} for symbol in sorted(self._symbols)]
+            subscriptions = [_bbo_subscription(symbol) for symbol in sorted(self._symbols)]
             if self.account_address and self._private_enabled:
                 subscriptions.extend(
                     (
@@ -422,6 +452,16 @@ def _optional_decimal(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     return _decimal(value)
+
+
+def _bbo_level(value: Any) -> tuple[tuple[Decimal, Decimal], ...]:
+    if not isinstance(value, dict):
+        return ()
+    return ((_decimal(value.get("px")), _decimal(value.get("sz"))),)
+
+
+def _bbo_subscription(symbol: str) -> dict[str, str]:
+    return {"type": "bbo", "coin": symbol}
 
 
 def _millis_datetime(value: Any) -> datetime | None:

@@ -28,7 +28,7 @@ from app.api import markets as markets_api
 from app.api import settings_api
 from app.schemas import SymbolMappingIn
 from app.venues.domain.models import OrderBookSnapshot, Ticker
-from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
+from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map
 
 
 def test_quote_synchronizer_rejects_unsynced_quotes() -> None:
@@ -539,10 +539,6 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     assert opportunity.trigger_leg_a_ask == 101
     assert opportunity.trigger_leg_b_bid == 110
     assert opportunity.trigger_leg_b_ask == 111
-
-def test_hyperliquid_fast_l2book_subscription_includes_fast_flag() -> None:
-    assert l2book_subscription("xyz:JP225", fast=True) == {"type": "l2Book", "coin": "xyz:JP225", "fast": True}
-    assert l2book_subscription("BTC", fast=False) == {"type": "l2Book", "coin": "BTC"}
 
 def test_leg_b_spread_rebate_reduces_spread_cost() -> None:
     cost = estimate_cost(

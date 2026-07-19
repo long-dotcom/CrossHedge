@@ -197,13 +197,6 @@ def _exchange_time_from_hyperliquid_ms(value: Any) -> datetime | None:
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc).replace(tzinfo=None)
 
 
-def l2book_subscription(coin: str, *, fast: bool) -> dict[str, Any]:
-    subscription: dict[str, Any] = {"type": "l2Book", "coin": coin}
-    if fast:
-        subscription["fast"] = True
-    return subscription
-
-
 def hyperliquid_symbol_map(mappings, *, hip3_only: bool) -> dict[str, str]:
     rows: dict[str, str] = {}
     for item in mappings:

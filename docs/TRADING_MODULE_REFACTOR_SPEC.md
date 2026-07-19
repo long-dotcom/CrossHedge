@@ -48,7 +48,7 @@ Paper 不使用本地撮合结果。加密腿由 `HybridPaperProbeConnector` 调
 | 能力 | Hyperliquid | Binance Futures | MT5 |
 |---|---|---|---|
 | 账户/持仓 | Info API | 签名 REST | terminal API |
-| 公共行情 | l2Book WS | bookTicker + depth WS | symbol tick/book |
+| 公共行情 | bbo WS + 执行前 l2Book 快照 | bookTicker + depth WS | symbol tick/book |
 | 私有订单事件 | orderUpdates/userFills WS | User Data Stream | 活动订单轮询 |
 | 实盘提交 | 官方 Exchange SDK | 项目 HMAC REST | Redis Stream → Gateway → order_send |
 | 幂等标识 | 确定性 cloid | newClientOrderId | magic/comment + ticket |
@@ -102,7 +102,7 @@ Binance 本地簿必须：
 5. 后续严格校验 `pu == previous_u`。
 6. 缺口时标记失步、停止发布并重新同步。
 
-Hyperliquid 使用交易所完整 l2Book 更新。MT5 使用 terminal market book；不可用时只发布 ticker，不伪造 Live 深度。
+Hyperliquid 常规行情使用 bbo WS 更新最优买卖价，并在执行前按需读取 l2Book 快照复核深度。MT5 使用 terminal market book；不可用时只发布 ticker，不伪造 Live 深度。
 
 ## 7. 品种与成本刷新
 

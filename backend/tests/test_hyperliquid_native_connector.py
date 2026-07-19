@@ -5,7 +5,7 @@ from decimal import Decimal
 from app.venues.domain.events import VenueEventType
 from app.venues.domain.models import OrderRequest, OrderStatus, OrderType, Side
 from app.venues.hyperliquid.connector import HyperliquidConnector
-from app.venues.hyperliquid.websocket import HyperliquidWebSocketRuntime
+from app.venues.hyperliquid.websocket import HyperliquidWebSocketRuntime, _bbo_subscription
 
 
 class FakeHyperInfo:
@@ -52,6 +52,10 @@ class FakeExchange:
             "status": "ok",
             "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}},
         }
+
+
+def test_hyperliquid_public_market_data_uses_bbo_subscription() -> None:
+    assert _bbo_subscription("BTC") == {"type": "bbo", "coin": "BTC"}
 
 
 def test_hyperliquid_native_account_instrument_and_order() -> None:
@@ -103,18 +107,18 @@ def test_hyperliquid_health_does_not_call_rest_api() -> None:
     assert health["ws_connected"] is True
 
 
-def test_hyperliquid_l2_and_private_events_are_normalized() -> None:
+def test_hyperliquid_bbo_and_private_events_are_normalized() -> None:
     runtime = HyperliquidWebSocketRuntime(ws_url="wss://example", account_address="0xabc")
     runtime.register_client_order_id("0x11111111111111111111111111111111", "business-id")
     runtime.process_message(
         {
-            "channel": "l2Book",
+            "channel": "bbo",
             "data": {
                 "coin": "BTC",
                 "time": 1_700_000_000_000,
-                "levels": [
-                    [{"px": "60000", "sz": "1"}],
-                    [{"px": "60001", "sz": "2"}],
+                "bbo": [
+                    {"px": "60000", "sz": "1", "n": 1},
+                    {"px": "60001", "sz": "2", "n": 1},
                 ],
             },
         }
@@ -164,6 +168,7 @@ def test_hyperliquid_l2_and_private_events_are_normalized() -> None:
     )
 
     assert runtime.ticker("BTC").bid == Decimal("60000")
+    assert runtime.order_book("BTC").asks == ((Decimal("60001"), Decimal("2")),)
     assert order_events[0].event_type == VenueEventType.ORDER_PARTIALLY_FILLED
     assert order_events[0].order.client_order_id == "business-id"
     assert order_events[0].order.filled_quantity == Decimal("0.01")

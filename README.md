@@ -114,7 +114,7 @@ Maker-then-Market、部分成交、撤单确认、单腿失败、补偿和人工
 
 ## Hyperliquid 事件流
 
-- 公共 WS 维护 `l2Book`。
+- 公共 WS 订阅 `bbo`，在最优买一/卖一变化时更新扫描行情；执行前仍按需使用 `l2Book` 快照复核深度。
 - 执行 Worker 单独订阅 `orderUpdates` 和 `userFills`。
 - 业务 ClientOrderId 映射为确定性的 16 字节 cloid。
 - Fill 按交易 ID 去重；断线后使用订单状态和用户成交历史补齐。
