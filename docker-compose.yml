@@ -88,7 +88,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    entrypoint: []
+    # 使用 null 继承镜像入口；Coolify 不接受用于清空入口的空数组。
+    entrypoint: null
     command: ["python", "-m", "app.execution.worker_main"]
     environment:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
