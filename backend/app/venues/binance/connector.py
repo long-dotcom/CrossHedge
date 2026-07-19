@@ -53,14 +53,22 @@ class BinanceFuturesConnector:
         environment: str = "live",
         read_only: bool = True,
         rest_client: BinanceFuturesRestClient | None = None,
+        default_maker_fee_rate: Decimal = Decimal("0.0002"),
+        default_taker_fee_rate: Decimal = Decimal("0.0005"),
     ) -> None:
         values = credentials or {}
         self.environment = environment
         self.read_only = bool(read_only)
+        self.default_maker_fee_rate = default_maker_fee_rate
+        self.default_taker_fee_rate = default_taker_fee_rate
         self.rest = rest_client or BinanceFuturesRestClient(
             api_key=str(values.get("api_key") or ""),
             api_secret=str(values.get("api_secret") or ""),
             environment=environment,
+        )
+        self._has_credentials = bool(
+            str(getattr(self.rest, "api_key", "") or "")
+            and str(getattr(self.rest, "api_secret", "") or "")
         )
         self._instrument_cache: TTLCache[Instrument] = TTLCache(
             ttl_seconds=21600, namespace=f"binance-instruments-{environment}",
@@ -94,6 +102,7 @@ class BinanceFuturesConnector:
         }
 
     def get_account(self) -> AccountSnapshot:
+        self._require_private_access()
         cached = self._ws.account()
         if cached is not None:
             return cached
@@ -125,6 +134,7 @@ class BinanceFuturesConnector:
         return snapshot
 
     def get_positions(self) -> list[Position]:
+        self._require_private_access()
         cached = self._ws.positions()
         if cached is not None:
             return cached
@@ -155,6 +165,7 @@ class BinanceFuturesConnector:
         return rows
 
     def get_open_orders(self, symbol: str | None = None) -> list[OrderSnapshot]:
+        self._require_private_access()
         return [self._order_from_payload(item) for item in self.rest.open_orders(symbol)]
 
     def get_instruments(self, symbols: Sequence[str] | None = None) -> list[Instrument]:
@@ -179,20 +190,25 @@ class BinanceFuturesConnector:
         if not rows:
             raise LookupError(f"Binance Futures 品种不存在: {key}")
         instrument = rows[0]
-        try:
-            fee = self.rest.commission_rate(key)
-            funding = self.rest.premium_index(key)
-            instrument = Instrument(
-                **{
-                    **instrument.__dict__,
-                    "maker_fee_rate": _decimal(fee.get("makerCommissionRate")),
-                    "taker_fee_rate": _decimal(fee.get("takerCommissionRate")),
-                    "funding_rate": _optional_decimal(funding.get("lastFundingRate")),
-                    "next_funding_at": _millis_datetime(funding.get("nextFundingTime")),
-                }
-            )
-        except BinanceApiError:
-            pass
+        maker_fee_rate = self.default_maker_fee_rate
+        taker_fee_rate = self.default_taker_fee_rate
+        if self._has_credentials:
+            try:
+                fee = self.rest.commission_rate(key)
+                maker_fee_rate = _decimal(fee.get("makerCommissionRate"))
+                taker_fee_rate = _decimal(fee.get("takerCommissionRate"))
+            except BinanceApiError:
+                pass
+        funding = self.rest.premium_index(key)
+        instrument = Instrument(
+            **{
+                **instrument.__dict__,
+                "maker_fee_rate": maker_fee_rate,
+                "taker_fee_rate": taker_fee_rate,
+                "funding_rate": _optional_decimal(funding.get("lastFundingRate")),
+                "next_funding_at": _millis_datetime(funding.get("nextFundingTime")),
+            }
+        )
         self._instrument_cache.set(key, instrument)
         return instrument
 
@@ -235,6 +251,7 @@ class BinanceFuturesConnector:
         self._ws.remove_symbols(symbols)
 
     def subscribe_private_events(self, handler: EventHandler) -> None:
+        self._require_private_access()
         if handler not in self._event_handlers:
             self._event_handlers.append(handler)
         self._ws.add_event_handler(handler)
@@ -242,6 +259,7 @@ class BinanceFuturesConnector:
     def submit_order(self, request: OrderRequest) -> OrderSnapshot:
         if self.read_only:
             raise PermissionError("Binance Connector 为只读配置，禁止下单")
+        self._require_private_access()
         if not self._ws.private_stream_ready:
             raise RuntimeError("Binance 账户私有 WebSocket 尚未连接，禁止提交无法实时确认的订单")
         symbol = normalize_symbol(request.symbol)
@@ -267,6 +285,7 @@ class BinanceFuturesConnector:
     def cancel_order(self, symbol: str, *, client_order_id: str = "", venue_order_id: str = "") -> OrderSnapshot:
         if self.read_only:
             raise PermissionError("Binance Connector 为只读配置，禁止撤单")
+        self._require_private_access()
         data = self.rest.cancel_order(
             symbol,
             client_order_id=client_order_id,
@@ -275,11 +294,13 @@ class BinanceFuturesConnector:
         return self._order_from_payload(data)
 
     def get_order(self, symbol: str, *, client_order_id: str = "", venue_order_id: str = "") -> OrderSnapshot:
+        self._require_private_access()
         return self._order_from_payload(
             self.rest.query_order(symbol, client_order_id=client_order_id, order_id=venue_order_id)
         )
 
     def get_fills(self, symbol: str | None = None, *, client_order_id: str = "", venue_order_id: str = "") -> list[Fill]:
+        self._require_private_access()
         if not symbol:
             raise ValueError("Binance 成交查询必须提供 symbol")
         rows = self.rest.user_trades(symbol, order_id=venue_order_id)
@@ -346,6 +367,10 @@ class BinanceFuturesConnector:
     def _cache_ticker(self, ticker: Ticker) -> None:
         self._ticker_cache.set(ticker.symbol, ticker)
 
+    def _require_private_access(self) -> None:
+        if not self._has_credentials:
+            raise PermissionError("Binance 私有账户功能需要配置 API 凭据")
+
     def _instrument_from_payload(self, item: dict[str, Any]) -> Instrument:
         filters = {str(value.get("filterType")): value for value in item.get("filters", [])}
         lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
@@ -362,6 +387,8 @@ class BinanceFuturesConnector:
             price_tick=_decimal(price_filter.get("tickSize")),
             minimum_notional=_decimal(notional_filter.get("notional") or notional_filter.get("minNotional")),
             trading_enabled=str(item.get("status") or "") == "TRADING",
+            maker_fee_rate=self.default_maker_fee_rate,
+            taker_fee_rate=self.default_taker_fee_rate,
             raw=item,
         )
 

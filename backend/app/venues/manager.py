@@ -100,7 +100,18 @@ class NativeVenueManager:
                 ),
             )
         if normalized == "binance":
-            raise RuntimeError("Binance 必须在交易所设置中配置并启用原生凭据")
+            identity = "public:live"
+            key = (normalized, mode, identity)
+            return self._get_or_create(
+                key,
+                lambda: BinanceFuturesConnector(
+                    credentials={},
+                    environment="live",
+                    read_only=True,
+                    default_maker_fee_rate=Decimal(str(settings.cost.binance_default_maker_fee_rate)),
+                    default_taker_fee_rate=Decimal(str(settings.cost.binance_default_taker_fee_rate)),
+                ),
+            )
         raise ValueError(f"尚未接入原生交易场所: {normalized}")
 
     def preload_enabled(self, *, start: bool = True, subscribe_market_data: bool = True) -> list[str]:
