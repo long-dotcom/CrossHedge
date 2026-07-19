@@ -16,6 +16,8 @@ MT5 Terminal 调用已从业务后端运行链路剥离。后端通过 Redis Str
 
 ```powershell
 Copy-Item .env.example .env
+Copy-Item .mt5-gateway.env.example .mt5-gateway.env
+# 修改两个文件中的 REDIS_PASSWORD，并确保值完全一致。
 .\scripts\start_stack.ps1
 .\.venv\Scripts\python.exe -m pip install -r mt5_gateway\requirements.txt
 .\scripts\start_mt5_gateway.ps1
@@ -25,8 +27,12 @@ Copy-Item .env.example .env
 可用端口，并将本次结果写入不提交仓库的 `.runtime.env`。Redis 容器内部使用
 `16379`，宿主机端口只绑定 `127.0.0.1`。
 
-首次启动会生成 JWT、交易所凭证加密密钥和 Redis 密码，持久化在 Docker
-`app_secrets` 卷中。重启或重新创建容器不会覆盖密钥；删除该卷会导致登录令牌失效，
+Redis 地址和密码通过环境变量显式配置：Docker 服务读取根目录 `.env` 中的
+`REDIS_URL`、`REDIS_PASSWORD`，Windows Gateway 读取 `.mt5-gateway.env` 中的同名变量。
+两个文件的密码必须完全一致，Gateway 地址使用宿主机回环地址及 `REDIS_HOST_PORT`。
+
+首次启动只生成 JWT 和交易所凭证加密密钥，持久化在 Docker `app_secrets` 卷中。
+重启或重新创建容器不会覆盖这些密钥；删除该卷会导致登录令牌失效，
 并使数据库中已有的交易所凭证无法解密，因此生产环境必须备份该卷。
 旧版本升级时，如果 `.env` 仍有 JWT 或交易所加密密钥，初始化器会在首次创建密钥卷时
 沿用旧值以保护已有数据；全新安装则直接生成随机值。

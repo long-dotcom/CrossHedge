@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 SECRETS_DIR = Path("/run/crosshedge-secrets")
-SECRET_FILES = {"jwt_secret": 64, "exchange_config_secret": 64, "redis_password": 48}
+SECRET_FILES = {"jwt_secret": 64, "exchange_config_secret": 64}
 
 
 def create_secret(name: str, length: int, seed: str = "") -> None:
@@ -28,7 +28,6 @@ def main() -> None:
     legacy_exchange = os.getenv("LEGACY_EXCHANGE_CONFIG_SECRET", "").strip() or legacy_jwt
     create_secret("jwt_secret", SECRET_FILES["jwt_secret"], legacy_jwt)
     create_secret("exchange_config_secret", SECRET_FILES["exchange_config_secret"], legacy_exchange)
-    create_secret("redis_password", SECRET_FILES["redis_password"])
 
 
 if __name__ == "__main__":

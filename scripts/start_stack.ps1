@@ -47,6 +47,8 @@ function Get-CurrentPublishedPort([string]$Service, [string]$ContainerPort) {
 }
 
 $values = Read-EnvValues $SourceEnv
+if (-not $values["REDIS_URL"]) { throw "REDIS_URL is required in .env." }
+if (-not $values["REDIS_PASSWORD"]) { throw "REDIS_PASSWORD is required in .env." }
 $preferredAppPort = if ($values["APP_PORT"]) { [int]$values["APP_PORT"] } else { 8080 }
 $preferredRedisPort = if ($values["REDIS_HOST_PORT"]) { [int]$values["REDIS_HOST_PORT"] } else { 16379 }
 $currentAppPort = Get-CurrentPublishedPort "frontend" "80"

@@ -29,6 +29,8 @@ services:
   redis:
     image: redis:7.4-alpine
     restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
     command:
       - /bin/sh
       - -ec
@@ -37,18 +39,14 @@ services:
           --port 16379 \
           --appendonly yes \
           --maxmemory-policy noeviction \
-          --requirepass "$$(cat /run/crosshedge-secrets/redis_password)"
+          --requirepass "$${REDIS_PASSWORD}"
     ports:
       # Windows 主机上的 MT5 Gateway 通过本端口连接。
       - "127.0.0.1:${REDIS_HOST_PORT:-16379}:16379"
     volumes:
       - redis_data:/data
-      - app_secrets:/run/crosshedge-secrets:ro
-    depends_on:
-      secrets-init:
-        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/crosshedge-secrets/redis_password) redis-cli -p 16379 ping | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli -p 16379 ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -60,8 +58,8 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
-      REDIS_URL: redis://redis:16379/0
-      REDIS_PASSWORD_FILE: /run/crosshedge-secrets/redis_password
+      REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
       JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
       EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
       ENVIRONMENT: ${ENVIRONMENT:-local}
@@ -73,6 +71,8 @@ services:
     volumes:
       - app_secrets:/run/crosshedge-secrets:ro
     depends_on:
+      secrets-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -92,8 +92,8 @@ services:
     command: ["python", "-m", "app.execution.worker_main"]
     environment:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
-      REDIS_URL: redis://redis:16379/0
-      REDIS_PASSWORD_FILE: /run/crosshedge-secrets/redis_password
+      REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
       JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
       EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
       ENVIRONMENT: ${ENVIRONMENT:-local}
