@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$NoBuild
 )
 
@@ -10,7 +10,8 @@ $RuntimeEnv = Join-Path $ProjectRoot ".runtime.env"
 function Read-EnvValues([string]$Path) {
     $values = [ordered]@{}
     if (-not (Test-Path $Path)) { return $values }
-    foreach ($line in Get-Content $Path) {
+    # 显式使用 UTF-8，兼容 Windows PowerShell 5.1 与 PowerShell 7。
+    foreach ($line in Get-Content -Encoding UTF8 $Path) {
         $value = $line.Trim()
         if (-not $value -or $value.StartsWith("#") -or -not $value.Contains("=")) { continue }
         $name, $content = $value.Split("=", 2)

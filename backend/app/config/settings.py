@@ -226,6 +226,10 @@ class CostSettings:
     cost_cache_ttl_seconds: int = 60
     # Carry-cost 同步间隔 / 秒（CARRY_COST_SYNC_INTERVAL_SECONDS）
     carry_cost_sync_interval_seconds: int = 300
+    # Binance 无账户凭据时使用的默认 Maker 费率（BINANCE_DEFAULT_MAKER_FEE_RATE）
+    binance_default_maker_fee_rate: float = 0.0002
+    # Binance 无账户凭据时使用的默认 Taker 费率（BINANCE_DEFAULT_TAKER_FEE_RATE）
+    binance_default_taker_fee_rate: float = 0.0005
 
 
 @dataclass
@@ -327,6 +331,8 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "FX_FALLBACK_RATES":                 ("cost", "fx_fallback_rates"),
     "COST_CACHE_TTL_SECONDS":            ("cost", "cost_cache_ttl_seconds"),
     "CARRY_COST_SYNC_INTERVAL_SECONDS":  ("cost", "carry_cost_sync_interval_seconds"),
+    "BINANCE_DEFAULT_MAKER_FEE_RATE":    ("cost", "binance_default_maker_fee_rate"),
+    "BINANCE_DEFAULT_TAKER_FEE_RATE":    ("cost", "binance_default_taker_fee_rate"),
     # --- PaperLiveSettings ---
     "PAPER_LIVE_PROBE_ENABLED":          ("paper_live", "probe_enabled"),
     "PAPER_LIVE_PROBE_VENUES":           ("paper_live", "probe_venues"),

@@ -95,11 +95,15 @@ class MarketDataManager:
 
         connectors = {}
         for venue, symbols in symbols_by_venue.items():
-            connector = self._paper_connector(venue) if paper else native_venue_manager.connector_for(venue, "live")
-            connector.start()
-            if not paper:
-                connector.subscribe_market_data(sorted(symbols))
-            connectors[venue] = connector
+            try:
+                connector = self._paper_connector(venue) if paper else native_venue_manager.connector_for(venue, "live")
+                connector.start()
+                if not paper:
+                    connector.subscribe_market_data(sorted(symbols))
+                connectors[venue] = connector
+            except Exception as exc:
+                # 单一交易所故障必须隔离，避免阻断其他交易所的行情投影。
+                logger.warning("交易所行情连接失败，本轮跳过: venue={}, error={}", venue, exc)
 
         for mapping in mappings:
             for index in ("a", "b"):

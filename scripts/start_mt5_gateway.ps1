@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PythonPath = ".\.venv\Scripts\python.exe",
     [string]$GatewayEnvFile = ".mt5-gateway.env"
 )
@@ -9,7 +9,8 @@ Set-Location $ProjectRoot
 
 function Import-EnvFile([string]$Path) {
     if (-not (Test-Path $Path)) { return }
-    foreach ($line in Get-Content $Path) {
+    # Windows PowerShell 5.1 默认按系统 ANSI 读取无 BOM 文件，可能把中文后的换行误解为多字节字符。
+    foreach ($line in Get-Content -Encoding UTF8 $Path) {
         $value = $line.Trim()
         if (-not $value -or $value.StartsWith("#") -or -not $value.Contains("=")) { continue }
         $name, $content = $value.Split("=", 2)

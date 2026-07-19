@@ -48,6 +48,7 @@ class MT5RedisConnector:
         self._event_thread: threading.Thread | None = None
         self._event_cursor = "$"
         self._subscribed_symbols: set[str] = set()
+        self._gateway_consumer = ""
         self._subscription_lock = threading.Lock()
 
     def start(self) -> None:
@@ -89,6 +90,10 @@ class MT5RedisConnector:
         return [codec.instrument(item) for item in data]
 
     def get_instrument(self, symbol: str, *, refresh: bool = False) -> Instrument:
+        if not refresh:
+            raw = self._redis.get(redis_key("mt5", "snapshot", "instrument", symbol))
+            if raw:
+                return codec.instrument(codec.loads(raw))
         return codec.instrument(self._rpc("get_instrument", {"symbol": symbol, "refresh": refresh}))
 
     def get_ticker(self, symbol: str) -> Ticker:
@@ -105,7 +110,13 @@ class MT5RedisConnector:
         if handler:
             self.subscribe_private_events(handler)
         requested = {str(symbol) for symbol in symbols if symbol}
+        health = self.health()
+        consumer = str(health.get("consumer") or "")
         with self._subscription_lock:
+            if consumer and consumer != self._gateway_consumer:
+                # Gateway 重启后内存订阅为空，必须向新的 consumer 重发全部品种。
+                self._subscribed_symbols.clear()
+                self._gateway_consumer = consumer
             pending = requested - self._subscribed_symbols
             self._subscribed_symbols.update(pending)
         if pending:

@@ -24,6 +24,7 @@ CrossHedge 现在分为两类运行环境：
 | `crosshedge:mt5:events` | Stream | 订单状态及成交事件 |
 | `crosshedge:mt5:snapshot:account` | String/JSON | 当前账户完整快照 |
 | `crosshedge:mt5:snapshot:positions` | String/JSON | 当前持仓完整快照 |
+| `crosshedge:mt5:snapshot:instrument:{symbol}` | String/JSON | MT5 品种合约规格快照 |
 | `crosshedge:mt5:ticker:{symbol}` | String/JSON | MT5 最新报价 |
 | `crosshedge:mt5:orderbook:{symbol}` | String/JSON | MT5 最新盘口 |
 | `crosshedge:mt5:health` | String/JSON | Gateway 心跳及连接状态 |
@@ -57,6 +58,9 @@ CrossHedge 现在分为两类运行环境：
 - Redis 使用非默认端口并强制密码认证；Redis、JWT 与交易所加密密钥分别由 `REDIS_URL`、`REDIS_PASSWORD`、`JWT_SECRET`、`EXCHANGE_CONFIG_SECRET` 环境变量显式配置，系统不再自动生成或保存这些密钥。
 - Redis 原生密码认证不提供传输加密；直接公网连接会暴露流量元数据和明文协议内容，必须使用强随机密码，并优先在防火墙层限制来源 IP。
 - 账户和持仓快照具有 TTL。Gateway 停止后后端不会长期使用陈旧数据。
+- Gateway 定时把品种合约规格写入 Redis，后端扫描直接读取快照；规格默认每 6 小时从 Terminal 刷新一次，避免跨公网逐方向 RPC。
+- Redis 重启或网络短暂中断时 Gateway 保持 MT5 连接并按指数退避重连，不会退出；Redis 恢复后自动重建 Consumer Group、心跳和全部只读快照。
+- Gateway 进程重启导致 consumer ID 变化时，后端会自动重发全部行情品种订阅。
 - Redis 使用 AOF 和 `noeviction`，避免内存淘汰交易命令。生产环境仍需配置持久化、监控和容量告警。
 - Redis Stream 提供至少一次投递语义；幂等键是避免重复下单的必要条件。
 - 下单或撤单开始执行后会写入幂等状态。如果进程在明确结果落库前中断，Gateway 会拒绝自动重放该命令，需人工核对终端状态并清理对应状态键。

@@ -57,6 +57,9 @@ def test_public_market_subscription_does_not_enable_private_user_stream(monkeypa
 
 
 class FakeBinanceRest:
+    api_key = "key"
+    api_secret = "secret"
+
     def exchange_info(self):
         return {
             "symbols": [
@@ -132,6 +135,53 @@ def test_read_only_connector_rejects_order_before_network_call() -> None:
                 side=Side.BUY,
                 quantity=Decimal("0.01"),
                 client_order_id="blocked",
+            )
+        )
+
+
+def test_public_connector_uses_market_data_and_default_fees_without_credentials() -> None:
+    class PublicRest(FakeBinanceRest):
+        api_key = ""
+        api_secret = ""
+
+        def commission_rate(self, symbol):
+            raise AssertionError("公共行情连接器不应请求账户手续费接口")
+
+        def book_ticker(self, symbol):
+            return {
+                "bidPrice": "60000",
+                "askPrice": "60001",
+                "bidQty": "2",
+                "askQty": "3",
+            }
+
+    connector = BinanceFuturesConnector(rest_client=PublicRest(), read_only=True)
+
+    ticker = connector.get_ticker("BTCUSDT")
+    instrument = connector.get_instrument("BTCUSDT")
+
+    assert ticker.bid == Decimal("60000")
+    assert instrument.maker_fee_rate == Decimal("0.0002")
+    assert instrument.taker_fee_rate == Decimal("0.0005")
+    with pytest.raises(PermissionError, match="需要配置 API 凭据"):
+        connector.get_account()
+
+
+def test_writable_connector_without_credentials_rejects_order_before_network_call() -> None:
+    class PublicRest(FakeBinanceRest):
+        api_key = ""
+        api_secret = ""
+
+    connector = BinanceFuturesConnector(rest_client=PublicRest(), read_only=False)
+
+    with pytest.raises(PermissionError, match="需要配置 API 凭据"):
+        connector.submit_order(
+            OrderRequest(
+                venue="binance",
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=Decimal("0.01"),
+                client_order_id="missing-credentials",
             )
         )
 

@@ -143,7 +143,12 @@ def build_credential_connector(
         "read_only": bool(row.read_only),
     }
     if row.venue == "binance":
-        return BinanceFuturesConnector(**common)
+        settings = get_settings()
+        return BinanceFuturesConnector(
+            **common,
+            default_maker_fee_rate=Decimal(str(settings.cost.binance_default_maker_fee_rate)),
+            default_taker_fee_rate=Decimal(str(settings.cost.binance_default_taker_fee_rate)),
+        )
     if row.venue == "hyperliquid":
         return HyperliquidConnector(**common)
     if row.venue == "mt5":

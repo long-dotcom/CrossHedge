@@ -27,6 +27,7 @@ from app.risk.engine import pre_trade_check
 from app.api import markets as markets_api
 from app.api import settings_api
 from app.schemas import SymbolMappingIn
+from app.venues.domain.models import OrderBookSnapshot, Ticker
 from app.workers.market_data import MarketDataManager, _exchange_time_from_hyperliquid_ms, hyperliquid_symbol_map, l2book_subscription
 
 
@@ -81,6 +82,49 @@ def test_live_market_data_starts_single_native_projection_thread(monkeypatch) ->
         assert manager._thread.name == "native-market-data"
     finally:
         manager.stop()
+
+
+def test_market_data_isolates_one_venue_connector_failure(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Connector:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+        def start(self) -> None:
+            calls.append((self.venue, "start"))
+
+        def subscribe_market_data(self, symbols) -> None:
+            calls.append((self.venue, "subscribe"))
+
+        def get_ticker(self, symbol: str) -> Ticker:
+            calls.append((self.venue, "ticker"))
+            return Ticker(self.venue, symbol, 100, 101, 2, 3)
+
+        def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
+            return OrderBookSnapshot(self.venue, symbol, ((100, 2),), ((101, 3),))
+
+    def connector_for(venue: str, mode: str):
+        if venue == "binance":
+            raise RuntimeError("binance unavailable")
+        return Connector(venue)
+
+    class Sink:
+        def put(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setattr("app.workers.market_data.native_venue_manager.connector_for", connector_for)
+    monkeypatch.setattr("app.workers.market_data.quote_cache", Sink())
+    monkeypatch.setattr("app.workers.market_data.order_book_cache", Sink())
+    mappings = [
+        SimpleNamespace(symbol="GOLD", leg_a_venue="binance", leg_a_symbol="XAUUSDT", leg_b_venue="mt5", leg_b_symbol="XAUUSD"),
+        SimpleNamespace(symbol="BTC", leg_a_venue="hyperliquid", leg_a_symbol="BTC", leg_b_venue="mt5", leg_b_symbol="BTCUSD"),
+    ]
+
+    MarketDataManager()._refresh(mappings, paper=False)
+
+    assert ("hyperliquid", "ticker") in calls
+    assert ("mt5", "ticker") in calls
 
 def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
     mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
