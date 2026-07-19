@@ -92,7 +92,7 @@ function applySnapshot(
     queryClient.setQueryData(cacheKey, data.lead_lag);
   }
   if (data.hedge_groups) {
-    queryClient.setQueryData(['hedge-groups', data.hedge_groups.page || page], data.hedge_groups);
+    queryClient.setQueryData(cacheKey || ['hedge-groups', data.hedge_groups.page || page], data.hedge_groups);
   }
   if (data.positions) {
     queryClient.setQueryData(['positions'], data.positions);

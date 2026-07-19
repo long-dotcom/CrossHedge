@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.time_utils import utc_now
 from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
-from app.execution.outbox_worker import run_execution_outbox_once
+from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
 
 
@@ -113,7 +113,8 @@ def test_ttl_cancel_waits_for_terminal_then_hedges_partial_fill() -> None:
         assert db.query(VenueOrder).one().status == "PENDING_CANCEL"
         assert state["canceled"] == ["maker-venue-1"]
 
-    # 下一轮查询确认撤单携带部分成交，按比例只提交 0.008 Hedge。
+    # 模拟私有流重连后的单次补偿确认，随后按比例只提交 0.008 Hedge。
+    reconcile_execution_orders_once(session_factory=factory, adapter_factory=adapter_factory)
     assert run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory) == 1
     with factory() as db:
         intent = db.get(ExecutionIntent, intent_id)
@@ -142,6 +143,7 @@ def test_market_fallback_is_enqueued_only_after_cancel_confirmation() -> None:
     with factory() as db:
         assert db.query(ExecutionLeg).filter_by(intent_id=intent_id, role="MAKER_FALLBACK").count() == 0
 
+    reconcile_execution_orders_once(session_factory=factory, adapter_factory=adapter_factory)
     assert run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory) == 1
     with factory() as db:
         fallback = db.query(ExecutionLeg).filter_by(intent_id=intent_id, role="MAKER_FALLBACK").one()
@@ -170,6 +172,7 @@ def test_failed_hedge_creates_separate_flatten_compensation() -> None:
         maker.created_at = utc_now() - timedelta(seconds=2)
         db.commit()
     run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory)
+    reconcile_execution_orders_once(session_factory=factory, adapter_factory=adapter_factory)
     run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory)
     # Hedge 动态命令被拒绝后，应生成独立反向补偿腿。
     run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory)

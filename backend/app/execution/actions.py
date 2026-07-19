@@ -14,6 +14,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.models import ExecutionIntent, Fill, HedgeGroup, Order
+from app.execution.voiding import void_eligibility
 
 
 NON_TERMINAL_ORDER_STATUSES = {
@@ -86,6 +87,10 @@ def hedge_group_actions(db: Session, group: HedgeGroup | Any) -> dict[str, Any]:
         "recover": {
             "allowed": recover_allowed,
             "reason": "存在异常敞口或待确认订单" if recover_allowed else "当前没有可执行的恢复计划",
+        },
+        "void": {
+            "allowed": (void_decision := void_eligibility(db, group)).allowed,
+            "reason": void_decision.reason,
         },
     }
 

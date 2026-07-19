@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.time_utils import utc_now
 from app.db.models import Base, ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
-from app.execution.outbox_worker import run_execution_outbox_once
+from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
 
 
@@ -125,7 +125,7 @@ def test_stale_processing_command_queries_and_never_resubmits() -> None:
         assert "禁止自动重发" in db.query(ExecutionOutbox).one().last_error
 
 
-def test_sent_order_is_continuously_reconciled_without_resubmission() -> None:
+def test_sent_order_is_not_polled_and_explicit_recovery_does_not_resubmit() -> None:
     factory = _factory_and_session()
     intent_id = _create(factory)
     calls = []
@@ -143,6 +143,13 @@ def test_sent_order_is_continuously_reconciled_without_resubmission() -> None:
         session_factory=factory,
         adapter_factory=lambda venue, mode: adapter,
     ) == 0
+
+    with factory() as db:
+        assert db.get(ExecutionIntent, intent_id).status == "RUNNING"
+    reconcile_execution_orders_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: adapter,
+    )
 
     assert len(calls) == 1
     with factory() as db:

@@ -17,11 +17,13 @@ from app.core.time_utils import utc_now
 from app.venues.domain.events import VenueEvent, VenueEventType
 from app.venues.domain.models import (
     Fill,
+    AccountSnapshot,
     OrderBookSnapshot,
     OrderSnapshot,
     OrderStatus,
     OrderType,
     PositionSide,
+    Position,
     Side,
     Ticker,
 )
@@ -50,14 +52,23 @@ class HyperliquidWebSocketRuntime:
         self._tickers: dict[str, Ticker] = {}
         self._cloid_to_client: dict[str, str] = {}
         self._seen_fills: set[str] = set()
+        self._account_snapshot: AccountSnapshot | None = None
+        self._positions: dict[str, Position] = {}
+        self._positions_ready = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = False
+        self._private_connected = False
+        self._ever_connected = False
         self._last_message_at = 0.0
 
     def register_client_order_id(self, venue_cloid: str, client_order_id: str) -> None:
         self._cloid_to_client[venue_cloid.lower()] = client_order_id
+
+    @property
+    def private_stream_ready(self) -> bool:
+        return not self._private_enabled or self._private_connected
 
     def add_symbols(self, symbols: Sequence[str]) -> None:
         self._symbols.update(str(symbol) for symbol in symbols)
@@ -91,6 +102,7 @@ class HyperliquidWebSocketRuntime:
         return {
             "ws_running": bool(self._thread and self._thread.is_alive()),
             "ws_connected": self._connected,
+            "private_ws_connected": self._private_connected,
             "message_age_seconds": time.monotonic() - self._last_message_at if self._last_message_at else None,
             "symbols": sorted(self._symbols),
         }
@@ -105,6 +117,19 @@ class HyperliquidWebSocketRuntime:
         return OrderBookSnapshot(
             **{**book.__dict__, "bids": book.bids[:depth], "asks": book.asks[:depth]}
         )
+
+    def account(self) -> AccountSnapshot | None:
+        return self._account_snapshot
+
+    def positions(self) -> list[Position] | None:
+        return list(self._positions.values()) if self._positions_ready else None
+
+    def seed_account(self, account: AccountSnapshot) -> None:
+        self._account_snapshot = account
+
+    def seed_positions(self, positions: Sequence[Position]) -> None:
+        self._positions = {item.external_position_id or item.symbol: item for item in positions}
+        self._positions_ready = True
 
     def process_message(self, payload: dict[str, Any]) -> tuple[VenueEvent, ...]:
         channel = str(payload.get("channel") or "")
@@ -127,10 +152,71 @@ class HyperliquidWebSocketRuntime:
                 event = self._fill_event(item)
                 if event:
                     events.append(event)
+        elif channel == "clearinghouseState" and isinstance(data, dict):
+            events.extend(self._account_events(data))
         for event in events:
             for handler in tuple(self._handlers):
                 handler(event)
         return tuple(events)
+
+    def _account_events(self, data: dict[str, Any]) -> list[VenueEvent]:
+        state = data.get("clearinghouseState") or data
+        margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        now = utc_now()
+        account = AccountSnapshot(
+            venue="hyperliquid",
+            account_id=self.account_address,
+            currency="USDC",
+            equity=_decimal(margin.get("accountValue")),
+            available_balance=_decimal(state.get("withdrawable")),
+            margin_used=_decimal(margin.get("totalMarginUsed")),
+            raw=state,
+        )
+        self._account_snapshot = account
+        self._positions = {}
+        self._positions_ready = True
+        events = [VenueEvent(
+            f"hyperliquid:account:{now.isoformat()}",
+            "hyperliquid",
+            VenueEventType.ACCOUNT,
+            now,
+            account=account,
+            raw={"positions_snapshot": True},
+        )]
+        for wrapper in state.get("assetPositions", []):
+            item = wrapper.get("position") or wrapper
+            signed = _decimal(item.get("szi"))
+            quantity = abs(signed)
+            entry = _decimal(item.get("entryPx"))
+            unrealized = _decimal(item.get("unrealizedPnl"))
+            mark = entry
+            if quantity > 0:
+                mark = entry + (unrealized / quantity if signed > 0 else -unrealized / quantity)
+            position = Position(
+                venue="hyperliquid",
+                account_id=self.account_address,
+                symbol=str(item.get("coin") or ""),
+                position_side=PositionSide.NET,
+                quantity=quantity,
+                entry_price=entry,
+                mark_price=mark,
+                unrealized_pnl=unrealized,
+                margin_used=_decimal(item.get("marginUsed")),
+                liquidation_price=_optional_decimal(item.get("liquidationPx")),
+                external_position_id=str(item.get("coin") or ""),
+                raw=item,
+            )
+            if position.quantity > 0:
+                self._positions[position.external_position_id or position.symbol] = position
+            events.append(VenueEvent(
+                f"hyperliquid:position:{position.symbol}:{now.isoformat()}",
+                "hyperliquid",
+                VenueEventType.POSITION,
+                now,
+                position=position,
+                raw=item,
+            ))
+        return events
 
     def _process_book(self, data: dict[str, Any]) -> None:
         symbol = str(data.get("coin") or "")
@@ -166,6 +252,8 @@ class HyperliquidWebSocketRuntime:
         requested = _decimal(raw_order.get("origSz") or raw_order.get("sz"))
         remaining = _decimal(raw_order.get("sz"))
         filled = max(requested - remaining, Decimal("0"))
+        if status == OrderStatus.ACCEPTED and filled > 0:
+            status = OrderStatus.PARTIALLY_FILLED
         order = OrderSnapshot(
             venue="hyperliquid",
             symbol=str(raw_order.get("coin") or ""),
@@ -243,6 +331,7 @@ class HyperliquidWebSocketRuntime:
                     (
                         {"type": "orderUpdates", "user": self.account_address},
                         {"type": "userFills", "user": self.account_address},
+                        {"type": "clearinghouseState", "user": self.account_address},
                     )
                 )
             if not subscriptions:
@@ -253,6 +342,11 @@ class HyperliquidWebSocketRuntime:
                     for subscription in subscriptions:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
                     self._connected = True
+                    self._private_connected = bool(self.account_address and self._private_enabled)
+                    self._emit_stream_event(VenueEventType.STREAM_CONNECTED)
+                    if self._ever_connected:
+                        self._emit_stream_event(VenueEventType.RECONCILIATION_REQUIRED, reconciliation=True)
+                    self._ever_connected = True
                     backoff = 1.0
                     last_ping = time.monotonic()
                     while not self._stop.is_set():
@@ -267,9 +361,24 @@ class HyperliquidWebSocketRuntime:
             except Exception as exc:
                 logger.warning("Hyperliquid 原生 WS 断开: {}", exc)
             finally:
+                if self._connected:
+                    self._emit_stream_event(VenueEventType.STREAM_DISCONNECTED)
                 self._connected = False
+                self._private_connected = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
+
+    def _emit_stream_event(self, event_type: VenueEventType, *, reconciliation: bool = False) -> None:
+        now = utc_now()
+        event = VenueEvent(
+            f"hyperliquid:stream:{event_type.value}:{now.isoformat()}",
+            "hyperliquid",
+            event_type,
+            now,
+            reconciliation=reconciliation,
+        )
+        for handler in tuple(self._handlers):
+            handler(event)
 
 
 def _order_status(value: Any) -> OrderStatus:

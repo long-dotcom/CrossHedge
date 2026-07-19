@@ -556,7 +556,12 @@ def put_execution_settings(
     set_execution_settings(
         db,
         paper_live_probe_enabled=payload.paper_live_probe_enabled,
-        paper_live_parallel_execution=payload.paper_live_parallel_execution,
+        paper_probe_max_notional=payload.paper_probe_max_notional,
+        paper_probe_daily_max_runs=payload.paper_probe_daily_max_runs,
+        paper_probe_daily_max_notional=payload.paper_probe_daily_max_notional,
+        paper_probe_cooldown_ms=payload.paper_probe_cooldown_ms,
+        paper_probe_flatten_timeout_seconds=payload.paper_probe_flatten_timeout_seconds,
+        paper_probe_maker_timeout_seconds=payload.paper_probe_maker_timeout_seconds,
     )
     audit(db, user.id, "update_execution_settings", "settings", json.dumps(payload.model_dump(exclude={"confirmation"}), ensure_ascii=False))
     db.commit()

@@ -200,6 +200,33 @@ def test_mt5_cancel_order_uses_remove_action() -> None:
         connector.stop()
 
 
+def test_mt5_reduce_only_only_matches_gateway_magic_position() -> None:
+    mt5 = FakeMT5()
+    mt5.positions_get = lambda symbol=None: [
+        SimpleNamespace(ticket=10, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=0.01, magic=999),
+        SimpleNamespace(ticket=11, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=0.02, magic=260620),
+    ]
+    connector = MT5Connector(read_only=False, mt5_module=mt5, connect=lambda: True, order_magic=260620)
+    try:
+        position = connector._matching_position("BTCUSD", Side.SELL, Decimal("0.01"))
+        assert position is not None
+        assert position.ticket == 11
+    finally:
+        connector.stop()
+
+
+def test_mt5_reduce_only_does_not_match_manual_position() -> None:
+    mt5 = FakeMT5()
+    mt5.positions_get = lambda symbol=None: [
+        SimpleNamespace(ticket=10, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=1, magic=999),
+    ]
+    connector = MT5Connector(read_only=False, mt5_module=mt5, connect=lambda: True, order_magic=260620)
+    try:
+        assert connector._matching_position("BTCUSD", Side.SELL, Decimal("0.01")) is None
+    finally:
+        connector.stop()
+
+
 class PollConnector:
     def __init__(self):
         self.calls = 0

@@ -75,6 +75,8 @@ def create_open_intent(
         mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == opportunity.symbol).one_or_none()
         if mapping is None:
             raise ValueError("品种映射不存在")
+        if mode == "paper":
+            _require_hybrid_paper_mapping(mapping)
         style = execution_mode(mapping)
         if style == MAKER_THEN_MARKET:
             maker_key = maker_leg(mapping)
@@ -143,6 +145,7 @@ def create_open_intent(
             direction=opportunity.direction,
             status="opening",
             execution_mode=mode,
+            execution_profile="hybrid_probe_demo" if mode == "paper" else "live",
             notional=opportunity.notional,
             quantity=opportunity.quantity,
             leg_b_quantity=opportunity.leg_b_quantity or opportunity.quantity,
@@ -304,6 +307,7 @@ def create_close_intent(
     group = db.get(HedgeGroup, group_id)
     if group is None:
         raise ValueError("对冲组不存在")
+    _require_hybrid_paper_group(group)
     require_group_action(db, group, "close")
     active = (
         db.query(ExecutionIntent)
@@ -390,6 +394,7 @@ def create_recovery_intent(
     group = db.get(HedgeGroup, group_id)
     if group is None:
         raise ValueError("对冲组不存在")
+    _require_hybrid_paper_group(group)
     require_group_action(db, group, "recover")
     actions = hedge_group_actions(db, group)
     if int(actions.get("pending_order_count") or 0) > 0:
@@ -479,3 +484,22 @@ def _close_leg_plans(db: Session, group: HedgeGroup, mapping: SymbolMapping) -> 
             venue_reduce_only=venue != "binance",
         ))
     return plans
+
+
+def _require_hybrid_paper_mapping(mapping: SymbolMapping) -> None:
+    """Paper 只允许一条加密探针腿和一条 MT5 Demo 腿。"""
+    venues = {
+        str(mapping.leg_a_venue or "").strip().lower(),
+        str(mapping.leg_b_venue or "").strip().lower(),
+    }
+    crypto = venues & {"hyperliquid", "binance"}
+    if "mt5" not in venues or len(crypto) != 1 or len(venues) != 2:
+        raise ValueError("Paper 仅支持一条 Hyperliquid/Binance 真实最小探针腿与一条 MT5 Demo 腿")
+
+
+def _require_hybrid_paper_group(group: HedgeGroup) -> None:
+    """阻止旧本地 Paper 记录误触发真实探针或 MT5 Demo 订单。"""
+    if str(group.execution_mode or "").lower() != "paper":
+        return
+    if str(getattr(group, "execution_profile", "legacy_local") or "legacy_local") != "hybrid_probe_demo":
+        raise ValueError("该对冲组属于旧本地 Paper，禁止通过混合探针链路平仓或恢复")

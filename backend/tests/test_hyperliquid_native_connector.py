@@ -164,9 +164,29 @@ def test_hyperliquid_l2_and_private_events_are_normalized() -> None:
     )
 
     assert runtime.ticker("BTC").bid == Decimal("60000")
-    assert order_events[0].event_type == VenueEventType.ORDER_ACCEPTED
+    assert order_events[0].event_type == VenueEventType.ORDER_PARTIALLY_FILLED
     assert order_events[0].order.client_order_id == "business-id"
     assert order_events[0].order.filled_quantity == Decimal("0.01")
     assert fill_events[0].event_type == VenueEventType.FILL
     assert fill_events[0].fill.client_order_id == "business-id"
     assert runtime.process_message({"channel": "userFills", "data": {"fills": [fill_events[0].fill.raw]}}) == ()
+
+
+def test_hyperliquid_clearinghouse_stream_updates_account_and_positions() -> None:
+    runtime = HyperliquidWebSocketRuntime(ws_url="wss://example", account_address="0xabc")
+
+    events = runtime.process_message({
+        "channel": "clearinghouseState",
+        "data": {
+            "marginSummary": {"accountValue": "100", "totalMarginUsed": "10"},
+            "withdrawable": "80",
+            "assetPositions": [{"position": {
+                "coin": "BTC", "szi": "0.01", "entryPx": "60000",
+                "unrealizedPnl": "10", "marginUsed": "5",
+            }}],
+        },
+    })
+
+    assert [event.event_type for event in events] == [VenueEventType.ACCOUNT, VenueEventType.POSITION]
+    assert runtime.account().equity == Decimal("100")
+    assert runtime.positions()[0].symbol == "BTC"

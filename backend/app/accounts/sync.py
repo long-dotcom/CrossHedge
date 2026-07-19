@@ -7,7 +7,6 @@ from decimal import Decimal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.config.settings import get_settings
 from app.core.logging import get_logger
 from app.db.models import AccountSnapshot, ExchangeCredential
 from app.exchanges.credentials import (
@@ -15,7 +14,6 @@ from app.exchanges.credentials import (
     build_credential_connector,
     mark_test_result,
 )
-from app.venues.hyperliquid import HyperliquidConnector
 from app.venues.mt5 import MT5Connector
 from app.venues.paper import PaperConnector
 
@@ -37,11 +35,11 @@ def sync_account_snapshots(db: Session) -> list[AccountSnapshot]:
             mark_test_result(row, "failed", str(exc))
             snapshots.append(_status_snapshot(row.venue, row.environment, "error"))
 
-    # 兼容旧版环境变量配置；迁移到 exchange_credentials 后不会重复拉取。
+    # 未配置账户时保留 paper/网关状态快照，不再读取后端环境变量中的账户凭证。
     if "hyperliquid" not in configured:
-        snapshots.append(_legacy_hyperliquid_snapshot())
+        snapshots.append(_default_hyperliquid_snapshot())
     if "mt5" not in configured:
-        snapshots.append(_legacy_mt5_snapshot())
+        snapshots.append(_gateway_mt5_snapshot())
 
     for snapshot in snapshots:
         db.add(snapshot)
@@ -92,40 +90,19 @@ def _enabled_exchange_credentials(db: Session) -> list[ExchangeCredential]:
     )
 
 
-def _legacy_hyperliquid_snapshot() -> AccountSnapshot:
-    settings = get_settings()
-    if not settings.hyperliquid.account_address:
-        return _database_snapshot(PaperConnector(venue="hyperliquid").get_account(), source="paper")
-    try:
-        connector = HyperliquidConnector(
-            credentials={
-                "account_address": settings.hyperliquid.account_address,
-                "secret_key": settings.hyperliquid.secret_key,
-            },
-            read_only=True,
-            info_url=settings.hyperliquid.info_url,
-            ws_url=settings.hyperliquid.ws_url,
-        )
-        return _database_snapshot(connector.get_account(), source="hyperliquid_native")
-    except Exception as exc:
-        logger.warning("Hyperliquid 环境变量账户读取失败，使用状态快照: {}", exc)
-        return _status_snapshot("hyperliquid", "live", "error")
+def _default_hyperliquid_snapshot() -> AccountSnapshot:
+    return _database_snapshot(PaperConnector(venue="hyperliquid").get_account(), source="paper")
 
 
-def _legacy_mt5_snapshot() -> AccountSnapshot:
-    settings = get_settings()
+def _gateway_mt5_snapshot() -> AccountSnapshot:
     connector = MT5Connector(
-        credentials={
-            "login": settings.mt5.login,
-            "password": settings.mt5.password,
-            "server": settings.mt5.server,
-        },
+        credentials={},
         read_only=True,
     )
     try:
         return _database_snapshot(connector.get_account(), source="mt5_native")
     except Exception as exc:
-        logger.warning("MT5 环境变量账户读取失败，使用状态快照: {}", exc)
+        logger.warning("MT5 Gateway 账户读取失败，使用状态快照: {}", exc)
         return _status_snapshot("mt5", "live", "error")
 
 

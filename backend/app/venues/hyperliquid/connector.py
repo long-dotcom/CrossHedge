@@ -74,6 +74,7 @@ class HyperliquidConnector:
         self._info_transport = info_transport or post_hyperliquid_info
         self._exchange_factory = exchange_factory
         self._exchange = None
+        self._submitted_orders: dict[str, OrderSnapshot] = {}
         namespace = f"hl-instruments:{self.environment}:{hashlib.sha256(self.info_url.encode()).hexdigest()[:12]}"
         self._instruments: TTLCache[Instrument] = TTLCache(ttl_seconds=21600, namespace=namespace)
         self._ws = HyperliquidWebSocketRuntime(
@@ -91,6 +92,8 @@ class HyperliquidConnector:
         """只读取本地 WebSocket 状态，健康轮询不得消耗 REST 配额。"""
         websocket = self._ws.health()
         connected = bool(websocket.get("ws_connected"))
+        if not self.read_only:
+            connected = connected and bool(websocket.get("private_ws_connected"))
         return {
             "venue": self.venue,
             "status": "ok" if connected else "degraded",
@@ -100,6 +103,9 @@ class HyperliquidConnector:
 
     def get_account(self) -> AccountSnapshot:
         self._require_account()
+        cached = self._ws.account()
+        if cached is not None:
+            return cached
         perp = self._info({"type": "clearinghouseState", "user": self.account_address})
         spot = self._info({"type": "spotClearinghouseState", "user": self.account_address})
         margin = perp.get("marginSummary") or perp.get("crossMarginSummary") or {}
@@ -113,7 +119,7 @@ class HyperliquidConnector:
             for item in spot.get("balances", [])
             if _decimal(item.get("total")) != 0
         )
-        return AccountSnapshot(
+        snapshot = AccountSnapshot(
             venue=self.venue,
             account_id=self.account_address,
             currency="USDC",
@@ -123,9 +129,14 @@ class HyperliquidConnector:
             balances=balances,
             raw={"perp": perp, "spot": spot},
         )
+        self._ws.seed_account(snapshot)
+        return snapshot
 
     def get_positions(self) -> list[Position]:
         self._require_account()
+        cached = self._ws.positions()
+        if cached is not None:
+            return cached
         data = self._info({"type": "clearinghouseState", "user": self.account_address})
         mids = self._info({"type": "allMids"})
         rows = []
@@ -151,6 +162,7 @@ class HyperliquidConnector:
                     raw=item,
                 )
             )
+        self._ws.seed_positions(rows)
         return rows
 
     def get_open_orders(self, symbol: str | None = None) -> list[OrderSnapshot]:
@@ -246,6 +258,8 @@ class HyperliquidConnector:
     def submit_order(self, request: OrderRequest) -> OrderSnapshot:
         if self.read_only:
             raise PermissionError("Hyperliquid Connector 为只读配置，禁止下单")
+        if not self._ws.private_stream_ready:
+            raise RuntimeError("Hyperliquid 账户私有 WebSocket 尚未连接，禁止提交无法实时确认的订单")
         exchange = self._get_exchange()
         cloid = self._cloid(request.client_order_id)
         self._ws.register_client_order_id(cloid.to_raw(), request.client_order_id)
@@ -277,7 +291,9 @@ class HyperliquidConnector:
                 slippage=self.slippage,
                 cloid=cloid,
             )
-        return self._order_from_submit(result, request)
+        snapshot = self._order_from_submit(result, request)
+        self._remember_order(snapshot)
+        return snapshot
 
     def cancel_order(self, symbol: str, *, client_order_id: str = "", venue_order_id: str = "") -> OrderSnapshot:
         if self.read_only:
@@ -289,10 +305,19 @@ class HyperliquidConnector:
             exchange.cancel_by_cloid(symbol, self._cloid(client_order_id))
         else:
             raise ValueError("撤单必须提供订单 ID")
-        current = self.get_order(symbol, client_order_id=client_order_id, venue_order_id=venue_order_id)
-        if current.status == OrderStatus.ACCEPTED:
-            return OrderSnapshot(**{**current.__dict__, "status": OrderStatus.PENDING_CANCEL})
-        return current
+        current = self._submitted_orders.get(client_order_id) or self._submitted_orders.get(venue_order_id)
+        # 缓存缺失只可能发生在重启恢复路径，允许单次 REST 补齐事实。
+        if current is None:
+            current = self.get_order(symbol, client_order_id=client_order_id, venue_order_id=venue_order_id)
+        pending = OrderSnapshot(**{**current.__dict__, "status": OrderStatus.PENDING_CANCEL})
+        self._remember_order(pending)
+        return pending
+
+    def _remember_order(self, snapshot: OrderSnapshot) -> None:
+        if snapshot.client_order_id:
+            self._submitted_orders[snapshot.client_order_id] = snapshot
+        if snapshot.venue_order_id:
+            self._submitted_orders[snapshot.venue_order_id] = snapshot
 
     def get_order(self, symbol: str, *, client_order_id: str = "", venue_order_id: str = "") -> OrderSnapshot:
         self._require_account()

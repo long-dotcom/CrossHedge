@@ -74,11 +74,13 @@ _snapshot_locks_guard = threading.Lock()
 # 内部辅助：各 channel 的 payload 组装
 # ---------------------------------------------------------------------------
 
-def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20, include_voided: bool = False) -> dict[str, Any]:
     """对冲组列表（SSE 内部版本）。"""
     from app.execution.hedge_pool import hedge_pool
     from app.api.hedge_groups import _hedge_group_payload
     query = db.query(HedgeGroup)
+    if not include_voided:
+        query = query.filter(HedgeGroup.status != "voided")
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
     metadata = _leg_metadata_by_symbol(db, {row.symbol for row in rows})
@@ -207,12 +209,13 @@ def _stream_snapshot(
     min_move: float = 0.0,
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
+    include_voided: bool = False,
 ) -> dict[str, Any]:
     """根据 channel 参数生成快照数据。"""
     if channel == "pipeline":
         return {"pipeline": build_pipeline_diagnostics(db)}
     if channel == "hedge-groups":
-        return {"hedge_groups": _hedge_groups_payload(db, page=page, page_size=page_size)}
+        return {"hedge_groups": _hedge_groups_payload(db, page=page, page_size=page_size, include_voided=include_voided)}
     if channel == "positions":
         return {"positions": _positions_payload(db)}
     if channel == "accounts":
@@ -317,6 +320,7 @@ async def stream(
     min_move: float = 0.0,
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
+    include_voided: bool = False,
 ) -> StreamingResponse:
     """SSE 实时推送端点。"""
     page = max(int(page), 1)
@@ -354,6 +358,7 @@ async def stream(
             "min_move": min_move,
             "follow_ratio": follow_ratio,
             "max_lag_ms": max_lag_ms,
+            "include_voided": include_voided,
         }
         while True:
             try:

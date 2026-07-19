@@ -17,6 +17,7 @@ from typing import Any
 
 from redis import Redis
 from redis.exceptions import ResponseError
+from loguru import logger
 
 # 原生实现保留在独立进程加载路径；业务后端导出的是 Redis 代理连接器。
 from app.config.settings import get_settings
@@ -31,6 +32,9 @@ class MT5Gateway:
 
     def __init__(self, *, redis_client=None, connector=None) -> None:
         settings = get_settings()
+        if settings.mt5.demo_order_enabled and settings.mt5.live_order_enabled:
+            raise RuntimeError("MT5_DEMO_ORDER_ENABLED 与 MT5_LIVE_ORDER_ENABLED 不能同时开启")
+        gateway_environment = "demo" if settings.mt5.demo_order_enabled else "live"
         self.settings = settings
         self.redis = redis_client or Redis.from_url(settings.redis.url, decode_responses=True)
         self.consumer = f"{socket.gethostname()}-{os.getpid()}"
@@ -41,11 +45,18 @@ class MT5Gateway:
         self.symbols: set[str] = set()
         self.connector = connector or NativeMT5Connector(
             credentials={"login": settings.mt5.login, "password": settings.mt5.password, "server": settings.mt5.server},
-            environment="demo" if settings.mt5.demo_order_enabled and not settings.mt5.live_order_enabled else "live",
+            environment=gateway_environment,
             read_only=not bool(settings.mt5.live_order_enabled or settings.mt5.demo_order_enabled),
             order_deviation_points=settings.mt5.order_deviation_points,
             order_magic=settings.mt5.order_magic,
             poll_interval_ms=settings.mt5.order_poll_interval_ms,
+        )
+        logger.info(
+            "MT5 Gateway 配置: environment={}, demo_order_enabled={}, live_order_enabled={}, read_only={}",
+            self.connector.environment,
+            settings.mt5.demo_order_enabled,
+            settings.mt5.live_order_enabled,
+            bool(getattr(self.connector, "read_only", False)),
         )
 
     def run(self) -> None:
@@ -89,7 +100,11 @@ class MT5Gateway:
             cached = self.redis.get(result_key) if result_key else None
             if state_key and not cached and not self.redis.set(state_key, request_id, nx=True):
                 raise RuntimeError("同一幂等命令存在结果未知的历史执行，禁止自动重放，请先对账")
-            data = codec.loads(cached) if cached else self._dispatch(operation, payload)
+            data = codec.loads(cached) if cached else self._dispatch(
+                operation,
+                payload,
+                requested_environment=str(fields.get("environment") or ""),
+            )
             serialized = codec.dumps(data)
             if result_key and not cached:
                 self.redis.set(result_key, serialized, ex=86400)
@@ -101,7 +116,7 @@ class MT5Gateway:
             # 已产生明确失败响应的命令可以 ACK；调用方决定是否创建新命令。
             self.redis.xack(self.commands, self.group, message_id)
 
-    def _dispatch(self, operation: str, payload: dict[str, Any]) -> Any:
+    def _dispatch(self, operation: str, payload: dict[str, Any], *, requested_environment: str = "") -> Any:
         if operation == "get_account":
             return self.connector.get_account()
         if operation == "get_positions":
@@ -127,6 +142,7 @@ class MT5Gateway:
             self.connector.unsubscribe_market_data(sorted(symbols))
             return {"unsubscribed": sorted(symbols)}
         if operation == "submit_order":
+            self._require_order_environment(requested_environment)
             return self.connector.submit_order(codec.order_request(payload["request"]))
         if operation == "cancel_order":
             return self.connector.cancel_order(payload["symbol"], client_order_id=payload.get("client_order_id", ""), venue_order_id=payload.get("venue_order_id", ""))
@@ -139,6 +155,18 @@ class MT5Gateway:
         if operation == "order_check":
             return self._order_check(payload)
         raise ValueError(f"未知 MT5 Gateway 操作: {operation}")
+
+    def _require_order_environment(self, requested_environment: str) -> None:
+        """每次下单都校验 Gateway 账户环境，Paper 请求只能进入 Demo 账户。"""
+        requested = str(requested_environment or "").strip().lower()
+        if requested not in {"demo", "live"}:
+            return
+        account = self.connector.get_account()
+        trade_mode = int(account.raw.get("trade_mode", -1))
+        if requested == "demo" and trade_mode != 0:
+            raise PermissionError(f"Paper 请求要求 MT5 Demo 账户，当前账户为 {account.account_id}")
+        if requested == "live" and trade_mode == 0:
+            raise PermissionError(f"Live 请求禁止发送到 MT5 Demo 账户: {account.account_id}")
 
     def _order_check(self, payload: dict[str, Any]) -> dict[str, Any]:
         """在 Gateway 内执行 MT5 order_check，不产生真实订单。"""
@@ -227,6 +255,7 @@ class MT5Gateway:
         health = {
             "status": "ok" if connected else "degraded", "connected": connected,
             "consumer": self.consumer, "environment": self.connector.environment,
+            "read_only": self.connector.read_only,
             "updated_at": time.time(), "error": error,
         }
         self.redis.set(

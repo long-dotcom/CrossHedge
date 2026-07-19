@@ -81,18 +81,22 @@ class BinanceFuturesConnector:
         self._ws.stop()
 
     def health(self) -> dict:
-        try:
-            server_time = self.rest.server_time()
-            return {
-                "venue": self.venue,
-                "status": "ok",
-                "server_time": server_time,
-                **self._ws.health(),
-            }
-        except Exception as exc:
-            return {"venue": self.venue, "status": "degraded", "error": str(exc)}
+        """健康检查只读取本地 WS 状态，禁止周期性消耗 REST 配额。"""
+        websocket = self._ws.health()
+        connected = bool(websocket.get("market_ws_connected"))
+        if not self.read_only:
+            connected = bool(websocket.get("private_ws_connected"))
+        return {
+            "venue": self.venue,
+            "status": "ok" if connected else "degraded",
+            "error": "" if connected else "Binance WebSocket 未连接",
+            **websocket,
+        }
 
     def get_account(self) -> AccountSnapshot:
+        cached = self._ws.account()
+        if cached is not None:
+            return cached
         data = self.rest.account()
         balances = tuple(
             Balance(
@@ -106,7 +110,7 @@ class BinanceFuturesConnector:
             for item in data.get("assets", [])
             if _decimal(item.get("walletBalance")) != 0
         )
-        return AccountSnapshot(
+        snapshot = AccountSnapshot(
             venue=self.venue,
             account_id=str(data.get("accountAlias") or "binance-futures"),
             currency="USDT",
@@ -117,8 +121,13 @@ class BinanceFuturesConnector:
             balances=balances,
             raw=data,
         )
+        self._ws.seed_account(snapshot)
+        return snapshot
 
     def get_positions(self) -> list[Position]:
+        cached = self._ws.positions()
+        if cached is not None:
+            return cached
         rows = []
         for item in self.rest.position_risk():
             quantity = _decimal(item.get("positionAmt"))
@@ -142,6 +151,7 @@ class BinanceFuturesConnector:
                     raw=item,
                 )
             )
+        self._ws.seed_positions(rows)
         return rows
 
     def get_open_orders(self, symbol: str | None = None) -> list[OrderSnapshot]:
@@ -232,6 +242,8 @@ class BinanceFuturesConnector:
     def submit_order(self, request: OrderRequest) -> OrderSnapshot:
         if self.read_only:
             raise PermissionError("Binance Connector 为只读配置，禁止下单")
+        if not self._ws.private_stream_ready:
+            raise RuntimeError("Binance 账户私有 WebSocket 尚未连接，禁止提交无法实时确认的订单")
         symbol = normalize_symbol(request.symbol)
         params: dict[str, Any] = {
             "symbol": symbol,

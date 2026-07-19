@@ -426,6 +426,8 @@ class MT5Connector:
         candidates = [
             item for item in self.mt5.positions_get(symbol=symbol) or []
             if int(getattr(item, "type", -1)) == expected_type
+            # 只允许关闭本网关创建的持仓，避免误平 Demo 账户中的手工单或其他 EA 持仓。
+            and int(getattr(item, "magic", 0)) == self.order_magic
             and _decimal(getattr(item, "volume", 0)) >= quantity
         ]
         return min(candidates, key=lambda item: _decimal(getattr(item, "volume", 0))) if candidates else None

@@ -27,10 +27,10 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.config.settings import Settings, get_settings
-from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
 from app.db.models import ExchangeCredential, HedgeGroup, Position, SymbolMapping, SystemSetting
 from app.execution.runtime_settings import paper_live_probe_enabled_for_venue, runtime_paper_live_probe_enabled
+from app.exchanges.credentials import build_credential_connector, decrypt_credentials
 from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
@@ -66,7 +66,7 @@ def live_execution_readiness(db: Session, settings: Settings | None = None) -> d
     checks: list[ReadinessCheck] = []
     checks.extend(_global_live_checks(db))
     if "hyperliquid" in venues:
-        checks.extend(_hyperliquid_live_checks(settings))
+        checks.extend(_hyperliquid_live_checks(db, settings))
     if "mt5" in venues:
         checks.extend(_mt5_checks(settings))
     checks.extend(_generic_live_venue_checks(db, venues - {"hyperliquid", "mt5"}))
@@ -95,7 +95,12 @@ def paper_execution_readiness(db: Session, settings: Settings | None = None) -> 
     settings = settings or get_settings()
     mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
     venues = _mapped_venues(mappings)
-    checks: list[ReadinessCheck] = []
+    probe_enabled = runtime_paper_live_probe_enabled(db, settings)
+    checks: list[ReadinessCheck] = [ReadinessCheck(
+        "paper_real_probe_mode",
+        "ok" if probe_enabled else "block",
+        "Paper 使用加密交易所真实最小单探针与 MT5 Demo" if probe_enabled else "Paper 仅支持真实最小单探针模式，请先开启总开关",
+    )]
     if "hyperliquid" in venues:
         checks.extend(_hyperliquid_paper_checks(db, settings))
     else:
@@ -154,59 +159,61 @@ def _global_live_checks(db: Session) -> list[ReadinessCheck]:
     ]
 
 
-def _hyperliquid_live_checks(settings: Settings) -> list[ReadinessCheck]:
+def _hyperliquid_live_checks(db: Session, settings: Settings) -> list[ReadinessCheck]:
     """检查 Hyperliquid 实盘就绪状态。"""
-    user = _hyperliquid_user_address(settings)
+    credential = _enabled_credential(db, "hyperliquid")
+    values = decrypt_credentials(credential) if credential else {}
+    user = str(values.get("account_address") or "")
+    secret_key = str(values.get("secret_key") or "")
     checks = [
         ReadinessCheck(
             "hyperliquid_account_address",
             "ok" if user else "block",
-            "Hyperliquid 账户地址已配置" if user else "HYPERLIQUID_ACCOUNT_ADDRESS 未配置，无法做账户级回查",
+            "Hyperliquid 账户地址已在管理台配置" if user else "请在管理台配置并启用 Hyperliquid 账户地址",
         ),
         ReadinessCheck(
             "hyperliquid_live_order_submit",
-            "ok" if settings.hyperliquid.secret_key else "block",
-            "Hyperliquid 原生签名下单已配置" if settings.hyperliquid.secret_key else "HYPERLIQUID_SECRET_KEY 未配置，无法实盘下单",
+            "ok" if secret_key and credential and not credential.read_only else "block",
+            "Hyperliquid 原生签名下单已配置" if secret_key and credential and not credential.read_only else "请在管理台配置签名密钥并关闭只读模式",
         ),
     ]
     if user:
-        checks.append(_hyperliquid_read_probe(settings, user))
+        checks.append(_hyperliquid_read_probe(credential))
     return checks
 
 
 def _hyperliquid_paper_checks(db: Session, settings: Settings) -> list[ReadinessCheck]:
-    """检查 Hyperliquid paper 撮合就绪状态。"""
+    """检查 Hyperliquid 真实最小单探针就绪状态。"""
     mappings = db.query(SymbolMapping).filter(SymbolMapping.enabled.is_(True)).all()
     if not mappings:
         return [ReadinessCheck("hyperliquid_paper_matching", "block", "没有启用的品种映射，无法进行 Hyperliquid paper 撮合")]
-    checks = [
-        ReadinessCheck(
-            "hyperliquid_paper_matching",
-            "ok",
-            f"Hyperliquid paper 使用本地 QuoteCache 撮合，已启用 {len(mappings)} 个品种",
-        )
-    ]
+    checks: list[ReadinessCheck] = []
     paper_live_hyperliquid = paper_live_probe_enabled_for_venue(db, settings, "hyperliquid")
     if paper_live_hyperliquid:
-        checks[0] = ReadinessCheck(
+        checks.append(ReadinessCheck(
             "hyperliquid_paper_live_probe",
             "ok",
-            f"Hyperliquid paper-live 探针已开启，paper 账本数量不变，HL 使用最小真实订单取成交价；已启用 {len(mappings)} 个品种",
-        )
-        user = _hyperliquid_user_address(settings)
+            f"Hyperliquid 使用真实最小单采样并立即回平，Paper 账本保留策略数量；已启用 {len(mappings)} 个品种",
+        ))
+        credential = _enabled_credential(db, "hyperliquid")
+        values = decrypt_credentials(credential) if credential else {}
+        user = str(values.get("account_address") or "")
+        secret_key = str(values.get("secret_key") or "")
         checks.append(
             ReadinessCheck(
                 "hyperliquid_paper_live_credentials",
-                "ok" if user and settings.hyperliquid.secret_key else "block",
-                "Hyperliquid paper-live 账户地址和 API 私钥已配置" if user and settings.hyperliquid.secret_key else "HYPERLIQUID_ACCOUNT_ADDRESS 或 HYPERLIQUID_SECRET_KEY 未配置",
+                "ok" if user and secret_key and credential and not credential.read_only else "block",
+                "Hyperliquid paper-live 凭证已在管理台配置" if user and secret_key and credential and not credential.read_only else "请在管理台配置 Hyperliquid 凭证并关闭只读模式",
             )
         )
         try:
-            import_module("hyperliquid.exchange")
-            import_module("eth_account")
+            import hyperliquid.exchange  # noqa: F401
+            import eth_account  # noqa: F401
             checks.append(ReadinessCheck("hyperliquid_sdk_import", "ok", "hyperliquid-python-sdk 可导入"))
         except Exception as exc:
             checks.append(ReadinessCheck("hyperliquid_sdk_import", "block", f"hyperliquid-python-sdk 不可导入: {exc}"))
+    else:
+        checks.append(ReadinessCheck("hyperliquid_paper_live_probe", "block", "Hyperliquid Paper 必须开启真实最小单探针"))
     checks.extend(_generic_paper_live_probe_checks(db, mappings, settings))
     return checks
 
@@ -253,36 +260,12 @@ def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping],
 
 def _mt5_checks(settings: Settings) -> list[ReadinessCheck]:
     """检查 MT5 实盘就绪状态。"""
-    checks = [
-        ReadinessCheck(
-            "mt5_live_order_enabled",
-            "ok" if settings.mt5.live_order_enabled else "block",
-            "MT5 实盘下单开关已开启" if settings.mt5.live_order_enabled else "MT5_LIVE_ORDER_ENABLED 未开启",
-        )
-    ]
-    checks.append(_mt5_gateway_probe(expect_demo=False))
-    if settings.mt5.login and settings.mt5.server:
-        checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置"))
-    else:
-        checks.append(ReadinessCheck("mt5_login_config", "warn", "MT5 登录参数未完整配置，将依赖本机终端已有登录会话"))
-    return checks
+    return [_mt5_gateway_probe(expect_demo=False, require_trading=True)]
 
 
 def _mt5_demo_checks(settings: Settings) -> list[ReadinessCheck]:
     """检查 MT5 demo 就绪状态。"""
-    checks = [
-        ReadinessCheck(
-            "mt5_demo_order_enabled",
-            "ok" if settings.mt5.demo_order_enabled else "block",
-            "MT5 demo 下单开关已开启" if settings.mt5.demo_order_enabled else "MT5_DEMO_ORDER_ENABLED 未开启",
-        )
-    ]
-    checks.append(_mt5_gateway_probe(expect_demo=True))
-    if settings.mt5.login and settings.mt5.server:
-        checks.append(ReadinessCheck("mt5_login_config", "ok", "MT5 登录参数已配置，并会用于锁定 demo 账户身份"))
-    else:
-        checks.append(ReadinessCheck("mt5_login_config", "warn", "MT5 登录参数未完整配置，将依赖本机终端已有登录会话"))
-    return checks
+    return [_mt5_gateway_probe(expect_demo=True, require_trading=True)]
 
 
 def _symbol_mapping_checks(db: Session) -> list[ReadinessCheck]:
@@ -403,35 +386,32 @@ def _position_label(position: Position) -> str:
     return f"{position.platform}:{position.symbol}:{position.side}:{position.quantity}"
 
 
-def _hyperliquid_user_address(settings: Settings) -> str:
-    """获取 Hyperliquid 钱包地址。"""
-    return settings.hyperliquid.account_address
+def _enabled_credential(db: Session, venue: str) -> ExchangeCredential | None:
+    """获取管理台中已启用的交易所配置。"""
+    return db.query(ExchangeCredential).filter(
+        ExchangeCredential.venue == venue,
+        ExchangeCredential.enabled.is_(True),
+    ).first()
 
 
-def _hyperliquid_read_probe(settings: Settings, user: str) -> ReadinessCheck:
-    """Hyperliquid 只读探测 —— 查询 clearinghouseState 验证 API 可达。
-
-    使用 ``post_hyperliquid_info`` 统一 HTTP 调用。
-    """
+def _hyperliquid_read_probe(credential: ExchangeCredential) -> ReadinessCheck:
+    """使用管理台保存的凭证执行 Hyperliquid 账户只读探测。"""
     try:
-        data = post_hyperliquid_info(
-            settings.hyperliquid.info_url,
-            {"type": "clearinghouseState", "user": user},
-        )
-        if isinstance(data, dict) and ("marginSummary" in data or "crossMarginSummary" in data or "assetPositions" in data):
-            return ReadinessCheck("hyperliquid_read_probe", "ok", "Hyperliquid clearinghouseState 只读探测成功")
-        return ReadinessCheck("hyperliquid_read_probe", "block", "Hyperliquid clearinghouseState 返回格式异常")
+        build_credential_connector(credential).get_account()
+        return ReadinessCheck("hyperliquid_read_probe", "ok", "Hyperliquid 账户只读探测成功")
     except Exception as exc:
         return ReadinessCheck("hyperliquid_read_probe", "block", f"Hyperliquid clearinghouseState 只读探测失败: {exc}")
 
 
-def _mt5_gateway_probe(*, expect_demo: bool) -> ReadinessCheck:
+def _mt5_gateway_probe(*, expect_demo: bool, require_trading: bool = False) -> ReadinessCheck:
     """通过 Redis 心跳和账户快照检查独立 MT5 Gateway。"""
     try:
         connector = native_venue_manager.connector_for("mt5", "live")
         health = connector.health()
         if not health.get("connected"):
             return ReadinessCheck("mt5_gateway", "block", str(health.get("error") or "MT5 Gateway 未连接"))
+        if require_trading and health.get("read_only", True):
+            return ReadinessCheck("mt5_gateway", "block", "MT5 Gateway 当前为只读模式，请在网关配置中开启对应下单开关")
         account = connector.get_account()
         if expect_demo:
             trade_mode = int(account.raw.get("trade_mode", -1))

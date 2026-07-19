@@ -208,6 +208,7 @@ def probe_run_payload(db: Session, run: ProbeRun) -> dict[str, Any]:
     """
     return {
         "id": run.id,
+        "hedge_group_id": run.hedge_group_id,
         "purpose": run.purpose,
         "venue": run.venue,
         "instrument_id": run.instrument_id,

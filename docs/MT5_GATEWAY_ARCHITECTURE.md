@@ -34,8 +34,9 @@ CrossHedge 现在分为两类运行环境：
 
 ## 启动顺序
 
-1. 复制配置：`Copy-Item .env.example .env`，设置 PostgreSQL、JWT、交易所和 MT5 参数。
-2. 启动容器：`docker compose up -d --build`。
+1. 复制编排配置：`Copy-Item .env.example .env`。交易所账户从前端管理台配置；如需指定
+   MT5 登录参数，另将 `.mt5-gateway.env.example` 复制为 `.mt5-gateway.env`。
+2. 启动容器：`.\scripts\start_stack.ps1`。脚本会自动避让宿主机端口冲突。
 3. Windows 虚拟环境安装 Gateway 依赖：
 
    ```powershell
@@ -53,14 +54,23 @@ CrossHedge 现在分为两类运行环境：
 ## 安全与故障处理
 
 - Redis 端口只绑定 `127.0.0.1`。如果 Gateway 位于另一台 Windows 主机，必须使用受控内网、TLS/VPN 和 Redis ACL，不能直接暴露公网。
+- Redis 使用非默认端口并强制密码认证；密码与 JWT、交易所加密密钥由首次启动初始化并持久化在 `app_secrets` 卷中。
 - 账户和持仓快照具有 TTL。Gateway 停止后后端不会长期使用陈旧数据。
 - Redis 使用 AOF 和 `noeviction`，避免内存淘汰交易命令。生产环境仍需配置持久化、监控和容量告警。
 - Redis Stream 提供至少一次投递语义；幂等键是避免重复下单的必要条件。
 - 下单或撤单开始执行后会写入幂等状态。如果进程在明确结果落库前中断，Gateway 会拒绝自动重放该命令，需人工核对终端状态并清理对应状态键。
+- Paper 命令携带 `environment=demo`，Gateway 在每次下单前读取账户 `trade_mode`；Terminal 不是 Demo 账户时拒绝下单。Live 命令也不能误发到 Demo 账户。
+- MT5 平仓只匹配网关专属 `MT5_ORDER_MAGIC` 的 position ticket，不会选中同一 Demo 账户内的手工单或其他 EA 持仓。
+
+## Paper 混合执行边界
+
+Paper 的 MT5 腿由 Gateway Demo 账户实际持有；加密交易所腿则由后端真实最小探针采样并立即回平。两者都通过统一 Intent/Outbox 生命周期驱动，但加密探针另外把恢复状态写入 Redis，并写入数据库 `ProbeRun` 供执行页查看。
+
+Market 模式按现有双腿调度并发提交。Maker 模式先完成加密 Post-only 探针的“成交或超时撤单 → 按实际成交量回平”，确认真实残量为零后再提交 MT5 Demo 对冲腿。加密探针和后续 Live 均由账户私有 WS 确认订单及成交；Binance listenKey 每 30 分钟续期，断线重连后只做一次 REST 补偿对账。关闭设置页的混合 Paper 总开关只阻止新探针；已经进入恢复流程的稳定 ClientOrderId 仍可继续查询和回平。
 
 ## 缓存边界
 
-已迁移到 Redis 的缓存包括通用 TTL、行情历史/最新值、订单簿、策略配置、品种映射、统计信号、成本、FX、SSE 快照、扫描结果、对冲组共享快照、断路器配置、MT5 交易能力和自动执行确认状态。连接器生命周期、线程停止标记、Paper 撮合账本、断路器滑动窗口以及单次扫描累加器属于进程运行状态，不作为业务缓存迁移。
+已迁移到 Redis 的缓存包括通用 TTL、行情历史/最新值、订单簿、策略配置、品种映射、统计信号、成本、FX、SSE 快照、扫描结果、对冲组共享快照、断路器配置、MT5 交易能力、自动执行确认状态以及真实探针的锁、限额和恢复状态。连接器生命周期、线程停止标记、断路器滑动窗口以及单次扫描累加器属于进程运行状态，不作为业务缓存迁移。
 
 ## 验证
 
@@ -68,7 +78,10 @@ CrossHedge 现在分为两类运行环境：
 
 ```powershell
 $env:RUN_REDIS_INTEGRATION = "1"
-$env:REDIS_INTEGRATION_URL = "redis://127.0.0.1:6379/15"
+$redisContainer = (docker compose ps -q redis).Trim()
+$redisPort = ((docker port $redisContainer 16379/tcp) -split ':')[-1]
+$redisPassword = (docker compose exec -T redis sh -c 'cat /run/crosshedge-secrets/redis_password').Trim()
+$env:REDIS_INTEGRATION_URL = "redis://:$redisPassword@127.0.0.1:$redisPort/15"
 .\.venv\Scripts\python.exe -m pytest backend/tests/test_mt5_redis_integration.py -q
 ```
 

@@ -1,4 +1,16 @@
 services:
+  secrets-init:
+    image: python:3.12-alpine
+    restart: "no"
+    command: ["python", "/opt/crosshedge/init-secrets.py"]
+    environment:
+      # 升级旧部署时仅用于首次迁移；新安装不再在 .env 中配置这两个值。
+      LEGACY_JWT_SECRET: ${JWT_SECRET:-}
+      LEGACY_EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:-}
+    volumes:
+      - ./docker/init-secrets.py:/opt/crosshedge/init-secrets.py:ro
+      - app_secrets:/run/crosshedge-secrets
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -17,14 +29,26 @@ services:
   redis:
     image: redis:7.4-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        exec redis-server \
+          --port 16379 \
+          --appendonly yes \
+          --maxmemory-policy noeviction \
+          --requirepass "$$(cat /run/crosshedge-secrets/redis_password)"
     ports:
       # Windows 主机上的 MT5 Gateway 通过本端口连接。
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:16379"
     volumes:
       - redis_data:/data
+      - app_secrets:/run/crosshedge-secrets:ro
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/crosshedge-secrets/redis_password) redis-cli -p 16379 ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -34,11 +58,20 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    env_file: ${CROSSHEDGE_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis:16379/0
+      REDIS_PASSWORD_FILE: /run/crosshedge-secrets/redis_password
+      JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
+      EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
+      SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
       SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
+    volumes:
+      - app_secrets:/run/crosshedge-secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,11 +90,18 @@ services:
     restart: unless-stopped
     entrypoint: []
     command: ["python", "-m", "app.execution.worker_main"]
-    env_file: ${CROSSHEDGE_ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis:16379/0
+      REDIS_PASSWORD_FILE: /run/crosshedge-secrets/redis_password
+      JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
+      EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
+      SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
       SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
+    volumes:
+      - app_secrets:/run/crosshedge-secrets:ro
     depends_on:
       backend:
         condition: service_healthy
@@ -80,3 +120,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  app_secrets:

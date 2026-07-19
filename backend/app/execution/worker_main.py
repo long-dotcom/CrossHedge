@@ -17,7 +17,9 @@ from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
-from app.execution.outbox_worker import run_execution_outbox_once
+from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
+from app.execution.probe_runs import reconcile_probe_runs_once
+from app.execution.reconciler import sync_live_positions
 from app.execution.venue_events import enqueue_venue_event
 from app.venues.manager import native_venue_manager
 
@@ -63,6 +65,16 @@ def main() -> None:
         except Exception as exc:
             logger.exception("执行 Worker 的原生连接器预热失败，继续提供 Paper/可用 venue 服务: {}", exc)
             _write_health(status="degraded", error=str(exc))
+        # 进程启动只执行一次恢复快照；正常运行完全由账户私有 WS 推进。
+        try:
+            with SessionLocal() as db:
+                # Binance 用户流没有初始账户快照；启动时仅拉取一次，之后由 WS 增量维护。
+                sync_live_positions(db, allow_remote_crypto=True)
+                db.commit()
+            reconcile_execution_orders_once()
+            reconcile_probe_runs_once()
+        except Exception as exc:
+            logger.exception("执行 Worker 启动恢复对账失败，等待私有 WS 重连后重试: {}", exc)
         next_health_at = 0.0
         while _running:
             try:

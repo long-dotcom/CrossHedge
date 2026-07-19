@@ -60,7 +60,7 @@ class _FakeNativeConnector:
 
 def test_real_redis_command_snapshot_event_and_idempotency() -> None:
     client = Redis.from_url(
-        os.getenv("REDIS_INTEGRATION_URL", "redis://127.0.0.1:6379/15"),
+        os.getenv("REDIS_INTEGRATION_URL", "redis://127.0.0.1:16379/15"),
         decode_responses=True,
     )
     client.ping()
