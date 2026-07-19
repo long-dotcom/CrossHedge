@@ -22,9 +22,6 @@ if ((Test-Path $EnvFile) -and (-not $Force)) {
 
 Copy-Item -Path $EnvExample -Destination $EnvFile -Force
 
-$content = Get-Content $EnvFile -Raw
-$content = $content -replace "QUOTE_SOURCE_MODE=paper", "QUOTE_SOURCE_MODE=live"
-$content | Set-Content -Path $EnvFile -Encoding utf8
-
-Write-Host ".env created. Fill wallet address, private key, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, and change JWT_SECRET."
+Write-Host ".env created. 请手动填写 JWT_SECRET、EXCHANGE_CONFIG_SECRET 和 REDIS_PASSWORD。"
+Write-Host "如需指定 MT5 登录参数，请复制 .mt5-gateway.env.example 为 .mt5-gateway.env。"
 Write-Host $EnvFile

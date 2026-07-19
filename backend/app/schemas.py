@@ -14,7 +14,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,12 @@ class LiveTradingIn(BaseModel):
 class ExecutionSettingsIn(BaseModel):
     """执行参数更新请求体。"""
     paper_live_probe_enabled: bool = False
-    paper_live_parallel_execution: bool = True
+    paper_probe_max_notional: float = Field(default=20.0, ge=10.0, le=1000.0)
+    paper_probe_daily_max_runs: int = Field(default=200, ge=1, le=100000)
+    paper_probe_daily_max_notional: float = Field(default=4000.0, ge=10.0, le=10000000.0)
+    paper_probe_cooldown_ms: int = Field(default=500, ge=0, le=60000)
+    paper_probe_flatten_timeout_seconds: float = Field(default=20.0, ge=3.0, le=300.0)
+    paper_probe_maker_timeout_seconds: float = Field(default=5.0, ge=1.0, le=300.0)
     confirmation: str = ""
 
 
@@ -168,6 +173,12 @@ class CloseHedgeGroupIn(BaseModel):
 class RecoverHedgeGroupIn(BaseModel):
     """异常对冲组恢复请求；confirmation 防止误触真实回平。"""
     reason: str = "manual recovery flatten"
+    confirmation: str
+
+
+class VoidHedgeGroupIn(BaseModel):
+    """无真实敞口异常组的作废归档请求。"""
+    reason: str = "人工作废异常对冲组"
     confirmation: str
 
 

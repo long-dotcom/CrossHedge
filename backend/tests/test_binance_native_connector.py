@@ -219,3 +219,20 @@ def test_trade_lite_is_normalized_as_fill_event() -> None:
     assert len(events) == 1
     assert events[0].event_type == VenueEventType.FILL
     assert events[0].fill.client_order_id == "fast-cid"
+
+
+def test_account_update_is_normalized_and_cached() -> None:
+    rest = BinanceFuturesRestClient(transport=lambda *_: BinanceResponse({}, 200, {}))
+    runtime = BinanceWebSocketRuntime(rest)
+
+    events = runtime.process_private_message({
+        "e": "ACCOUNT_UPDATE", "E": 1_700_000_000_100, "T": 1_700_000_000_000,
+        "a": {
+            "B": [{"a": "USDT", "wb": "100", "cw": "80"}],
+            "P": [{"s": "BTCUSDT", "pa": "-0.01", "ep": "60000", "up": "2", "ps": "SHORT"}],
+        },
+    })
+
+    assert [event.event_type for event in events] == [VenueEventType.ACCOUNT, VenueEventType.POSITION]
+    assert runtime.account().available_balance == Decimal("80")
+    assert runtime.positions()[0].position_side == PositionSide.SHORT

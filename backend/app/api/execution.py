@@ -157,6 +157,30 @@ def get_probe_run(
     return probe_run_payload(db, run)
 
 
+@execution_router.get("/probe-runs")
+def list_probe_runs(
+    page: int = 1,
+    page_size: int = 20,
+    active_only: bool = False,
+    _: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """分页读取真实探针状态，便于发现尚未回平或需要人工恢复的运行。"""
+    page = max(1, page)
+    page_size = min(100, max(1, page_size))
+    query = db.query(ProbeRun)
+    if active_only:
+        query = query.filter(ProbeRun.status.notin_(("FLAT", "FAILED")))
+    total = query.count()
+    rows = query.order_by(desc(ProbeRun.id)).offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "items": [probe_run_payload(db, row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
 @execution_router.post("/intents/{intent_id}/replay")
 def replay_execution_intent(
     intent_id: int,

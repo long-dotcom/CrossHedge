@@ -6,6 +6,8 @@ __pycache__/
 data/
 backend/data/
 .env
+.mt5-gateway.env
+.runtime.env
 .venv/
 .idea/
 .run/

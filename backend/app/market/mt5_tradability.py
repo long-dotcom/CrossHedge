@@ -23,7 +23,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import threading
 import time
 
 from sqlalchemy.orm import Session
@@ -32,6 +31,7 @@ from sqlalchemy.exc import OperationalError
 from app.adapters.mt5 import MT5OrderCheck, mt5_market_order_check
 from app.config.settings import get_settings
 from app.core.logging import get_logger
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 from app.db.models import StrategySetting, SystemSetting
 from app.market.symbols import enabled_mappings
@@ -77,29 +77,29 @@ class MT5TradabilityCache:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        # 品种×方向 → 最新交易能力状态
-        self._states: dict[tuple[str, str], TradabilityState] = {}
-        # 品种×方向 → (隔离截止时间, 隔离原因)
-        self._blocked: dict[tuple[str, str], tuple[float, str]] = {}
-        self._initialized = False
-        self._last_refresh_at = 0.0
+        self._states_key = redis_key("cache", "mt5-tradability", "states")
+        self._meta_key = redis_key("cache", "mt5-tradability", "meta")
+
+    @staticmethod
+    def _field(symbol: str, side: str) -> str:
+        return f"{symbol.upper()}:{side.lower()}"
+
+    @staticmethod
+    def _block_key(symbol: str, side: str) -> str:
+        return redis_key("cache", "mt5-tradability", "blocked", symbol.upper(), side.lower())
 
     def initialized(self) -> bool:
         """缓存是否已完成首次刷新。"""
-        with self._lock:
-            return self._initialized
+        return redis_client().hget(self._meta_key, "initialized") == "1"
 
     def mark_not_initialized(self) -> None:
         """标记缓存未初始化（例如 MT5 断开连接时）。"""
-        with self._lock:
-            self._initialized = False
+        redis_client().hset(self._meta_key, "initialized", "0")
 
     def get(self, symbol: str, side: str) -> TradabilityState | None:
         """获取指定品种×方向的缓存状态。"""
-        key = (symbol.upper(), side.lower())
-        with self._lock:
-            return self._states.get(key)
+        raw = redis_client().hget(self._states_key, self._field(symbol, side))
+        return TradabilityState(**json.loads(raw)) if raw else None
 
     def is_fresh_allowed(self, symbol: str, side: str, ttl_ms: int | None = None) -> tuple[bool, str]:
         """检查交易能力是否新鲜且允许。
@@ -144,8 +144,7 @@ class MT5TradabilityCache:
             retcode=getattr(check, "retcode", None),
             source=source,
         )
-        with self._lock:
-            self._states[(state.symbol, state.side)] = state
+        redis_client().hset(self._states_key, self._field(state.symbol, state.side), json.dumps(state.__dict__, ensure_ascii=False))
         return state
 
     def refresh(self, db: Session) -> dict[str, int]:
@@ -167,9 +166,7 @@ class MT5TradabilityCache:
                 checked += 1
                 if state.allowed:
                     allowed += 1
-        with self._lock:
-            self._initialized = True
-            self._last_refresh_at = time.time()
+        redis_client().hset(self._meta_key, mapping={"initialized": "1", "last_refresh_at": str(time.time())})
         logger.info("MT5 交易能力缓存刷新完成: checked={}, allowed={}", checked, allowed)
         return {"checked": checked, "allowed": allowed}
 
@@ -203,8 +200,7 @@ class MT5TradabilityCache:
         duration = seconds if seconds is not None else get_settings().mt5.trade_reject_quarantine_seconds
         until = time.time() + max(duration, 1)
         key = (symbol.upper(), side.lower())
-        with self._lock:
-            self._blocked[key] = (until, message)
+        redis_client().set(self._block_key(*key), message, ex=max(int(duration), 1))
         _persist_block(db, key[0], key[1], mt5_symbol, quantity, message, until)
         return self.update(symbol, mt5_symbol, side, quantity, MT5OrderCheck(False, message), source)
 
@@ -227,8 +223,8 @@ class MT5TradabilityCache:
                 stale_keys.append(row.key)
                 continue
             active[(symbol.upper(), side.lower())] = (until, message)
-        with self._lock:
-            self._blocked.update(active)
+        for (symbol, side), (until, message) in active.items():
+            redis_client().set(self._block_key(symbol, side), message, ex=max(int(until - now), 1))
         # 清理过期的隔离记录
         for key in stale_keys:
             db.query(SystemSetting).filter(SystemSetting.key == key).delete()
@@ -240,10 +236,10 @@ class MT5TradabilityCache:
 
     def snapshot(self) -> list[dict]:
         """返回当前缓存快照（用于诊断页面展示）。"""
-        with self._lock:
-            states = list(self._states.values())
-            initialized = self._initialized
-            last_refresh_at = self._last_refresh_at
+        states = [TradabilityState(**json.loads(raw)) for raw in redis_client().hvals(self._states_key)]
+        meta = redis_client().hgetall(self._meta_key)
+        initialized = meta.get("initialized") == "1"
+        last_refresh_at = float(meta.get("last_refresh_at", 0.0))
         return [
             {
                 "symbol": state.symbol,
@@ -263,17 +259,12 @@ class MT5TradabilityCache:
 
     def _active_block(self, symbol: str, side: str) -> str:
         """检查品种×方向是否处于隔离期，返回隔离原因或空字符串。"""
-        key = (symbol.upper(), side.lower())
-        with self._lock:
-            blocked = self._blocked.get(key)
-            if not blocked:
-                return ""
-            until, message = blocked
-            if until <= time.time():
-                self._blocked.pop(key, None)
-                return ""
-            remaining = until - time.time()
-            return f"{message}; quarantine_remaining={remaining:.0f}s"
+        key = self._block_key(symbol, side)
+        message = redis_client().get(key)
+        if not message:
+            return ""
+        remaining = max(redis_client().ttl(key), 0)
+        return f"{message}; quarantine_remaining={remaining:.0f}s"
 
 
 def _probe_quantity(mapping) -> float:

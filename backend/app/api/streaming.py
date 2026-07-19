@@ -54,7 +54,18 @@ from app.market.scan_state import scan_state_store
 router = APIRouter()
 
 # 同一 channel/分页参数的所有客户端共享序列化快照，避免每个 SSE 连接重复查库。
-_snapshot_cache: dict[str, tuple[float, str]] = {}
+class _SnapshotCacheCompat:
+    """保留测试清理入口，实际快照存储位于 Redis。"""
+
+    def clear(self) -> None:
+        from app.core.redis_client import redis_client, redis_key
+        client = redis_client()
+        keys = list(client.scan_iter(match=redis_key("cache", "stream-snapshots", "*")))
+        if keys:
+            client.delete(*keys)
+
+
+_snapshot_cache = _SnapshotCacheCompat()
 _snapshot_locks: dict[str, threading.Lock] = {}
 _snapshot_locks_guard = threading.Lock()
 
@@ -63,11 +74,13 @@ _snapshot_locks_guard = threading.Lock()
 # 内部辅助：各 channel 的 payload 组装
 # ---------------------------------------------------------------------------
 
-def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20, include_voided: bool = False) -> dict[str, Any]:
     """对冲组列表（SSE 内部版本）。"""
     from app.execution.hedge_pool import hedge_pool
     from app.api.hedge_groups import _hedge_group_payload
     query = db.query(HedgeGroup)
+    if not include_voided:
+        query = query.filter(HedgeGroup.status != "voided")
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
     metadata = _leg_metadata_by_symbol(db, {row.symbol for row in rows})
@@ -196,12 +209,13 @@ def _stream_snapshot(
     min_move: float = 0.0,
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
+    include_voided: bool = False,
 ) -> dict[str, Any]:
     """根据 channel 参数生成快照数据。"""
     if channel == "pipeline":
         return {"pipeline": build_pipeline_diagnostics(db)}
     if channel == "hedge-groups":
-        return {"hedge_groups": _hedge_groups_payload(db, page=page, page_size=page_size)}
+        return {"hedge_groups": _hedge_groups_payload(db, page=page, page_size=page_size, include_voided=include_voided)}
     if channel == "positions":
         return {"positions": _positions_payload(db)}
     if channel == "accounts":
@@ -260,32 +274,30 @@ def _snapshot_cache_key(**params: Any) -> str:
 
 def _cached_stream_event(cache_seconds: float, **params: Any) -> str:
     """在线程中生成并缓存序列化快照；同键并发只允许一个生产者。"""
-    key = _snapshot_cache_key(**params)
-    now = time.monotonic()
-    cached = _snapshot_cache.get(key)
-    if cached and now - cached[0] < cache_seconds:
-        return cached[1]
+    import hashlib
+    from app.core.redis_client import redis_client, redis_key
+    logical_key = _snapshot_cache_key(**params)
+    key = redis_key("cache", "stream-snapshots", hashlib.sha256(logical_key.encode()).hexdigest())
+    cached = redis_client().get(key)
+    if cached is not None:
+        return cached
     with _snapshot_locks_guard:
         lock = _snapshot_locks.setdefault(key, threading.Lock())
     with lock:
-        now = time.monotonic()
-        cached = _snapshot_cache.get(key)
-        if cached and now - cached[0] < cache_seconds:
-            return cached[1]
+        cached = redis_client().get(key)
+        if cached is not None:
+            return cached
         session = SessionLocal()
         try:
             snapshot = _stream_snapshot(session, **params)
             serialized = json.dumps(snapshot, default=json_default, separators=(",", ":"))
         finally:
             session.close()
-        stored_at = time.monotonic()
-        _snapshot_cache[key] = (stored_at, serialized)
-        # 防止恶意组合筛选参数导致缓存键和锁无限增长。
+        redis_client().set(key, serialized, px=max(int(cache_seconds * 1000), 1))
+        # 锁仅用于当前进程内避免重复生产，不承载缓存数据。
         with _snapshot_locks_guard:
-            if len(_snapshot_cache) > 256:
-                ordered = sorted(_snapshot_cache.items(), key=lambda item: item[1][0])
-                for stale_key, _ in ordered[: len(ordered) - 256]:
-                    _snapshot_cache.pop(stale_key, None)
+            if len(_snapshot_locks) > 256:
+                for stale_key in list(_snapshot_locks)[: len(_snapshot_locks) - 256]:
                     _snapshot_locks.pop(stale_key, None)
         return serialized
 
@@ -308,6 +320,7 @@ async def stream(
     min_move: float = 0.0,
     follow_ratio: float = 0.5,
     max_lag_ms: int = 2000,
+    include_voided: bool = False,
 ) -> StreamingResponse:
     """SSE 实时推送端点。"""
     page = max(int(page), 1)
@@ -345,6 +358,7 @@ async def stream(
             "min_move": min_move,
             "follow_ratio": follow_ratio,
             "max_lag_ms": max_lag_ms,
+            "include_voided": include_voided,
         }
         while True:
             try:

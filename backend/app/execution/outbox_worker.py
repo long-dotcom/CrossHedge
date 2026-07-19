@@ -45,6 +45,7 @@ class DispatchCommand:
     """可安全跨线程传递的不可变单腿提交命令。"""
 
     leg_id: int
+    intent_id: int
     venue_order_id: int
     venue: str
     execution_mode: str
@@ -57,6 +58,7 @@ class DispatchCommand:
     post_only: bool
     venue_reduce_only: bool
     position_side: str
+    action: str
     hedge_group_id: int | None
     client_order_id: str
 
@@ -70,18 +72,20 @@ def run_execution_outbox_once(
 ) -> int:
     """领取并处理一批 Outbox 命令，返回领取数量。"""
     factory = adapter_factory or _default_adapter_factory
-    # 原生 WS/MT5 活动轮询事件是低延迟主路径，REST/终端查询仅用于恢复和对账。
-    from app.execution.venue_events import project_venue_events_once
+    # 私有 WS 是订单确认主路径；REST 查单只允许启动或断线重连后的单次补偿。
+    from app.execution.venue_events import consume_reconciliation_request, project_venue_events_once
 
     project_venue_events_once(session_factory=session_factory)
-    reconcile_execution_orders_once(
-        session_factory=session_factory,
-        adapter_factory=factory,
-        limit=max(int(limit) * 4, 20),
-    )
-    from app.execution.probe_runs import reconcile_probe_runs_once
+    advance_execution_timers_once(session_factory=session_factory, adapter_factory=factory)
+    if consume_reconciliation_request():
+        reconcile_execution_orders_once(
+            session_factory=session_factory,
+            adapter_factory=factory,
+            limit=max(int(limit) * 4, 20),
+        )
+        from app.execution.probe_runs import reconcile_probe_runs_once
 
-    reconcile_probe_runs_once(session_factory=session_factory, adapter_factory=factory)
+        reconcile_probe_runs_once(session_factory=session_factory, adapter_factory=factory)
     claims = _claim_outbox(
         session_factory,
         limit=max(int(limit), 1),
@@ -90,6 +94,40 @@ def run_execution_outbox_once(
     for claim in claims:
         _process_claim(session_factory, factory, claim)
     return len(claims)
+
+
+def advance_execution_timers_once(
+    *,
+    session_factory: sessionmaker = SessionLocal,
+    adapter_factory: AdapterFactory | None = None,
+) -> int:
+    """仅按本地持久化状态推进 Maker TTL，不向交易所发起查单。"""
+    factory = adapter_factory or _default_adapter_factory
+    advanced = 0
+    with session_factory() as db:
+        intents = db.query(ExecutionIntent).filter(
+            ExecutionIntent.status == "RUNNING",
+            ExecutionIntent.execution_style == "maker_then_market",
+        ).all()
+        for intent in intents:
+            outbox = (
+                db.query(ExecutionOutbox)
+                .filter(ExecutionOutbox.intent_id == intent.id)
+                .order_by(ExecutionOutbox.id.desc())
+                .first()
+            )
+            legs = db.query(ExecutionLeg).filter(
+                ExecutionLeg.intent_id == intent.id
+            ).order_by(ExecutionLeg.id).all()
+            if outbox is None or not legs:
+                continue
+            before = (intent.status, outbox.status, len(legs))
+            _finish_command(db, outbox, intent, legs, adapter_factory=factory)
+            db.flush()
+            after = (intent.status, outbox.status, db.query(ExecutionLeg).filter(ExecutionLeg.intent_id == intent.id).count())
+            advanced += int(after != before)
+        db.commit()
+    return advanced
 
 
 def reconcile_execution_orders_once(
@@ -418,6 +456,7 @@ def _ensure_venue_order(db: Session, intent: ExecutionIntent, leg: ExecutionLeg)
 def _dispatch_command(intent: ExecutionIntent, leg: ExecutionLeg, venue_order: VenueOrder) -> DispatchCommand:
     return DispatchCommand(
         leg_id=leg.id,
+        intent_id=intent.id,
         venue_order_id=venue_order.id,
         venue=leg.venue,
         execution_mode=intent.execution_mode,
@@ -430,6 +469,7 @@ def _dispatch_command(intent: ExecutionIntent, leg: ExecutionLeg, venue_order: V
         post_only=bool(leg.post_only),
         venue_reduce_only=bool(leg.venue_reduce_only),
         position_side=leg.position_side,
+        action=leg.action,
         hedge_group_id=intent.hedge_group_id,
         client_order_id=venue_order.client_order_id,
     )
@@ -450,7 +490,12 @@ def _submit_dispatch_command(adapter_factory: AdapterFactory, command: DispatchC
             post_only=command.post_only,
             reduce_only=command.venue_reduce_only,
             position_side=PositionSide(command.position_side) if command.position_side in {"NET", "LONG", "SHORT"} else PositionSide.NET,
-            metadata={"hedge_group_id": command.hedge_group_id},
+            metadata={
+                "hedge_group_id": command.hedge_group_id,
+                "intent_id": command.intent_id,
+                "leg_id": command.leg_id,
+                "action": command.action,
+            },
         )
     )
 
@@ -773,7 +818,7 @@ def _add_group_event_once(db: Session, group_id: int, event_type: str, detail: s
 
 
 def _refresh_hedge_pool(db: Session, intent: ExecutionIntent) -> None:
-    """事务提交后同步内存池，数据库仍是执行状态的权威来源。"""
+    """事务提交后同步 Redis 快照池，数据库仍是执行状态的权威来源。"""
     if intent.hedge_group_id is None:
         return
     group = db.get(HedgeGroup, intent.hedge_group_id)

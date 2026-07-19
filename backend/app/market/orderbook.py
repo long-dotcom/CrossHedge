@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
-import threading
+import json
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from app.core.logging import get_logger
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 
 logger = get_logger(__name__)
@@ -94,16 +97,19 @@ class SimulatedFill:
 # ---------------------------------------------------------------------------
 
 class OrderBookCache:
-    """线程安全的订单簿缓存。
+    """基于 Redis 的共享订单簿缓存。
 
     按 ``(platform, symbol)`` 键存储最新订单簿快照。
     每次写入会过滤无效档位（价格 ≤ 0 或数量 ≤ 0）并截断到最大档数。
     """
 
-    def __init__(self, max_levels: int = 20) -> None:
+    def __init__(self, max_levels: int = 20, *, namespace: str | None = None) -> None:
         self.max_levels = max_levels
-        self._lock = threading.RLock()
-        self._books: dict[tuple[str, str], OrderBook] = {}
+        # 固定命名空间用于跨容器共享；独立实例默认随机命名以避免互相污染。
+        self._namespace = namespace or uuid.uuid4().hex
+
+    def _key(self, platform: str, symbol: str) -> str:
+        return redis_key("orderbooks", self._namespace, platform, symbol)
 
     def put(
         self,
@@ -144,14 +150,13 @@ class OrderBookCache:
             local_recv_ts=utc_now(),
             exchange_ts=exchange_ts,
         )
-        with self._lock:
-            self._books[(platform, symbol)] = book
+        redis_client().set(self._key(platform, symbol), _book_json(book))
         return book
 
     def latest(self, platform: str, symbol: str) -> OrderBook | None:
         """获取指定平台和品种的最新订单簿。"""
-        with self._lock:
-            return self._books.get((platform, symbol))
+        raw = redis_client().get(self._key(platform, symbol))
+        return _book_from_json(raw) if raw else None
 
 
 # ---------------------------------------------------------------------------
@@ -262,4 +267,27 @@ def _parse_side(rows: Any) -> list[tuple[float, float]]:
 
 
 # 全局订单簿缓存单例
-order_book_cache = OrderBookCache()
+order_book_cache = OrderBookCache(namespace="shared")
+
+
+def _book_json(book: OrderBook) -> str:
+    time_value = lambda value: value.isoformat() if isinstance(value, datetime) else value
+    return json.dumps({
+        "platform": book.platform, "symbol": book.symbol,
+        "bids": [[item.price, item.size] for item in book.bids],
+        "asks": [[item.price, item.size] for item in book.asks],
+        "source": book.source, "local_recv_ts": time_value(book.local_recv_ts),
+        "exchange_ts": time_value(book.exchange_ts),
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _book_from_json(raw: str) -> OrderBook:
+    data = json.loads(raw)
+    parse_time = lambda value: datetime.fromisoformat(value) if isinstance(value, str) else value
+    return OrderBook(
+        platform=data["platform"], symbol=data["symbol"],
+        bids=tuple(BookLevel(float(row[0]), float(row[1])) for row in data.get("bids", [])),
+        asks=tuple(BookLevel(float(row[0]), float(row[1])) for row in data.get("asks", [])),
+        source=data["source"], local_recv_ts=parse_time(data["local_recv_ts"]),
+        exchange_ts=parse_time(data.get("exchange_ts")),
+    )

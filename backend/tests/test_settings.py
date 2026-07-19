@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from app.auth.security import hash_password
 from app.db.models import Base, User
 from app.db import init_db as init_db_module
-from app.config.settings import SecuritySettings, Settings, enforce_runtime_security, insecure_runtime_reasons
+from app.config.settings import SecuritySettings, Settings, enforce_runtime_security, get_settings, insecure_runtime_reasons
 
 
 def test_runtime_security_allows_local_defaults() -> None:
@@ -78,3 +78,25 @@ def test_seed_defaults_rejects_existing_default_admin_in_secure_runtime(monkeypa
         init_db_module.seed_defaults(db)
 
     db.close()
+
+
+def test_secret_files_override_environment_and_secure_redis_url(monkeypatch, tmp_path) -> None:
+    jwt_file = tmp_path / "jwt_secret"
+    exchange_file = tmp_path / "exchange_config_secret"
+    redis_file = tmp_path / "redis_password"
+    jwt_file.write_text("jwt-from-file", encoding="utf-8")
+    exchange_file.write_text("exchange-from-file", encoding="utf-8")
+    redis_file.write_text("redis-password", encoding="utf-8")
+    monkeypatch.setenv("JWT_SECRET", "jwt-from-environment")
+    monkeypatch.setenv("JWT_SECRET_FILE", str(jwt_file))
+    monkeypatch.setenv("EXCHANGE_CONFIG_SECRET_FILE", str(exchange_file))
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6391/0")
+    monkeypatch.setenv("REDIS_PASSWORD_FILE", str(redis_file))
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.security.jwt_secret == "jwt-from-file"
+    assert settings.security.exchange_config_secret == "exchange-from-file"
+    assert settings.redis.url == "redis://:redis-password@redis:6391/0"
+    get_settings.cache_clear()

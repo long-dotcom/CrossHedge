@@ -6,6 +6,7 @@
 - GET  /hedge-groups/{group_id}         —— 对冲组详情（含事件和订单）
 - POST /hedge-groups/{group_id}/close   —— 关闭对冲组
 - POST /hedge-groups/{group_id}/mark-manual —— 标记为需人工介入
+- POST /hedge-groups/{group_id}/void       —— 无真实敞口时作废归档
 """
 
 from __future__ import annotations
@@ -23,9 +24,10 @@ from app.db.session import get_db
 from app.execution.actions import hedge_group_actions
 from app.execution.coordinator import create_close_intent, create_recovery_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
+from app.execution.voiding import void_hedge_group
 from app.execution.pnl import pnl_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
-from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn
+from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn, VoidHedgeGroupIn
 
 router = APIRouter()
 
@@ -120,9 +122,11 @@ def _execution_history(db: Session, group_id: int) -> list[dict[str, Any]]:
     return result
 
 
-def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def _hedge_groups_payload(db: Session, page: int = 1, page_size: int = 20, include_voided: bool = False) -> dict[str, Any]:
     """组装对冲组列表（分页）。"""
     query = db.query(HedgeGroup)
+    if not include_voided:
+        query = query.filter(HedgeGroup.status != "voided")
     total = query.count()
     rows = query.order_by(desc(HedgeGroup.created_at)).offset((page - 1) * page_size).limit(page_size).all()
     from app.api.deps import _leg_metadata_by_symbol
@@ -144,9 +148,10 @@ def hedge_groups(
     db: Session = Depends(get_db),
     page: int = 1,
     page_size: int = 20,
+    include_voided: bool = False,
 ) -> dict[str, Any]:
     """对冲组列表（分页）。"""
-    return _hedge_groups_payload(db, page=page, page_size=page_size)
+    return _hedge_groups_payload(db, page=page, page_size=page_size, include_voided=include_voided)
 
 
 @router.get("/{group_id}")
@@ -247,4 +252,36 @@ def recover_group(
             "message": "恢复请求已进入执行队列，仅处理本组已确认成交残量",
         }
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{group_id}/void")
+def void_group(
+    group_id: int,
+    payload: VoidHedgeGroupIn,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """仅在无真实敞口和结果未知外部订单时软作废异常组。"""
+    expected = f"VOID {group_id}"
+    if payload.confirmation != expected:
+        raise HTTPException(status_code=400, detail=f"作废归档必须传 confirmation='{expected}'")
+    try:
+        group = void_hedge_group(
+            db,
+            group_id,
+            reason=payload.reason,
+            requested_by=f"user:{user.id}",
+        )
+        audit(db, user.id, "void_hedge_group", "hedge_group", f"{group_id}; reason={payload.reason}")
+        db.commit()
+        db.refresh(group)
+        hedge_pool.upsert_group(group)
+        return {
+            "status": "ok",
+            "message": "对冲组已作废归档，执行审计记录仍保留",
+            "group": as_dict(group),
+        }
+    except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc

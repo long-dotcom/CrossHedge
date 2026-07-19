@@ -12,8 +12,8 @@ from app.venues.domain.models import (
     OrderType,
     Side,
 )
-from app.venues.mt5.connector import MT5Connector
-from app.venues.mt5.poller import MT5OrderPoller
+from mt5_gateway.native_connector import MT5Connector
+from mt5_gateway.poller import MT5OrderPoller
 
 
 class FakeMT5:
@@ -185,6 +185,44 @@ def test_mt5_limit_order_uses_pending_action() -> None:
         )
         assert mt5.sent[0]["action"] == mt5.TRADE_ACTION_PENDING
         assert mt5.sent[0]["type"] == mt5.ORDER_TYPE_SELL_LIMIT
+    finally:
+        connector.stop()
+
+
+def test_mt5_cancel_order_uses_remove_action() -> None:
+    mt5 = FakeMT5()
+    connector = MT5Connector(read_only=False, mt5_module=mt5, connect=lambda: True)
+    try:
+        result = connector.cancel_order("BTCUSD", client_order_id="cancel-1", venue_order_id="44")
+        assert mt5.sent[0] == {"action": mt5.TRADE_ACTION_REMOVE, "order": 44}
+        assert result.status == OrderStatus.PENDING_CANCEL
+    finally:
+        connector.stop()
+
+
+def test_mt5_reduce_only_only_matches_gateway_magic_position() -> None:
+    mt5 = FakeMT5()
+    mt5.positions_get = lambda symbol=None: [
+        SimpleNamespace(ticket=10, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=0.01, magic=999),
+        SimpleNamespace(ticket=11, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=0.02, magic=260620),
+    ]
+    connector = MT5Connector(read_only=False, mt5_module=mt5, connect=lambda: True, order_magic=260620)
+    try:
+        position = connector._matching_position("BTCUSD", Side.SELL, Decimal("0.01"))
+        assert position is not None
+        assert position.ticket == 11
+    finally:
+        connector.stop()
+
+
+def test_mt5_reduce_only_does_not_match_manual_position() -> None:
+    mt5 = FakeMT5()
+    mt5.positions_get = lambda symbol=None: [
+        SimpleNamespace(ticket=10, symbol=symbol, type=mt5.POSITION_TYPE_BUY, volume=1, magic=999),
+    ]
+    connector = MT5Connector(read_only=False, mt5_module=mt5, connect=lambda: True, order_magic=260620)
+    try:
+        assert connector._matching_position("BTCUSD", Side.SELL, Decimal("0.01")) is None
     finally:
         connector.stop()
 

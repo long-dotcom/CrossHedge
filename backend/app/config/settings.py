@@ -32,6 +32,7 @@ from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +70,26 @@ class DatabaseSettings:
 
 
 @dataclass
+class RedisSettings:
+    """Redis 缓存、Stream 与 MT5 Gateway 通信配置。"""
+
+    url: str = "redis://localhost:6379/0"
+    password: str = ""
+    password_file: str = ""
+    key_prefix: str = "crosshedge"
+    socket_timeout_seconds: float = 5.0
+    mt5_rpc_timeout_seconds: float = 15.0
+    mt5_snapshot_ttl_seconds: int = 10
+    mt5_heartbeat_ttl_seconds: int = 15
+
+
+@dataclass
 class SecuritySettings:
     """安全与认证配置 —— JWT、管理员账户、交易所密钥加密"""
 
     # JWT 签名密钥（JWT_SECRET）
     jwt_secret: str = INSECURE_DEFAULT_JWT_SECRET
+    jwt_secret_file: str = ""
     # JWT 签名算法（JWT_ALGORITHM）
     jwt_algorithm: str = "HS256"
     # 访问令牌有效期 / 分钟（ACCESS_TOKEN_EXPIRE_MINUTES）
@@ -84,6 +100,7 @@ class SecuritySettings:
     admin_password: str = INSECURE_DEFAULT_ADMIN_PASSWORD
     # 交易所配置加密主密钥；留空时使用 jwt_secret 派生（EXCHANGE_CONFIG_SECRET）
     exchange_config_secret: str = ""
+    exchange_config_secret_file: str = ""
     # 实盘交易总开关（LIVE_TRADING_ENABLED）
     live_trading_enabled: bool = False
     # 实盘交易二次确认口令，留空则不启用（LIVE_TRADING_CONFIRMATION）
@@ -159,8 +176,6 @@ class HyperliquidSettings:
     account_address: str = ""
     # API 签名密钥（HYPERLIQUID_SECRET_KEY）
     secret_key: str = ""
-    # Paper 模式下是否启用 Hyperliquid 实盘下单（HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED）
-    paper_live_order_enabled: bool = False
     # Paper-live 滑点估计（HYPERLIQUID_PAPER_LIVE_SLIPPAGE）
     paper_live_slippage: float = 0.01
 
@@ -221,8 +236,6 @@ class PaperLiveSettings:
     probe_enabled: bool = False
     # 探针覆盖的 venue 列表，逗号分隔，* 表示全部（PAPER_LIVE_PROBE_VENUES）
     probe_venues: str = "*"
-    # 是否并行执行多 venue 下单（PAPER_LIVE_PARALLEL_EXECUTION）
-    parallel_execution: bool = True
 
 
 @dataclass
@@ -251,13 +264,24 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "DATABASE_POOL_SIZE":                ("database", "pool_size"),
     "DATABASE_MAX_OVERFLOW":             ("database", "max_overflow"),
     "DATABASE_POOL_RECYCLE":             ("database", "pool_recycle"),
+    # --- RedisSettings ---
+    "REDIS_URL":                         ("redis", "url"),
+    "REDIS_PASSWORD":                    ("redis", "password"),
+    "REDIS_PASSWORD_FILE":               ("redis", "password_file"),
+    "REDIS_KEY_PREFIX":                  ("redis", "key_prefix"),
+    "REDIS_SOCKET_TIMEOUT_SECONDS":      ("redis", "socket_timeout_seconds"),
+    "MT5_RPC_TIMEOUT_SECONDS":           ("redis", "mt5_rpc_timeout_seconds"),
+    "MT5_SNAPSHOT_TTL_SECONDS":          ("redis", "mt5_snapshot_ttl_seconds"),
+    "MT5_HEARTBEAT_TTL_SECONDS":         ("redis", "mt5_heartbeat_ttl_seconds"),
     # --- SecuritySettings ---
     "JWT_SECRET":                        ("security", "jwt_secret"),
+    "JWT_SECRET_FILE":                   ("security", "jwt_secret_file"),
     "JWT_ALGORITHM":                     ("security", "jwt_algorithm"),
     "ACCESS_TOKEN_EXPIRE_MINUTES":       ("security", "access_token_minutes"),
     "ADMIN_USERNAME":                    ("security", "admin_username"),
     "ADMIN_PASSWORD":                    ("security", "admin_password"),
     "EXCHANGE_CONFIG_SECRET":            ("security", "exchange_config_secret"),
+    "EXCHANGE_CONFIG_SECRET_FILE":       ("security", "exchange_config_secret_file"),
     "LIVE_TRADING_ENABLED":              ("security", "live_trading_enabled"),
     "LIVE_TRADING_CONFIRMATION":         ("security", "live_trading_confirmation"),
     "DEFAULT_EXECUTION_MODE":            ("security", "default_execution_mode"),
@@ -272,22 +296,16 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "STREAM_INTERVAL_MS":                ("quote", "stream_interval_ms"),
     "SIGNAL_STATS_CACHE_TTL_MS":         ("quote", "signal_stats_cache_ttl_ms"),
     # --- ScannerSettings ---
-    "SCANNER_INTERVAL_SECONDS":          ("scanner", "interval_seconds"),
     "SCANNER_INTERVAL_MS":               ("scanner", "interval_ms"),
     "SCAN_PERSIST_INTERVAL_MS":          ("scanner", "persist_interval_ms"),
     "EXECUTION_MAINTENANCE_INTERVAL_MS": ("scanner", "execution_maintenance_interval_ms"),
     "SPREAD_HISTORY_INTERVAL_SECONDS":   ("scanner", "spread_history_interval_seconds"),
     "SPREAD_BUCKET_SECONDS":             ("scanner", "spread_bucket_seconds"),
     # --- HyperliquidSettings ---
-    "HYPERLIQUID_INFO_URL":              ("hyperliquid", "info_url"),
-    "HYPERLIQUID_WS_URL":                ("hyperliquid", "ws_url"),
     "HYPERLIQUID_L2BOOK_FAST_ENABLED":   ("hyperliquid", "l2book_fast_enabled"),
     "HYPERLIQUID_DEFAULT_TAKER_FEE_RATE": ("hyperliquid", "default_taker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MAKER_FEE_RATE": ("hyperliquid", "default_maker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MIN_NOTIONAL":  ("hyperliquid", "default_min_notional"),
-    "HYPERLIQUID_ACCOUNT_ADDRESS":       ("hyperliquid", "account_address"),
-    "HYPERLIQUID_SECRET_KEY":            ("hyperliquid", "secret_key"),
-    "HYPERLIQUID_PAPER_LIVE_ORDER_ENABLED": ("hyperliquid", "paper_live_order_enabled"),
     "HYPERLIQUID_PAPER_LIVE_SLIPPAGE":   ("hyperliquid", "paper_live_slippage"),
     # --- MT5Settings ---
     "MT5_LOGIN":                         ("mt5", "login"),
@@ -312,7 +330,6 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     # --- PaperLiveSettings ---
     "PAPER_LIVE_PROBE_ENABLED":          ("paper_live", "probe_enabled"),
     "PAPER_LIVE_PROBE_VENUES":           ("paper_live", "probe_venues"),
-    "PAPER_LIVE_PARALLEL_EXECUTION":     ("paper_live", "parallel_execution"),
     # --- VenueSettings ---
     "VENUE_STARTUP_TIMEOUT_SECONDS":     ("venues", "startup_timeout_seconds"),
     "VENUE_INSTRUMENT_REFRESH_SECONDS":  ("venues", "instrument_refresh_seconds"),
@@ -349,6 +366,8 @@ class Settings:
 
     # 数据库配置
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
+    # Redis 缓存与跨进程通信
+    redis: RedisSettings = field(default_factory=RedisSettings)
     # 安全与认证配置
     security: SecuritySettings = field(default_factory=SecuritySettings)
     # 行情源与报价同步配置
@@ -409,6 +428,47 @@ def _get_sub_settings(settings: Settings) -> dict[str, Any]:
     return result
 
 
+def _read_secret_file(path: str, variable_name: str) -> str:
+    """读取容器密钥文件，并拒绝空文件或缺失文件。"""
+    secret_path = Path(path)
+    try:
+        value = secret_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"{variable_name} 指向的密钥文件不可读: {secret_path}") from exc
+    if not value:
+        raise ValueError(f"{variable_name} 指向的密钥文件为空: {secret_path}")
+    return value
+
+
+def _apply_secret_files(settings: Settings) -> None:
+    """让持久化密钥文件覆盖普通环境变量，并为 Redis URL 注入认证信息。"""
+    security = settings.security
+    if security.jwt_secret_file:
+        security.jwt_secret = _read_secret_file(security.jwt_secret_file, "JWT_SECRET_FILE")
+    if security.exchange_config_secret_file:
+        security.exchange_config_secret = _read_secret_file(
+            security.exchange_config_secret_file,
+            "EXCHANGE_CONFIG_SECRET_FILE",
+        )
+
+    redis = settings.redis
+    if redis.password_file:
+        redis.password = _read_secret_file(redis.password_file, "REDIS_PASSWORD_FILE")
+    if redis.password:
+        parts = urlsplit(redis.url)
+        if not parts.hostname:
+            raise ValueError("REDIS_URL 缺少主机名")
+        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+        port = f":{parts.port}" if parts.port else ""
+        redis.url = urlunsplit((
+            parts.scheme,
+            f":{quote(redis.password, safe='')}@{host}{port}",
+            parts.path,
+            parts.query,
+            parts.fragment,
+        ))
+
+
 def _validate_settings(settings: Settings) -> None:
     """在启动阶段校验关键枚举和时间参数，避免无效配置进入运行期。"""
     if settings.security.default_execution_mode not in {"dry_run", "paper", "live"}:
@@ -427,6 +487,9 @@ def _validate_settings(settings: Settings) -> None:
         "SPREAD_HISTORY_INTERVAL_SECONDS": settings.scanner.spread_history_interval_seconds,
         "SPREAD_BUCKET_SECONDS": settings.scanner.spread_bucket_seconds,
         "COST_CACHE_TTL_SECONDS": settings.cost.cost_cache_ttl_seconds,
+        "MT5_RPC_TIMEOUT_SECONDS": settings.redis.mt5_rpc_timeout_seconds,
+        "MT5_SNAPSHOT_TTL_SECONDS": settings.redis.mt5_snapshot_ttl_seconds,
+        "MT5_HEARTBEAT_TTL_SECONDS": settings.redis.mt5_heartbeat_ttl_seconds,
     }
     invalid = [name for name, value in positive_values.items() if value <= 0]
     if invalid:
@@ -464,7 +527,6 @@ def runtime_requires_strong_secrets(settings: Settings) -> bool:
     live_switch_enabled = (
         settings.security.live_trading_enabled
         or settings.mt5.live_order_enabled
-        or settings.hyperliquid.paper_live_order_enabled
         or settings.paper_live.probe_enabled
         or settings.security.default_execution_mode == "live"
     )
@@ -534,5 +596,6 @@ def get_settings() -> Settings:
         init_kwargs[parent_name] = sub_cls(**child_overrides)
 
     settings = Settings(**init_kwargs)
+    _apply_secret_files(settings)
     _validate_settings(settings)
     return settings

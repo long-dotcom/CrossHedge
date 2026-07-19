@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from app.core.mt5_bootstrap import ensure_mt5_connected
+from mt5_gateway.mt5_bootstrap import ensure_mt5_connected
 from app.core.time_utils import utc_now
 from app.venues.domain.capabilities import VenueCapabilities
 from app.venues.domain.models import (
@@ -32,7 +32,7 @@ from app.venues.domain.models import (
     Side,
     Ticker,
 )
-from app.venues.mt5.poller import MT5OrderPoller
+from mt5_gateway.poller import MT5OrderPoller
 from app.venues.protocols import EventHandler
 
 
@@ -426,6 +426,8 @@ class MT5Connector:
         candidates = [
             item for item in self.mt5.positions_get(symbol=symbol) or []
             if int(getattr(item, "type", -1)) == expected_type
+            # 只允许关闭本网关创建的持仓，避免误平 Demo 账户中的手工单或其他 EA 持仓。
+            and int(getattr(item, "magic", 0)) == self.order_magic
             and _decimal(getattr(item, "volume", 0)) >= quantity
         ]
         return min(candidates, key=lambda item: _decimal(getattr(item, "volume", 0))) if candidates else None

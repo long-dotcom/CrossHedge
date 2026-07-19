@@ -74,7 +74,8 @@ def run_execution_reconcile(db: Session) -> int:
 def _reconcile_impl(db: Session) -> int:
     """对账内部实现。"""
     reconciled = 0
-    sync_live_positions(db)
+    # 加密账户/持仓由私有 WS 事件持续投影；定时维护不得重复请求远端快照。
+    sync_live_positions(db, allow_remote_crypto=False)
     groups = db.query(HedgeGroup).filter(HedgeGroup.status.in_(RECONCILE_GROUP_STATUSES)).all()
     for group in groups:
         changed = reconcile_hedge_group(db, group)
@@ -84,7 +85,7 @@ def _reconcile_impl(db: Session) -> int:
     reconciled += reconcile_orphan_positions(db)
     # 分批回填历史订单；幂等事件 ID 保证重启或重复扫描不会重复写入。
     project_unmirrored_legacy_orders(db)
-    # 同步完成后刷新内存对冲池
+    # 同步完成后刷新 Redis 对冲组快照
     hedge_pool.load_from_db(db)
     return reconciled
 
@@ -153,7 +154,7 @@ def _escalate_detached_unresolved_order(db: Session, group: HedgeGroup, order: O
     return True
 
 
-def sync_live_positions(db: Session) -> int:
+def sync_live_positions(db: Session, *, allow_remote_crypto: bool = True) -> int:
     """从各交易平台同步 live 仓位到 Position 表。
 
     支持 Hyperliquid、MT5 和 Binance 原生连接器。
@@ -169,6 +170,8 @@ def sync_live_positions(db: Session) -> int:
         venues.add(str(venue or "").strip().lower())
     count = 0
     for venue in sorted(venues & SUPPORTED_VENUES):
+        if venue in {"hyperliquid", "binance"} and not allow_remote_crypto:
+            continue
         try:
             positions = native_venue_manager.connector_for(venue, "live").get_positions()
         except Exception as exc:

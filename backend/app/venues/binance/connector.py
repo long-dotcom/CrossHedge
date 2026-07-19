@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.time_utils import utc_now
+from app.core.cache import TTLCache
 from app.venues.binance.rest import BinanceApiError, BinanceFuturesRestClient, normalize_symbol
 from app.venues.binance.websocket import BinanceWebSocketRuntime
 from app.venues.domain.capabilities import VenueCapabilities
@@ -61,9 +62,13 @@ class BinanceFuturesConnector:
             api_secret=str(values.get("api_secret") or ""),
             environment=environment,
         )
-        self._instrument_cache: dict[str, Instrument] = {}
+        self._instrument_cache: TTLCache[Instrument] = TTLCache(
+            ttl_seconds=21600, namespace=f"binance-instruments-{environment}",
+        )
         self._event_handlers: list[EventHandler] = []
-        self._ticker_cache: dict[str, Ticker] = {}
+        self._ticker_cache: TTLCache[Ticker] = TTLCache(
+            ttl_seconds=10, namespace=f"binance-tickers-{environment}",
+        )
         self._ws = BinanceWebSocketRuntime(
             self.rest,
             on_ticker=self._cache_ticker,
@@ -76,18 +81,22 @@ class BinanceFuturesConnector:
         self._ws.stop()
 
     def health(self) -> dict:
-        try:
-            server_time = self.rest.server_time()
-            return {
-                "venue": self.venue,
-                "status": "ok",
-                "server_time": server_time,
-                **self._ws.health(),
-            }
-        except Exception as exc:
-            return {"venue": self.venue, "status": "degraded", "error": str(exc)}
+        """健康检查只读取本地 WS 状态，禁止周期性消耗 REST 配额。"""
+        websocket = self._ws.health()
+        connected = bool(websocket.get("market_ws_connected"))
+        if not self.read_only:
+            connected = bool(websocket.get("private_ws_connected"))
+        return {
+            "venue": self.venue,
+            "status": "ok" if connected else "degraded",
+            "error": "" if connected else "Binance WebSocket 未连接",
+            **websocket,
+        }
 
     def get_account(self) -> AccountSnapshot:
+        cached = self._ws.account()
+        if cached is not None:
+            return cached
         data = self.rest.account()
         balances = tuple(
             Balance(
@@ -101,7 +110,7 @@ class BinanceFuturesConnector:
             for item in data.get("assets", [])
             if _decimal(item.get("walletBalance")) != 0
         )
-        return AccountSnapshot(
+        snapshot = AccountSnapshot(
             venue=self.venue,
             account_id=str(data.get("accountAlias") or "binance-futures"),
             currency="USDT",
@@ -112,8 +121,13 @@ class BinanceFuturesConnector:
             balances=balances,
             raw=data,
         )
+        self._ws.seed_account(snapshot)
+        return snapshot
 
     def get_positions(self) -> list[Position]:
+        cached = self._ws.positions()
+        if cached is not None:
+            return cached
         rows = []
         for item in self.rest.position_risk():
             quantity = _decimal(item.get("positionAmt"))
@@ -137,6 +151,7 @@ class BinanceFuturesConnector:
                     raw=item,
                 )
             )
+        self._ws.seed_positions(rows)
         return rows
 
     def get_open_orders(self, symbol: str | None = None) -> list[OrderSnapshot]:
@@ -151,14 +166,15 @@ class BinanceFuturesConnector:
             if requested is not None and symbol not in requested:
                 continue
             instrument = self._instrument_from_payload(item)
-            self._instrument_cache[symbol] = instrument
+            self._instrument_cache.set(symbol, instrument)
             rows.append(instrument)
         return rows
 
     def get_instrument(self, symbol: str, *, refresh: bool = False) -> Instrument:
         key = normalize_symbol(symbol)
-        if not refresh and key in self._instrument_cache:
-            return self._instrument_cache[key]
+        cached = self._instrument_cache.get(key) if not refresh else None
+        if cached is not None:
+            return cached
         rows = self.get_instruments([key])
         if not rows:
             raise LookupError(f"Binance Futures 品种不存在: {key}")
@@ -177,7 +193,7 @@ class BinanceFuturesConnector:
             )
         except BinanceApiError:
             pass
-        self._instrument_cache[key] = instrument
+        self._instrument_cache.set(key, instrument)
         return instrument
 
     def get_ticker(self, symbol: str) -> Ticker:
@@ -226,6 +242,8 @@ class BinanceFuturesConnector:
     def submit_order(self, request: OrderRequest) -> OrderSnapshot:
         if self.read_only:
             raise PermissionError("Binance Connector 为只读配置，禁止下单")
+        if not self._ws.private_stream_ready:
+            raise RuntimeError("Binance 账户私有 WebSocket 尚未连接，禁止提交无法实时确认的订单")
         symbol = normalize_symbol(request.symbol)
         params: dict[str, Any] = {
             "symbol": symbol,
@@ -326,7 +344,7 @@ class BinanceFuturesConnector:
         return CredentialCheck(self.venue, self.environment, account_id, valid, can_read, can_trade, tuple(items))
 
     def _cache_ticker(self, ticker: Ticker) -> None:
-        self._ticker_cache[ticker.symbol] = ticker
+        self._ticker_cache.set(ticker.symbol, ticker)
 
     def _instrument_from_payload(self, item: dict[str, Any]) -> Instrument:
         filters = {str(value.get("filterType")): value for value in item.get("filters", [])}

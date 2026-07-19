@@ -678,6 +678,7 @@ class HedgeGroup(Base, TimestampMixin):
     direction: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), default="pending_open")
     execution_mode: Mapped[str] = mapped_column(String(32), default="paper")
+    execution_profile: Mapped[str] = mapped_column(String(32), default="hybrid_probe_demo")
     notional: Mapped[float] = mapped_column(Float)
     quantity: Mapped[float] = mapped_column(Float)
     leg_b_quantity: Mapped[float] = mapped_column(Float, default=1.0)

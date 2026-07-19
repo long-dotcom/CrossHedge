@@ -563,14 +563,25 @@ export function SettingsPage() {
                         className="settings-form settings-compact-form"
                         initialValues={{
                           paper_live_probe_enabled: execution.data?.paper_live_probe_enabled,
-                          paper_live_parallel_execution: execution.data?.paper_live_parallel_execution,
+                          paper_probe_max_notional: execution.data?.paper_probe_max_notional,
+                          paper_probe_daily_max_runs: execution.data?.paper_probe_daily_max_runs,
+                          paper_probe_daily_max_notional: execution.data?.paper_probe_daily_max_notional,
+                          paper_probe_cooldown_ms: execution.data?.paper_probe_cooldown_ms,
+                          paper_probe_flatten_timeout_seconds: execution.data?.paper_probe_flatten_timeout_seconds,
+                          paper_probe_maker_timeout_seconds: execution.data?.paper_probe_maker_timeout_seconds,
                           confirmation: ''
                         }}
                         onFinish={(v) => saveExecution.mutate(v)}
                         onValuesChange={() => setDirty(true)}
                       >
-                        <Form.Item name="paper_live_probe_enabled" label="Paper Probe（实盘最小单）" valuePropName="checked"><Switch /></Form.Item>
-                        <Form.Item name="paper_live_parallel_execution" label="探针与 MT5 demo 并发提交" valuePropName="checked"><Switch /></Form.Item>
+                        <Alert type="warning" showIcon message="Paper 只使用真实最小单探针 + MT5 Gateway Demo，不会降级为本地虚拟撮合。Market 双腿并发提交；Maker 模式先取得探针成交，再提交 MT5 Demo 对冲腿。" />
+                        <Form.Item name="paper_live_probe_enabled" label="启用混合 Paper 执行" valuePropName="checked"><Switch /></Form.Item>
+                        <Form.Item name="paper_probe_max_notional" label="单次探针最大名义金额（USD）"><InputNumber min={10} max={1000} precision={2} /></Form.Item>
+                        <Form.Item name="paper_probe_daily_max_runs" label="每日最大探针次数"><InputNumber min={1} max={100000} precision={0} /></Form.Item>
+                        <Form.Item name="paper_probe_daily_max_notional" label="每日最大真实成交名义金额（USD）"><InputNumber min={10} max={10000000} precision={2} /></Form.Item>
+                        <Form.Item name="paper_probe_cooldown_ms" label="同品种探针冷却（毫秒）"><InputNumber min={0} max={60000} precision={0} /></Form.Item>
+                        <Form.Item name="paper_probe_flatten_timeout_seconds" label="探针回平超时（秒）"><InputNumber min={3} max={300} precision={1} /></Form.Item>
+                        <Form.Item name="paper_probe_maker_timeout_seconds" label="Maker 等待成交时间（秒）"><InputNumber min={1} max={300} precision={1} /></Form.Item>
                         <Form.Item name="confirmation" label="确认短语"><Input placeholder="ENABLE PAPER LIVE PROBE" /></Form.Item>
                         <Button danger htmlType="submit" loading={saveExecution.isPending}>保存执行开关</Button>
                       </Form>

@@ -1,0 +1,105 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crosshedge
+      POSTGRES_USER: crosshedge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crosshedge_local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crosshedge -d crosshedge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        exec redis-server \
+          --port 6391 \
+          --appendonly yes \
+          --maxmemory-policy noeviction \
+          --requirepass "$${REDIS_PASSWORD}"
+    ports:
+      # 发布到公网网卡，供另一台机器上的 Windows MT5 Gateway 连接。
+      - "${REDIS_BIND_ADDRESS:-0.0.0.0}:${REDIS_HOST_PORT:-6391}:6391"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli -p 6391 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
+      REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?请在环境变量中配置 JWT_SECRET}
+      EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:?请在环境变量中配置 EXCHANGE_CONFIG_SECRET}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
+      SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
+      SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  execution-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    # 使用 null 继承镜像入口；Coolify 不接受用于清空入口的空数组。
+    entrypoint: null
+    command: ["python", "-m", "app.execution.worker_main"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
+      REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?请在环境变量中配置 JWT_SECRET}
+      EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:?请在环境变量中配置 EXCHANGE_CONFIG_SECRET}
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
+      SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
+      SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

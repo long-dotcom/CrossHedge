@@ -9,11 +9,13 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from queue import Empty, SimpleQueue
+from threading import Event
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
+from app.core.redis_client import redis_client, redis_key
 from app.db.models import (
     ExecutionEvent,
     ExecutionIntent,
@@ -21,17 +23,29 @@ from app.db.models import (
     ExecutionOutbox,
     Fill as DatabaseFill,
     Order,
+    Position as DatabasePosition,
     VenueOrder,
 )
 from app.db.session import SessionLocal
 from app.venues.domain.events import VenueEvent
 
 venue_event_queue: SimpleQueue[VenueEvent] = SimpleQueue()
+_reconciliation_requested = Event()
 
 
 def enqueue_venue_event(event: VenueEvent) -> None:
     """WS/MT5 轮询回调只入队，不在网络线程执行数据库操作。"""
+    if event.event_type.value == "RECONCILIATION_REQUIRED":
+        _reconciliation_requested.set()
     venue_event_queue.put(event)
+
+
+def consume_reconciliation_request() -> bool:
+    """原子消费一次断线重连补偿请求。"""
+    if not _reconciliation_requested.is_set():
+        return False
+    _reconciliation_requested.clear()
+    return True
 
 
 def project_venue_events_once(
@@ -93,6 +107,10 @@ def _project_event(db, event: VenueEvent) -> tuple[bool, int | None]:
             processed_at=utc_now(),
         )
     )
+    if event.account is not None:
+        _apply_account(db, event)
+    if event.position is not None:
+        _apply_position(db, event)
     if venue_order is None or leg is None:
         return True, None
     if event.order is not None:
@@ -100,6 +118,65 @@ def _project_event(db, event: VenueEvent) -> tuple[bool, int | None]:
     if event.fill is not None:
         _apply_fill(db, venue_order, leg, event.fill)
     return True, intent_id
+
+
+def _apply_account(db, event: VenueEvent) -> None:
+    """账户事件写入 Redis；完整仓位快照到达时先清空该 venue 的旧仓位。"""
+    if bool(event.raw.get("positions_snapshot")):
+        db.query(DatabasePosition).filter(DatabasePosition.platform == event.venue).delete(
+            synchronize_session=False
+        )
+    try:
+        cache = redis_client()
+        cache.set(
+            redis_key("venue", event.venue, "account"),
+            json.dumps(asdict(event.account), ensure_ascii=False, default=_json_default),
+        )
+        if bool(event.raw.get("positions_snapshot")):
+            cache.delete(redis_key("venue", event.venue, "positions"))
+    except Exception:
+        # Redis 暂时不可用不能阻断订单事件的数据库投影。
+        pass
+
+
+def _apply_position(db, event: VenueEvent) -> None:
+    position = event.position
+    raw_signed = position.raw.get("szi", position.raw.get("pa", position.quantity))
+    try:
+        is_short = Decimal(str(raw_signed or 0)) < 0
+    except Exception:
+        is_short = position.position_side.value == "SHORT"
+    side = "short" if is_short or position.position_side.value == "SHORT" else "long"
+    rows = db.query(DatabasePosition).filter(
+        DatabasePosition.platform == event.venue,
+        DatabasePosition.symbol == position.symbol,
+        DatabasePosition.side == side,
+    ).order_by(DatabasePosition.id).all()
+    if position.quantity <= 0:
+        for row in rows:
+            db.delete(row)
+    else:
+        row = rows[0] if rows else DatabasePosition(platform=event.venue, symbol=position.symbol, side=side)
+        for duplicate in rows[1:]:
+            db.delete(duplicate)
+        row.quantity = float(position.quantity)
+        row.entry_price = float(position.entry_price)
+        if position.mark_price > 0 or not rows:
+            row.mark_price = float(position.mark_price)
+        row.unrealized_pnl = float(position.unrealized_pnl)
+        row.margin_used = float(position.margin_used)
+        row.liquidation_price = float(position.liquidation_price) if position.liquidation_price is not None else None
+        db.add(row)
+    try:
+        cache = redis_client()
+        key = redis_key("venue", event.venue, "positions")
+        field = position.external_position_id or f"{position.symbol}:{side}"
+        if position.quantity <= 0:
+            cache.hdel(key, field)
+        else:
+            cache.hset(key, field, json.dumps(asdict(position), ensure_ascii=False, default=_json_default))
+    except Exception:
+        pass
 
 
 def _find_venue_order(db, client_order_id: str, venue_order_id: str) -> VenueOrder | None:

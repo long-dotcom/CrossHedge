@@ -51,13 +51,20 @@ function orderDetailItems(row: any) {
 export function ExecutionPage() {
   const [orderPage, setOrderPage] = useState(1);
   const [fillPage, setFillPage] = useState(1);
+  const [probePage, setProbePage] = useState(1);
   const [activeTab, setActiveTab] = useState('orders');
   const streamStatus = usePageStream('execution', { page: orderPage, fillPage, pageSize: 20 });
   useHeaderStreamStatus(streamStatus);
   const orders = useQuery({ queryKey: ['orders', orderPage], queryFn: async () => (await api.get('/orders', { params: { page: orderPage, page_size: 20 } })).data });
   const fills = useQuery({ queryKey: ['fills', fillPage], queryFn: async () => (await api.get('/fills', { params: { page: fillPage, page_size: 20 } })).data });
+  const probes = useQuery({
+    queryKey: ['probe-runs', probePage],
+    queryFn: async () => (await api.get('/execution/probe-runs', { params: { page: probePage, page_size: 20 } })).data,
+    refetchInterval: 3000
+  });
   const orderRows = orders.data?.items || [];
   const fillRows = fills.data?.items || [];
+  const probeRows = probes.data?.items || [];
 
   const orderColumns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 70 },
@@ -84,12 +91,28 @@ export function ExecutionPage() {
     { title: '成交时间', dataIndex: 'created_at', width: 180, render: fmtLocalTime }
   ];
 
+  const probeColumns: ColumnsType<any> = [
+    { title: 'ID', dataIndex: 'id', width: 70 },
+    { title: '组ID', dataIndex: 'hedge_group_id', width: 80, render: (v) => v || '-' },
+    { title: '用途', dataIndex: 'purpose', width: 130 },
+    { title: '平台', dataIndex: 'venue', width: 90, render: platformTag },
+    { title: '品种', dataIndex: 'instrument_id', width: 120, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
+    { title: '方向', dataIndex: 'entry_side', width: 76, render: (v) => sideTag(String(v || '').toLowerCase()) },
+    {
+      title: '状态', dataIndex: 'status', width: 130,
+      render: (v) => <Tag color={v === 'FLAT' ? 'green' : v === 'RECOVERY_REQUIRED' ? 'red' : 'processing'}>{v || '-'}</Tag>
+    },
+    { title: '真实数量', dataIndex: 'probe_quantity', width: 110, align: 'right', render: (v) => fmtNum(v, 8) },
+    { title: '残量', dataIndex: 'residual_quantity', width: 110, align: 'right', render: (v) => fmtNum(v, 8) },
+    { title: '更新时间', dataIndex: 'updated_at', width: 180, render: fmtLocalTime }
+  ];
+
   return (
     <div className="page-fill page-stack">
       <Card title="执行记录" className="fill-card tabs-fill-card">
         <Tabs
           activeKey={activeTab}
-          onChange={(key) => { setActiveTab(key); setOrderPage(1); setFillPage(1); }}
+          onChange={(key) => { setActiveTab(key); setOrderPage(1); setFillPage(1); setProbePage(1); }}
           items={[
             {
               key: 'orders',
@@ -122,6 +145,33 @@ export function ExecutionPage() {
                   tableLayout="fixed"
                   scroll={tableScrollAutoY(980, fillRows.length, 'calc(100vh - 356px)', 8)}
                   pagination={{ current: fillPage, pageSize: 20, total: fills.data?.total || 0, onChange: setFillPage }}
+                />
+              )
+            },
+            {
+              key: 'probes',
+              label: '真实探针',
+              children: (
+                <Table
+                  rowKey="id"
+                  columns={probeColumns}
+                  dataSource={probeRows}
+                  loading={probes.isLoading}
+                  tableLayout="fixed"
+                  scroll={tableScrollAutoY(1080, probeRows.length, 'calc(100vh - 356px)', 8)}
+                  pagination={{ current: probePage, pageSize: 20, total: probes.data?.total || 0, onChange: setProbePage }}
+                  expandable={{
+                    expandedRowRender: (row) => (
+                      <Descriptions size="small" column={{ xs: 1, sm: 2, lg: 3 }} items={[
+                        { key: 'open', label: '开仓成交价', children: fmtMoney(row.open_fill_price) },
+                        { key: 'close', label: '回平成交价', children: fmtMoney(row.close_fill_price) },
+                        { key: 'baseline', label: '运行前仓位', children: fmtNum(row.baseline_position_quantity, 8) },
+                        { key: 'final', label: '最终仓位', children: fmtNum(row.final_position_quantity, 8) },
+                        { key: 'flat_at', label: '回平确认', children: fmtLocalTime(row.flat_confirmed_at) },
+                        { key: 'error', label: '错误/恢复提示', children: <EllipsisCell value={row.error_message} /> }
+                      ]} />
+                    )
+                  }}
                 />
               )
             }

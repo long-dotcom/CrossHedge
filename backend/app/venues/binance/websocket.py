@@ -18,11 +18,14 @@ from app.venues.binance.orderbook import BinanceLocalOrderBook, OrderBookGap
 from app.venues.binance.rest import BinanceFuturesRestClient, normalize_symbol
 from app.venues.domain.events import VenueEvent, VenueEventType
 from app.venues.domain.models import (
+    AccountSnapshot,
+    Balance,
     Fill,
     OrderSnapshot,
     OrderStatus,
     OrderType,
     PositionSide,
+    Position,
     Side,
     Ticker,
 )
@@ -65,8 +68,12 @@ class BinanceWebSocketRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._market_connected = False
         self._private_connected = False
+        self._private_ever_connected = False
         self._last_market_message_at = 0.0
         self._last_private_message_at = 0.0
+        self._account_snapshot: AccountSnapshot | None = None
+        self._positions: dict[str, Position] = {}
+        self._positions_ready = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -74,6 +81,10 @@ class BinanceWebSocketRuntime:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="binance-native-ws", daemon=True)
         self._thread.start()
+
+    @property
+    def private_stream_ready(self) -> bool:
+        return not self._private_enabled or self._private_connected
 
     def stop(self) -> None:
         self._stop.set()
@@ -115,6 +126,19 @@ class BinanceWebSocketRuntime:
     def order_book(self, symbol: str, depth: int = 20):
         book = self._books.get(normalize_symbol(symbol))
         return book.snapshot(depth=depth) if book else None
+
+    def account(self) -> AccountSnapshot | None:
+        return self._account_snapshot
+
+    def positions(self) -> list[Position] | None:
+        return list(self._positions.values()) if self._positions_ready else None
+
+    def seed_account(self, account: AccountSnapshot) -> None:
+        self._account_snapshot = account
+
+    def seed_positions(self, positions: Sequence[Position]) -> None:
+        self._positions = {item.external_position_id or item.symbol: item for item in positions}
+        self._positions_ready = True
 
     def process_market_message(self, payload: dict[str, Any]) -> None:
         """公开给测试和 runtime 的确定性消息处理入口。"""
@@ -206,10 +230,76 @@ class BinanceWebSocketRuntime:
                     raw=payload,
                 )
             )
+        elif event_name == "ACCOUNT_UPDATE":
+            events.extend(self._account_events(payload))
         for event in events:
             for handler in tuple(self._handlers):
                 handler(event)
         return tuple(events)
+
+    def _account_events(self, payload: dict[str, Any]) -> list[VenueEvent]:
+        data = payload.get("a") or {}
+        now = _millis_datetime(payload.get("T") or payload.get("E")) or utc_now()
+        balances = tuple(
+            Balance(
+                asset=str(item.get("a") or ""),
+                wallet_balance=_decimal(item.get("wb")),
+                available_balance=_decimal(item.get("cw")),
+            )
+            for item in data.get("B", [])
+        )
+        account = AccountSnapshot(
+            venue="binance",
+            account_id="binance-futures",
+            currency="USDT",
+            equity=sum((item.wallet_balance for item in balances), Decimal("0")),
+            available_balance=sum((item.available_balance for item in balances), Decimal("0")),
+            margin_used=Decimal("0"),
+            balances=balances,
+            observed_at=now,
+            raw=data,
+        )
+        self._account_snapshot = account
+        events = [VenueEvent(
+            _event_id(payload, "account", "update"),
+            "binance",
+            VenueEventType.ACCOUNT,
+            now,
+            account=account,
+            raw={"positions_snapshot": False, **payload},
+        )]
+        for item in data.get("P", []):
+            signed = _decimal(item.get("pa"))
+            raw_side = str(item.get("ps") or "BOTH").upper()
+            position = Position(
+                venue="binance",
+                account_id="binance-futures",
+                symbol=str(item.get("s") or ""),
+                position_side=PositionSide.NET if raw_side == "BOTH" else PositionSide(raw_side),
+                quantity=abs(signed),
+                entry_price=_decimal(item.get("ep")),
+                mark_price=Decimal("0"),
+                unrealized_pnl=_decimal(item.get("up")),
+                margin_used=_decimal(item.get("iw")),
+                external_position_id=f"{item.get('s', '')}-{raw_side}",
+                observed_at=now,
+                raw=item,
+            )
+            self._positions_ready = True
+            identity = position.external_position_id or position.symbol
+            if position.quantity > 0:
+                self._positions[identity] = position
+            else:
+                self._positions.pop(identity, None)
+            events.append(VenueEvent(
+                _event_id(payload, position.external_position_id, "position"),
+                "binance",
+                VenueEventType.POSITION,
+                now,
+                position=position,
+                raw=item,
+            ))
+        return events
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -267,6 +357,10 @@ class BinanceWebSocketRuntime:
                 url = f"{PRIVATE_WS_URLS[self.environment]}/{listen_key}"
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, open_timeout=10) as ws:
                     self._private_connected = True
+                    self._emit_stream_event(VenueEventType.STREAM_CONNECTED)
+                    if self._private_ever_connected:
+                        self._emit_stream_event(VenueEventType.RECONCILIATION_REQUIRED, reconciliation=True)
+                    self._private_ever_connected = True
                     backoff = 1.0
                     next_keepalive = time.monotonic() + 30 * 60
                     while not self._stop.is_set():
@@ -285,6 +379,8 @@ class BinanceWebSocketRuntime:
             except Exception as exc:
                 logger.warning("Binance 私有 WS 断开: {}", exc)
             finally:
+                if self._private_connected:
+                    self._emit_stream_event(VenueEventType.STREAM_DISCONNECTED)
                 self._private_connected = False
                 if listen_key:
                     try:
@@ -293,6 +389,18 @@ class BinanceWebSocketRuntime:
                         pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
+
+    def _emit_stream_event(self, event_type: VenueEventType, *, reconciliation: bool = False) -> None:
+        now = utc_now()
+        event = VenueEvent(
+            f"binance:stream:{event_type.value}:{now.isoformat()}",
+            "binance",
+            event_type,
+            now,
+            reconciliation=reconciliation,
+        )
+        for handler in tuple(self._handlers):
+            handler(event)
 
 
 def _order_from_update(data: dict[str, Any], envelope: dict[str, Any]) -> OrderSnapshot:

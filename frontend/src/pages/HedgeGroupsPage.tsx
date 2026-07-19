@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Card, Descriptions, Popconfirm, Space, Table, Tag, message } from 'antd';
+import { Button, Card, Descriptions, Popconfirm, Space, Switch, Table, Tag, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useState } from 'react';
 import { api } from '../api/client';
@@ -19,7 +19,8 @@ function statusTag(status: string) {
     opening: { label: '开仓中', color: 'processing' },
     closing: { label: '平仓中', color: 'processing' },
     manual_intervention: { label: '人工', color: 'red' },
-    failed: { label: '失败', color: 'red' }
+    failed: { label: '失败', color: 'red' },
+    voided: { label: '已作废', color: 'default' }
   };
   const item = map[status] || { label: status || '-', color: 'default' };
   return <Tag color={item.color}>{item.label}</Tag>;
@@ -90,11 +91,21 @@ function detailItems(row: any) {
 
 export function HedgeGroupsPage() {
   const [page, setPage] = useState(1);
-  const streamStatus = usePageStream('hedge-groups', { page, pageSize: 20 });
+  const [includeVoided, setIncludeVoided] = useState(false);
+  const hedgeGroupsKey = ['hedge-groups', page, includeVoided];
+  const streamStatus = usePageStream('hedge-groups', {
+    page,
+    pageSize: 20,
+    params: { include_voided: includeVoided },
+    cacheKey: hedgeGroupsKey
+  });
   useHeaderStreamStatus(streamStatus);
   const queryClient = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
-  const query = useQuery({ queryKey: ['hedge-groups', page], queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20 } })).data });
+  const query = useQuery({
+    queryKey: hedgeGroupsKey,
+    queryFn: async () => (await api.get('/hedge-groups', { params: { page, page_size: 20, include_voided: includeVoided } })).data
+  });
   const close = useMutation({
     mutationFn: async (id: number) => (await api.post(
       `/hedge-groups/${id}/close`,
@@ -132,6 +143,17 @@ export function HedgeGroupsPage() {
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '恢复请求失败')
   });
+  const voidGroup = useMutation({
+    mutationFn: async (id: number) => (await api.post(
+      `/hedge-groups/${id}/void`,
+      { reason: '人工确认无真实敞口，作废异常对冲组', confirmation: `VOID ${id}` }
+    )).data,
+    onSuccess: () => {
+      messageApi.success('对冲组已作废归档，审计记录仍保留');
+      queryClient.invalidateQueries({ queryKey: ['hedge-groups'] });
+    },
+    onError: (err: any) => messageApi.error(err.response?.data?.detail || '作废归档失败')
+  });
   const columns: ColumnsType<any> = [
     { title: 'ID', dataIndex: 'id', width: 64, align: 'right' },
     { title: '品种', dataIndex: 'symbol', width: 82, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
@@ -146,7 +168,7 @@ export function HedgeGroupsPage() {
     { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_a_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_b_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
-    { title: '操作', fixed: 'right', width: 170, render: (_, row) => (
+    { title: '操作', fixed: 'right', width: 230, render: (_, row) => (
       <Space size={4}>
         <Popconfirm
           title={`强制平仓 #${row.id}?`}
@@ -177,6 +199,20 @@ export function HedgeGroupsPage() {
             disabled={!row.available_actions?.recover?.allowed || (recover.isPending && recover.variables !== row.id)}
           >恢复</Button>
         </Popconfirm>
+        <Popconfirm
+          title={`作废归档 #${row.id}?`}
+          description={row.available_actions?.void?.reason || '服务端尚未确认可以安全作废'}
+          okText="作废归档"
+          cancelText="取消"
+          onConfirm={() => voidGroup.mutate(row.id)}
+        >
+          <Button
+            size="small"
+            title={row.available_actions?.void?.reason}
+            loading={voidGroup.isPending && voidGroup.variables === row.id}
+            disabled={!row.available_actions?.void?.allowed || (voidGroup.isPending && voidGroup.variables !== row.id)}
+          >作废</Button>
+        </Popconfirm>
       </Space>
     ) }
   ];
@@ -188,7 +224,12 @@ export function HedgeGroupsPage() {
       <Card
         title="对冲组"
         className="fill-card"
-        extra={<Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>}
+        extra={(
+          <Space>
+            <Space size={6}>显示已归档 <Switch size="small" checked={includeVoided} onChange={(checked) => { setIncludeVoided(checked); setPage(1); }} /></Space>
+            <Button loading={reconcile.isPending} onClick={() => reconcile.mutate()}>同步执行状态</Button>
+          </Space>
+        )}
       >
         <Table
           rowKey="id"

@@ -14,7 +14,7 @@
   - 回退到历史成交（``history_deals_get``）中累加
 
 使用 ``post_hyperliquid_info`` 统一 HTTP 调用，
-使用 ``ensure_mt5_connected`` 统一 MT5 连接，
+MT5 数据统一从独立 Gateway 读取，
 使用 ``run_worker`` 模板自动记录 WorkerRun 和执行 prune。
 
 使用方式::
@@ -37,11 +37,11 @@ from app.adapters.venue import mapping_leg
 from app.config.settings import get_settings
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.core.time_utils import utc_now
 from app.core.worker_runner import run_worker
 from app.db.models import HedgeGroup, Order, SymbolMapping, SystemLog, WorkerRun
 from app.execution.hedge_pool import hedge_pool
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -97,7 +97,7 @@ def _carry_cost_impl(db: Session, *, force: bool = False) -> int:
             group.swap = swap
         if abs(float(group.funding or 0.0) - old_funding) > 1e-9 or abs(float(group.swap or 0.0) - old_swap) > 1e-9:
             changed += 1
-    # 同步完成后刷新内存对冲池
+    # 同步完成后刷新 Redis 对冲组快照
     hedge_pool.load_from_db(db)
     return changed
 
@@ -170,55 +170,46 @@ def _paper_hyperliquid_funding_cost(group: HedgeGroup, mapping: SymbolMapping) -
 def _mt5_swap_cost(db: Session, group: HedgeGroup, mapping: SymbolMapping) -> float | None:
     """获取 MT5 侧的过夜费（swap）。
 
-    使用 ``ensure_mt5_connected`` 统一 MT5 连接初始化。
+    通过 Redis 代理连接器读取 Gateway 快照和成交数据。
     """
     if not group.opened_at:
         return None
     try:
-        import MetaTrader5 as mt5  # type: ignore
+        connector = native_venue_manager.connector_for("mt5", "live")
     except Exception:
         return None
-    settings = get_settings()
-    if not ensure_mt5_connected(
-        login=settings.mt5.login or None,
-        password=settings.mt5.password or None,
-        server=settings.mt5.server or None,
-    ):
-        return None
     if group.status in ACTIVE_COST_STATUSES:
-        position_swap = _open_position_swap(mt5, group, mapping)
+        position_swap = _open_position_swap(connector, group, mapping)
         if position_swap is not None:
             return -position_swap
-    deal_swap = _deal_swap(db, mt5, group)
+    deal_swap = _deal_swap(db, connector, group)
     if deal_swap is not None:
         return -deal_swap
     return None
 
 
-def _open_position_swap(mt5, group: HedgeGroup, mapping: SymbolMapping) -> float | None:
+def _open_position_swap(connector, group: HedgeGroup, mapping: SymbolMapping) -> float | None:
     """从当前 MT5 持仓中读取 swap 值。"""
     mt5_leg = _venue_leg(mapping, "mt5")
     if not mt5_leg:
         return None
     mt5_leg_name, mt5_symbol = mt5_leg
     try:
-        positions = mt5.positions_get(symbol=mt5_symbol)
-    except TypeError:
-        positions = mt5.positions_get()
+        positions = connector.get_positions()
     except Exception:
         return None
-    target_type = getattr(mt5, "POSITION_TYPE_BUY", 0) if _direction_is_venue_long(group.direction, mt5_leg_name) else getattr(mt5, "POSITION_TYPE_SELL", 1)
+    target_side = "LONG" if _direction_is_venue_long(group.direction, mt5_leg_name) else "SHORT"
     candidates = [
         position
         for position in positions or []
-        if str(getattr(position, "symbol", "")) == mt5_symbol
-        and int(getattr(position, "type", -1)) == int(target_type)
-        and float(getattr(position, "volume", 0.0) or 0.0) > 0
+        if position.symbol == mt5_symbol
+        and position.position_side.value == target_side
+        and float(position.quantity) > 0
     ]
     if not candidates:
         return None
-    total_volume = sum(float(getattr(position, "volume", 0.0) or 0.0) for position in candidates)
-    total_swap = sum(float(getattr(position, "swap", 0.0) or 0.0) for position in candidates)
+    total_volume = sum(float(position.quantity) for position in candidates)
+    total_swap = sum(float(position.raw.get("swap", 0.0) or 0.0) for position in candidates)
     if total_volume <= 0:
         return None
     expected_quantity = group.leg_a_quantity if mt5_leg_name == "a" else group.leg_b_quantity
@@ -227,7 +218,7 @@ def _open_position_swap(mt5, group: HedgeGroup, mapping: SymbolMapping) -> float
     return total_swap * ratio
 
 
-def _deal_swap(db: Session, mt5, group: HedgeGroup) -> float | None:
+def _deal_swap(db: Session, connector, group: HedgeGroup) -> float | None:
     """从 MT5 历史成交中累加 swap 值（回退方案）。"""
     orders = db.query(Order).filter(Order.hedge_group_id == group.id, Order.platform == "mt5", Order.external_order_id != "").all()
     total = 0.0
@@ -237,16 +228,13 @@ def _deal_swap(db: Session, mt5, group: HedgeGroup) -> float | None:
             ticket = int(str(order.external_order_id).strip())
         except (TypeError, ValueError):
             continue
-        for reader in (lambda: mt5.history_deals_get(order=ticket), lambda: mt5.history_deals_get(ticket=ticket)):
-            try:
-                rows = reader()
-            except Exception:
-                rows = None
-            for deal in rows or []:
-                found = True
-                total += float(getattr(deal, "swap", 0.0) or 0.0)
-            if rows:
-                break
+        try:
+            rows = connector.get_fills(venue_order_id=str(ticket))
+        except Exception:
+            rows = []
+        for deal in rows:
+            found = True
+            total += float(deal.raw.get("swap", 0.0) or 0.0)
     return total if found else None
 
 

@@ -19,7 +19,7 @@
 1. 后台“交易所配置”中的 Binance `environment` 必须为 `testnet` 或 `demo`。
 2. 凭证必须启用、完整配置、关闭只读，并具有合约测试交易权限。
 3. 品种映射必须启用，并指向 Testnet/Demo 实际存在的 Binance Futures symbol。
-4. Paper Live Probe 开关已经显式启用。
+4. 设置页“混合 Paper（真实最小探针 + MT5 Demo）”总开关已经显式启用。
 5. 后端与独立执行 Worker 已按新配置重启。
 6. `/health` 必须为 `ok`，Worker 的 Binance runtime 必须满足：
    - `runtime_status=running`
@@ -92,7 +92,7 @@ Dry-run 只读取脱敏凭证信息和健康状态，不提交订单。只要凭
   - entry/exit 的 `venue_reduce_only=false`
   - 保存 ClientOrderId、VenueOrderId、PositionId、成交量、均价和最近原生交易所事件
 
-已有人工仓位并不要求先清零，但脚本只验证“恢复原基线”，不能把人工仓位当成 Probe 敞口关闭。若最终仓位与基线不一致，验收失败并进入人工恢复，不得继续。
+真实探针必须使用专用空仓账户。同品种已有任何人工仓位时系统会在真实提交前拒绝，避免把人工仓位误认为探针敞口；不得通过修改数据库或 Redis 绕过该检查。
 
 ## 6. 失败处理
 
@@ -102,6 +102,7 @@ Dry-run 只读取脱敏凭证信息和健康状态，不提交订单。只要凭
 4. 若 ProbeRun=`RECOVERY_REQUIRED`，核对交易所真实仓位与运行前基线，使用受控恢复流程。
 5. 保存失败证据文件和 Worker 日志，修复后使用新的验收批次。
 6. 禁止为了让报告通过而手工修改数据库状态。
+7. 只有服务端“作废归档”资格检查明确确认无真实成交、无结果未知外部订单且 Probe 已安全回平时，才能作废垃圾组；作废后必须仍能查看原 Intent、订单、Fill、事件及审计记录。
 
 ## 7. MT5 Demo 验收
 

@@ -28,9 +28,9 @@ from app.config.settings import get_settings
 from app.core.cache import TTLCache
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
-from app.core.mt5_bootstrap import ensure_mt5_connected
 from app.core.type_utils import safe_float
 from app.market.fx import fx_to_usd
+from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
 
@@ -87,11 +87,11 @@ class HyperliquidMarketData:
 # ── TTL 缓存实例 ────────────────────────────────────────────────────────────
 # 市场数据缓存（按 dex 分组），TTL 由 settings.cost.cost_cache_ttl_seconds 控制
 _cost_cache_ttl = max(float(get_settings().cost.cost_cache_ttl_seconds), 1.0)
-_hl_market_cache: TTLCache[HyperliquidMarketData] = TTLCache(ttl_seconds=_cost_cache_ttl)
+_hl_market_cache: TTLCache[HyperliquidMarketData] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="hl-market-costs")
 # 用户费率缓存，TTL 同上
-_hl_user_fee_cache: TTLCache[tuple[float, float]] = TTLCache(ttl_seconds=_cost_cache_ttl)
+_hl_user_fee_cache: TTLCache[tuple[float, float]] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="hl-user-fees")
 # 交易所成本缓存，避免扫描循环反复请求品种与 funding。
-_venue_cost_cache: TTLCache[VenueCostInputs] = TTLCache(ttl_seconds=_cost_cache_ttl)
+_venue_cost_cache: TTLCache[VenueCostInputs] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="venue-costs")
 
 
 class VenueCostUnavailable(RuntimeError):
@@ -189,40 +189,25 @@ def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_day
     返回:
         MT5CostInputs
     """
-    settings = get_settings()
     try:
-        import MetaTrader5 as mt5  # type: ignore
+        connector = native_venue_manager.connector_for("mt5", "live")
+        instrument = connector.get_instrument(mt5_symbol)
+        tick = connector.get_ticker(mt5_symbol)
+        account = connector.get_account()
     except Exception as exc:
-        logger.warning("MetaTrader5 包不可用，使用默认 MT5 成本: {}", exc)
+        logger.warning("MT5 Gateway 成本数据不可用，使用默认 MT5 成本: {}", exc)
         return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
-
-    if not ensure_mt5_connected(
-        login=settings.mt5.login,
-        password=settings.mt5.password,
-        server=settings.mt5.server,
-    ):
-        logger.warning("MT5 连接失败，使用默认 MT5 成本")
-        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
-    mt5.symbol_select(mt5_symbol, True)
-    info = mt5.symbol_info(mt5_symbol)
-    if not info:
-        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
-    swap_long = safe_float(getattr(info, "swap_long", 0.0))
-    swap_short = safe_float(getattr(info, "swap_short", 0.0))
-    swap_mode = int(getattr(info, "swap_mode", 0))
-    point = safe_float(getattr(info, "point", 0.0))
-    contract_size = safe_float(getattr(info, "trade_contract_size", 1.0))
-    tick = mt5.symbol_info_tick(mt5_symbol)
-    current_price = (
-        (safe_float(getattr(tick, "bid", 0.0)) + safe_float(getattr(tick, "ask", 0.0))) / 2
-        if tick
-        else 0.0
-    )
-    account = mt5.account_info()
+    info = instrument.raw
+    swap_long = safe_float(instrument.long_carry_rate)
+    swap_short = safe_float(instrument.short_carry_rate)
+    swap_mode = int(info.get("swap_mode", 0))
+    point = safe_float(info.get("point", instrument.price_tick))
+    contract_size = safe_float(instrument.contract_size)
+    current_price = (safe_float(tick.bid) + safe_float(tick.ask)) / 2
     currency_by_mode = {
-        2: str(getattr(info, "currency_base", "") or "USD"),
-        3: str(getattr(info, "currency_margin", "") or "USD"),
-        4: str(getattr(account, "currency", "") or "USD"),
+        2: instrument.base_asset or "USD",
+        3: instrument.settlement_asset or "USD",
+        4: account.currency or "USD",
     }
     swap_currency = currency_by_mode.get(swap_mode, "USD")
     currency_rate_to_usd = fx_to_usd(swap_currency).rate_to_usd if swap_mode in currency_by_mode else 1.0

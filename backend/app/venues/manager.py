@@ -17,6 +17,7 @@ from app.market.quotes import quote_cache
 from app.venues.binance import BinanceFuturesConnector
 from app.venues.domain.models import OrderBookSnapshot, Ticker
 from app.venues.hyperliquid import HyperliquidConnector
+from app.venues.hybrid_probe import HybridPaperProbeConnector
 from app.venues.mt5 import MT5Connector
 from app.venues.paper import PaperConnector
 from app.venues.protocols import EventHandler, VenueConnector
@@ -36,15 +37,19 @@ class NativeVenueManager:
         normalized = str(venue or "").strip().lower()
         mode = str(execution_mode or "live").strip().lower()
         if mode == "paper":
-            key = (normalized, mode, "paper")
-            return self._get_or_create(
-                key,
-                lambda: PaperConnector(
-                    venue=normalized,
-                    ticker_provider=lambda symbol: _paper_ticker(normalized, symbol),
-                    book_provider=lambda symbol, depth: _paper_book(normalized, symbol, depth),
-                ),
-            )
+            if normalized == "mt5":
+                key = (normalized, mode, "gateway-demo")
+                return self._get_or_create(
+                    key,
+                    lambda: MT5Connector(credentials={}, read_only=False, environment="demo"),
+                )
+            if normalized in {"hyperliquid", "binance"}:
+                key = (normalized, mode, "real-minimum-probe")
+                return self._get_or_create(
+                    key,
+                    lambda: HybridPaperProbeConnector(self.connector_for(normalized, "live")),
+                )
+            raise ValueError(f"Paper 真实探针暂不支持交易场所: {normalized}")
         if mode != "live":
             raise ValueError(f"不支持的执行模式: {execution_mode}")
 
@@ -65,16 +70,13 @@ class NativeVenueManager:
 
         settings = get_settings()
         if normalized == "hyperliquid":
-            identity = f"legacy:{settings.hyperliquid.account_address}:{settings.hyperliquid.info_url}"
+            identity = f"public:{settings.hyperliquid.info_url}"
             key = (normalized, mode, identity)
             return self._get_or_create(
                 key,
                 lambda: HyperliquidConnector(
-                    credentials={
-                        "account_address": settings.hyperliquid.account_address,
-                        "secret_key": settings.hyperliquid.secret_key,
-                    },
-                    read_only=not bool(settings.hyperliquid.secret_key),
+                    credentials={},
+                    read_only=True,
                     info_url=settings.hyperliquid.info_url,
                     ws_url=settings.hyperliquid.ws_url,
                     default_min_notional=Decimal(str(settings.hyperliquid.default_min_notional)),
@@ -84,18 +86,14 @@ class NativeVenueManager:
                 ),
             )
         if normalized == "mt5":
-            identity = f"legacy:{settings.mt5.login}:{settings.mt5.server}"
+            identity = "gateway"
             key = (normalized, mode, identity)
             return self._get_or_create(
                 key,
                 lambda: MT5Connector(
-                    credentials={
-                        "login": settings.mt5.login,
-                        "password": settings.mt5.password,
-                        "server": settings.mt5.server,
-                    },
-                    read_only=not bool(settings.mt5.live_order_enabled or settings.mt5.demo_order_enabled),
-                    environment="demo" if settings.mt5.demo_order_enabled and not settings.mt5.live_order_enabled else "live",
+                    credentials={},
+                    read_only=False,
+                    environment="live",
                     order_deviation_points=settings.mt5.order_deviation_points,
                     order_magic=settings.mt5.order_magic,
                     poll_interval_ms=settings.mt5.order_poll_interval_ms,
@@ -118,14 +116,18 @@ class NativeVenueManager:
                 venues.append(venue)
         loaded = []
         for venue in venues:
-            connector = self.connector_for(venue, "live")
-            if start:
-                connector.start()
-            if subscribe_market_data:
-                symbols = self.configured_symbols(venue)
-                if symbols:
-                    connector.subscribe_market_data(symbols)
-            loaded.append(venue)
+            try:
+                connector = self.connector_for(venue, "live")
+                if start:
+                    connector.start()
+                if subscribe_market_data:
+                    symbols = self.configured_symbols(venue)
+                    if symbols:
+                        connector.subscribe_market_data(symbols)
+                loaded.append(venue)
+            except Exception as exc:
+                # 独立 Gateway 或单一交易所不可用时，不影响其他连接器和 Paper 服务启动。
+                logger.warning("原生连接器预热跳过: venue={}, error={}", venue, exc)
         return loaded
 
     def configured_symbols(self, venue: str) -> tuple[str, ...]:

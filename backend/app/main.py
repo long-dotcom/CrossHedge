@@ -19,17 +19,17 @@ CrossHedge FastAPI 应用入口
 
 from __future__ import annotations
 
-import time
 import json
+import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import create_api_router
-from app.config.settings import ROOT_DIR, enforce_runtime_security, get_settings
+from app.config.settings import enforce_runtime_security, get_settings
 from app.core.logging import get_logger, setup_logging
+from app.core.redis_client import redis_client, redis_key, verify_redis
 from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.execution.auto_closer import run_auto_close
@@ -79,6 +79,9 @@ def on_startup() -> None:
 
     # 运行时安全检查（生产环境强制使用强密钥）
     enforce_runtime_security(settings)
+
+    # Redis 是缓存及 MT5 Gateway 通信的强依赖，连接失败时禁止启动。
+    verify_redis()
 
     # 数据库初始化（创建表 / 插入默认数据）
     init_db()
@@ -174,12 +177,12 @@ def _startup_step(db, name: str, func) -> None:
 
 
 def _execution_worker_health() -> dict[str, object]:
-    """读取独立执行 Worker 心跳；超过 5 秒即视为失联。"""
-    path = Path(ROOT_DIR) / ".run" / "execution-worker-health.json"
-    if not path.exists():
-        return {"status": "missing", "stale": True, "last_error": "执行 Worker 尚无心跳"}
+    """读取 Redis 中的独立执行 Worker 心跳；超过 5 秒即视为失联。"""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = redis_client().get(redis_key("health", "execution-worker"))
+        if not raw:
+            return {"status": "missing", "stale": True, "last_error": "执行 Worker 尚无心跳"}
+        payload = json.loads(raw)
         updated_at = datetime.fromisoformat(str(payload.get("updated_at") or ""))
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)

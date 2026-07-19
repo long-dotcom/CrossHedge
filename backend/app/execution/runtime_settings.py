@@ -4,7 +4,6 @@
 
 管理执行层的运行时可动态调整的配置项（通过数据库 ``SystemSetting`` 表覆盖）：
 - ``paper_live_probe_enabled``: Paper-live 探针总开关
-- ``paper_live_parallel_execution``: Paper-live 并行执行开关
 
 配置优先级：数据库 > .env 环境变量 > 默认值
 
@@ -32,7 +31,21 @@ from app.db.models import SystemSetting
 
 # 数据库 SystemSetting 表中的 key 常量
 PAPER_LIVE_PROBE_ENABLED_KEY = "paper_live_probe_enabled"
-PAPER_LIVE_PARALLEL_EXECUTION_KEY = "paper_live_parallel_execution"
+PAPER_PROBE_MAX_NOTIONAL_KEY = "paper_probe_max_notional"
+PAPER_PROBE_DAILY_MAX_RUNS_KEY = "paper_probe_daily_max_runs"
+PAPER_PROBE_DAILY_MAX_NOTIONAL_KEY = "paper_probe_daily_max_notional"
+PAPER_PROBE_COOLDOWN_MS_KEY = "paper_probe_cooldown_ms"
+PAPER_PROBE_FLATTEN_TIMEOUT_SECONDS_KEY = "paper_probe_flatten_timeout_seconds"
+PAPER_PROBE_MAKER_TIMEOUT_SECONDS_KEY = "paper_probe_maker_timeout_seconds"
+
+PAPER_PROBE_DEFAULTS = {
+    PAPER_PROBE_MAX_NOTIONAL_KEY: 20.0,
+    PAPER_PROBE_DAILY_MAX_RUNS_KEY: 200,
+    PAPER_PROBE_DAILY_MAX_NOTIONAL_KEY: 4000.0,
+    PAPER_PROBE_COOLDOWN_MS_KEY: 500,
+    PAPER_PROBE_FLATTEN_TIMEOUT_SECONDS_KEY: 20.0,
+    PAPER_PROBE_MAKER_TIMEOUT_SECONDS_KEY: 5.0,
+}
 
 
 def execution_settings_payload(db: Session, settings: Settings) -> dict[str, Any]:
@@ -47,8 +60,8 @@ def execution_settings_payload(db: Session, settings: Settings) -> dict[str, Any
     """
     return {
         "paper_live_probe_enabled": runtime_paper_live_probe_enabled_for_display(db, settings),
-        "paper_live_parallel_execution": runtime_paper_live_parallel_execution(db, settings),
         "paper_live_probe_confirmation_required": "ENABLE PAPER LIVE PROBE",
+        **paper_probe_limits(db),
     }
 
 
@@ -56,17 +69,45 @@ def set_execution_settings(
     db: Session,
     *,
     paper_live_probe_enabled: bool,
-    paper_live_parallel_execution: bool,
+    paper_probe_max_notional: float = 20.0,
+    paper_probe_daily_max_runs: int = 200,
+    paper_probe_daily_max_notional: float = 4000.0,
+    paper_probe_cooldown_ms: int = 500,
+    paper_probe_flatten_timeout_seconds: float = 20.0,
+    paper_probe_maker_timeout_seconds: float = 5.0,
 ) -> None:
     """将执行设置写入数据库。
 
     参数:
         db: 数据库会话。
         paper_live_probe_enabled: Paper-live 探针开关。
-        paper_live_parallel_execution: Paper-live 并行执行开关。
     """
     _set_system_setting(db, PAPER_LIVE_PROBE_ENABLED_KEY, _bool_text(paper_live_probe_enabled))
-    _set_system_setting(db, PAPER_LIVE_PARALLEL_EXECUTION_KEY, _bool_text(paper_live_parallel_execution))
+    values = {
+        PAPER_PROBE_MAX_NOTIONAL_KEY: paper_probe_max_notional,
+        PAPER_PROBE_DAILY_MAX_RUNS_KEY: paper_probe_daily_max_runs,
+        PAPER_PROBE_DAILY_MAX_NOTIONAL_KEY: paper_probe_daily_max_notional,
+        PAPER_PROBE_COOLDOWN_MS_KEY: paper_probe_cooldown_ms,
+        PAPER_PROBE_FLATTEN_TIMEOUT_SECONDS_KEY: paper_probe_flatten_timeout_seconds,
+        PAPER_PROBE_MAKER_TIMEOUT_SECONDS_KEY: paper_probe_maker_timeout_seconds,
+    }
+    for key, value in values.items():
+        _set_system_setting(db, key, str(value))
+
+
+def paper_probe_limits(db: Session) -> dict[str, float | int]:
+    """读取真实最小单探针的安全限额。"""
+    result: dict[str, float | int] = {}
+    integer_keys = {PAPER_PROBE_DAILY_MAX_RUNS_KEY, PAPER_PROBE_COOLDOWN_MS_KEY}
+    for key, default in PAPER_PROBE_DEFAULTS.items():
+        raw = _get_system_setting(db, key)
+        try:
+            result[key] = int(float(raw)) if key in integer_keys and raw is not None else (
+                int(default) if key in integer_keys else float(raw) if raw is not None else float(default)
+            )
+        except (TypeError, ValueError):
+            result[key] = int(default) if key in integer_keys else float(default)
+    return result
 
 
 def runtime_paper_live_probe_enabled(db: Session, settings: Settings) -> bool:
@@ -90,8 +131,7 @@ def runtime_paper_live_probe_enabled(db: Session, settings: Settings) -> bool:
 def runtime_paper_live_probe_enabled_for_display(db: Session, settings: Settings) -> bool:
     """获取用于前端展示的 Paper-live 探针开关状态。
 
-    与 ``runtime_paper_live_probe_enabled`` 类似，但额外考虑
-    Hyperliquid 专属的 paper-live 开关（``settings.hyperliquid.paper_live_order_enabled``）。
+    与 ``runtime_paper_live_probe_enabled`` 使用同一数据库总开关。
 
     参数:
         db: 数据库会话。
@@ -103,26 +143,7 @@ def runtime_paper_live_probe_enabled_for_display(db: Session, settings: Settings
     value = _get_system_setting(db, PAPER_LIVE_PROBE_ENABLED_KEY)
     if value is not None:
         return _parse_bool(value)
-    return bool(settings.paper_live.probe_enabled or settings.hyperliquid.paper_live_order_enabled)
-
-
-def runtime_paper_live_parallel_execution(db: Session | None, settings: Settings) -> bool:
-    """获取 Paper-live 并行执行运行时开关状态。
-
-    优先读取数据库设置，未设置时回退到 ``settings.paper_live.parallel_execution``。
-
-    参数:
-        db: 数据库会话（可为 None，此时直接返回配置默认值）。
-        settings: 应用根配置。
-
-    返回:
-        ``True`` 表示启用并行执行。
-    """
-    if db is not None:
-        value = _get_system_setting(db, PAPER_LIVE_PARALLEL_EXECUTION_KEY)
-        if value is not None:
-            return _parse_bool(value)
-    return settings.paper_live.parallel_execution
+    return bool(settings.paper_live.probe_enabled)
 
 
 def paper_live_probe_enabled_for_venue(
@@ -154,9 +175,6 @@ def paper_live_probe_enabled_for_venue(
         value = _get_system_setting(db, PAPER_LIVE_PROBE_ENABLED_KEY)
         if value is not None:
             return _parse_bool(value)
-    # Hyperliquid 有独立的 paper-live 开关
-    if venue == "hyperliquid" and settings.hyperliquid.paper_live_order_enabled:
-        return True
     if not settings.paper_live.probe_enabled:
         return False
     venues = _paper_live_probe_venues(settings)

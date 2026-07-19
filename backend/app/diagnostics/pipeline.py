@@ -107,7 +107,7 @@ def build_pipeline_diagnostics(db: Session) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _current_spreads(db: Session, mappings: list[SymbolMapping]) -> dict[str, dict[str, Any]]:
-    """获取已启用品种的当前价差状态（优先从内存缓存读取）"""
+    """获取已启用品种的当前价差状态（优先从 Redis 快照读取）"""
     enabled = {row.symbol.upper() for row in mappings}
     state = scan_state_store.snapshot()
     if state["ready"]:
@@ -146,7 +146,7 @@ def _active_opportunities(db: Session, mappings: list[SymbolMapping]) -> dict[st
 
 
 def _active_groups(db: Session) -> list[HedgeGroup]:
-    """获取所有活跃对冲组（优先从内存池读取）"""
+    """获取所有活跃对冲组（优先从 Redis 快照池读取）"""
     pending = (
         db.query(HedgeGroup)
         .filter(HedgeGroup.status == "pending_open")

@@ -299,30 +299,26 @@ def sync_symbol_mapping_from_broker(
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """从 MT5 终端同步品种信息到品种映射。"""
+    """通过 MT5 Gateway 同步品种信息到品种映射。"""
     row = db.get(SymbolMapping, mapping_id)
     if not row:
         raise HTTPException(status_code=404, detail="品种映射不存在")
+    from app.venues.manager import native_venue_manager
     try:
-        import MetaTrader5 as mt5  # type: ignore
+        instrument = native_venue_manager.connector_for("mt5", "live").get_instrument(row.mt5_symbol, refresh=True)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"MetaTrader5 包不可用: {exc}") from exc
-    if not mt5.initialize():
-        raise HTTPException(status_code=400, detail=f"MT5 初始化失败: {mt5.last_error()}")
-    mt5.symbol_select(row.mt5_symbol, True)
-    info = mt5.symbol_info(row.mt5_symbol)
-    if not info:
-        raise HTTPException(status_code=400, detail="MT5 品种不存在或不可见")
+        raise HTTPException(status_code=400, detail=f"MT5 Gateway 品种同步失败: {exc}") from exc
+    info = instrument.raw
 
-    volume_min = float(getattr(info, "volume_min", row.min_order_size))
-    volume_step = float(getattr(info, "volume_step", volume_min))
-    contract_size = float(getattr(info, "trade_contract_size", row.contract_multiplier or 1.0))
-    currency_base = str(getattr(info, "currency_base", "") or "")
-    currency_profit = str(getattr(info, "currency_profit", row.quote_asset or "USD") or "USD")
-    currency_margin = str(getattr(info, "currency_margin", currency_profit) or currency_profit)
-    calc_mode = int(getattr(info, "trade_calc_mode", 0) or 0)
-    digits = int(getattr(info, "digits", row.price_precision))
-    tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", row.min_tick))
+    volume_min = float(instrument.minimum_quantity)
+    volume_step = float(instrument.quantity_step)
+    contract_size = float(instrument.contract_size)
+    currency_base = instrument.base_asset
+    currency_profit = instrument.quote_asset or row.quote_asset or "USD"
+    currency_margin = instrument.settlement_asset or currency_profit
+    calc_mode = int(info.get("trade_calc_mode", 0) or 0)
+    digits = int(info.get("digits", row.price_precision))
+    tick_size = float(instrument.price_tick)
     mt5_min_base_size = volume_min * contract_size
     mt5_base_step = volume_step * contract_size
 
@@ -352,7 +348,7 @@ def sync_symbol_mapping_from_broker(
         "broker": {
             "volume_min": volume_min,
             "volume_step": volume_step,
-            "volume_max": float(getattr(info, "volume_max", 0.0)),
+            "volume_max": float(info.get("volume_max", 0.0)),
             "trade_contract_size": contract_size,
             "currency_base": currency_base,
             "currency_profit": currency_profit,
@@ -360,9 +356,9 @@ def sync_symbol_mapping_from_broker(
             "trade_calc_mode": calc_mode,
             "digits": digits,
             "trade_tick_size": tick_size,
-            "swap_long": float(getattr(info, "swap_long", 0.0)),
-            "swap_short": float(getattr(info, "swap_short", 0.0)),
-            "swap_mode": int(getattr(info, "swap_mode", 0)),
+            "swap_long": float(info.get("swap_long", 0.0)),
+            "swap_short": float(info.get("swap_short", 0.0)),
+            "swap_mode": int(info.get("swap_mode", 0)),
         },
     }
 
@@ -560,7 +556,12 @@ def put_execution_settings(
     set_execution_settings(
         db,
         paper_live_probe_enabled=payload.paper_live_probe_enabled,
-        paper_live_parallel_execution=payload.paper_live_parallel_execution,
+        paper_probe_max_notional=payload.paper_probe_max_notional,
+        paper_probe_daily_max_runs=payload.paper_probe_daily_max_runs,
+        paper_probe_daily_max_notional=payload.paper_probe_daily_max_notional,
+        paper_probe_cooldown_ms=payload.paper_probe_cooldown_ms,
+        paper_probe_flatten_timeout_seconds=payload.paper_probe_flatten_timeout_seconds,
+        paper_probe_maker_timeout_seconds=payload.paper_probe_maker_timeout_seconds,
     )
     audit(db, user.id, "update_execution_settings", "settings", json.dumps(payload.model_dump(exclude={"confirmation"}), ensure_ascii=False))
     db.commit()

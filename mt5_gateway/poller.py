@@ -1,4 +1,4 @@
-"""MT5 活动订单增量轮询器。"""
+"""MT5 Gateway 活动订单增量轮询器。"""
 
 from __future__ import annotations
 

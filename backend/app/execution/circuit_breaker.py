@@ -24,12 +24,14 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 from app.core.logging import get_logger
+from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 
 if TYPE_CHECKING:
@@ -38,14 +40,13 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# 模块级注册表与配置缓存
+# 模块级实时状态注册表；配置副本保存在 Redis
 # ---------------------------------------------------------------------------
 
 # 品种 → 断路器实例的注册表
 breaker_registry: dict[str, SymbolBreaker] = {}
 
-# 断路器配置缓存（从 StrategySetting 加载）
-_cb_config: dict[str, Any] = {}
+_CB_CONFIG_KEY = redis_key("cache", "circuit-breaker-config")
 
 
 # ---------------------------------------------------------------------------
@@ -237,17 +238,22 @@ def _load_cb_settings(db: "Session") -> dict[str, Any]:
 
 def reload_config(db: "Session") -> None:
     """从数据库重新加载断路器配置并推送到所有实例。"""
-    global _cb_config
-    _cb_config = _load_cb_settings(db)
+    config = _load_cb_settings(db)
+    redis_client().set(_CB_CONFIG_KEY, json.dumps(config, ensure_ascii=False))
     for breaker in breaker_registry.values():
-        breaker.apply_config(_cb_config)
-    logger.debug("断路器配置已刷新: {}", _cb_config)
+        breaker.apply_config(config)
+    logger.debug("断路器配置已刷新: {}", config)
+
+
+def _cached_config() -> dict[str, Any]:
+    raw = redis_client().get(_CB_CONFIG_KEY)
+    return json.loads(raw) if raw else {}
 
 
 def get_breaker(symbol: str) -> SymbolBreaker:
     """获取或创建指定品种的断路器实例。"""
     if symbol not in breaker_registry:
-        breaker_registry[symbol] = SymbolBreaker(symbol=symbol, **_cb_config)
+        breaker_registry[symbol] = SymbolBreaker(symbol=symbol, **_cached_config())
     return breaker_registry[symbol]
 
 
