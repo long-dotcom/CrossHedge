@@ -49,13 +49,15 @@ function Get-CurrentPublishedPort([string]$Service, [string]$ContainerPort) {
 $values = Read-EnvValues $SourceEnv
 if (-not $values["REDIS_URL"]) { throw "REDIS_URL is required in .env." }
 if (-not $values["REDIS_PASSWORD"]) { throw "REDIS_PASSWORD is required in .env." }
+$redisBindAddress = if ($values["REDIS_BIND_ADDRESS"]) { $values["REDIS_BIND_ADDRESS"] } else { "0.0.0.0" }
 $preferredAppPort = if ($values["APP_PORT"]) { [int]$values["APP_PORT"] } else { 8080 }
-$preferredRedisPort = if ($values["REDIS_HOST_PORT"]) { [int]$values["REDIS_HOST_PORT"] } else { 16379 }
+$preferredRedisPort = if ($values["REDIS_HOST_PORT"]) { [int]$values["REDIS_HOST_PORT"] } else { 6391 }
 $currentAppPort = Get-CurrentPublishedPort "frontend" "80"
-$currentRedisPort = Get-CurrentPublishedPort "redis" "16379"
+$currentRedisPort = Get-CurrentPublishedPort "redis" "6391"
 $appPort = if ($preferredAppPort -eq $currentAppPort) { $preferredAppPort } else { Find-AvailablePort $preferredAppPort @() }
 $redisPort = if ($preferredRedisPort -eq $currentRedisPort -and $currentRedisPort -ne $appPort) { $preferredRedisPort } else { Find-AvailablePort $preferredRedisPort @($appPort) }
 $values["APP_PORT"] = $appPort
+$values["REDIS_BIND_ADDRESS"] = $redisBindAddress
 $values["REDIS_HOST_PORT"] = $redisPort
 
 $lines = foreach ($item in $values.GetEnumerator()) { "$($item.Key)=$($item.Value)" }
@@ -71,4 +73,4 @@ if (-not $NoBuild) { $arguments += "--build" }
 if ($LASTEXITCODE -ne 0) { throw "Docker Compose failed to start." }
 
 Write-Host "Frontend: http://localhost:$appPort"
-Write-Host "Redis: 127.0.0.1:$redisPort (localhost only, password enabled)"
+Write-Host "Redis: ${redisBindAddress}:$redisPort (published network port, password enabled)"

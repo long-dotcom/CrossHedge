@@ -36,17 +36,17 @@ services:
       - -ec
       - |
         exec redis-server \
-          --port 16379 \
+          --port 6391 \
           --appendonly yes \
           --maxmemory-policy noeviction \
           --requirepass "$${REDIS_PASSWORD}"
     ports:
-      # Windows 主机上的 MT5 Gateway 通过本端口连接。
-      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:16379"
+      # 发布到公网网卡，供另一台机器上的 Windows MT5 Gateway 连接。
+      - "${REDIS_BIND_ADDRESS:-0.0.0.0}:${REDIS_HOST_PORT:-6391}:6391"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli -p 16379 ping | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli -p 6391 ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20

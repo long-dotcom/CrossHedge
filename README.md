@@ -17,7 +17,7 @@ MT5 Terminal 调用已从业务后端运行链路剥离。后端通过 Redis Str
 ```powershell
 Copy-Item .env.example .env
 Copy-Item .mt5-gateway.env.example .mt5-gateway.env
-# 修改两个文件中的 REDIS_PASSWORD，并确保值完全一致。
+# 修改两个文件中的 REDIS_PASSWORD，并在 Gateway 文件中填写服务器公网 IP。
 .\scripts\start_stack.ps1
 .\.venv\Scripts\python.exe -m pip install -r mt5_gateway\requirements.txt
 .\scripts\start_mt5_gateway.ps1
@@ -25,11 +25,13 @@ Copy-Item .mt5-gateway.env.example .mt5-gateway.env
 
 `start_stack.ps1` 会检查前端和 Redis 宿主机端口；默认端口被占用时自动选择下一个
 可用端口，并将本次结果写入不提交仓库的 `.runtime.env`。Redis 容器内部使用
-`16379`，宿主机端口只绑定 `127.0.0.1`。
+`6391`，并通过 `REDIS_BIND_ADDRESS=0.0.0.0` 发布到服务器全部网络接口。
 
 Redis 地址和密码通过环境变量显式配置：Docker 服务读取根目录 `.env` 中的
 `REDIS_URL`、`REDIS_PASSWORD`，Windows Gateway 读取 `.mt5-gateway.env` 中的同名变量。
-两个文件的密码必须完全一致，Gateway 地址使用宿主机回环地址及 `REDIS_HOST_PORT`。
+两个文件的密码必须完全一致；Gateway 的 `REDIS_URL` 使用项目服务器公网 IP 及
+`REDIS_HOST_PORT`。服务器系统防火墙和云安全组必须放行该 TCP 端口，建议仅允许
+MT5 机器的固定公网出口 IP。Redis 密码认证不加密传输内容，不应使用弱密码。
 
 首次启动只生成 JWT 和交易所凭证加密密钥，持久化在 Docker `app_secrets` 卷中。
 重启或重新创建容器不会覆盖这些密钥；删除该卷会导致登录令牌失效，

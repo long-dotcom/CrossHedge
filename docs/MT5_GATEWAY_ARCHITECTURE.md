@@ -53,8 +53,9 @@ CrossHedge 现在分为两类运行环境：
 
 ## 安全与故障处理
 
-- Redis 端口只绑定 `127.0.0.1`。如果 Gateway 位于另一台 Windows 主机，必须使用受控内网、TLS/VPN 和 Redis ACL，不能直接暴露公网。
+- Redis 通过 `REDIS_BIND_ADDRESS` 和 `REDIS_HOST_PORT` 发布；当前部署示例使用 `0.0.0.0:6391` 供远程 Windows Gateway 通过服务器公网 IP 连接。服务器防火墙和云安全组应只允许 MT5 机器的固定公网出口 IP，禁止对所有来源开放。
 - Redis 使用非默认端口并强制密码认证；地址和密码由 `.env` 与 `.mt5-gateway.env` 的 `REDIS_URL`、`REDIS_PASSWORD` 显式配置，不再随机生成。JWT 与交易所加密密钥仍由首次启动初始化并持久化在 `app_secrets` 卷中。
+- Redis 原生密码认证不提供传输加密；直接公网连接会暴露流量元数据和明文协议内容，必须使用强随机密码，并优先在防火墙层限制来源 IP。
 - 账户和持仓快照具有 TTL。Gateway 停止后后端不会长期使用陈旧数据。
 - Redis 使用 AOF 和 `noeviction`，避免内存淘汰交易命令。生产环境仍需配置持久化、监控和容量告警。
 - Redis Stream 提供至少一次投递语义；幂等键是避免重复下单的必要条件。
@@ -79,7 +80,7 @@ Market 模式按现有双腿调度并发提交。Maker 模式先完成加密 Pos
 ```powershell
 $env:RUN_REDIS_INTEGRATION = "1"
 $redisContainer = (docker compose ps -q redis).Trim()
-$redisPort = ((docker port $redisContainer 16379/tcp) -split ':')[-1]
+$redisPort = ((docker port $redisContainer 6391/tcp) -split ':')[-1]
 $redisPassword = (Get-Content .env | Where-Object { $_ -match '^REDIS_PASSWORD=' } | Select-Object -First 1).Split('=', 2)[1]
 $env:REDIS_INTEGRATION_URL = "redis://:$redisPassword@127.0.0.1:$redisPort/15"
 .\.venv\Scripts\python.exe -m pytest backend/tests/test_mt5_redis_integration.py -q

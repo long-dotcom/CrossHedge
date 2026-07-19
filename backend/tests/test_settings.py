@@ -90,7 +90,7 @@ def test_secret_files_override_environment_and_secure_redis_url(monkeypatch, tmp
     monkeypatch.setenv("JWT_SECRET", "jwt-from-environment")
     monkeypatch.setenv("JWT_SECRET_FILE", str(jwt_file))
     monkeypatch.setenv("EXCHANGE_CONFIG_SECRET_FILE", str(exchange_file))
-    monkeypatch.setenv("REDIS_URL", "redis://redis:16379/0")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6391/0")
     monkeypatch.setenv("REDIS_PASSWORD_FILE", str(redis_file))
     get_settings.cache_clear()
 
@@ -98,5 +98,5 @@ def test_secret_files_override_environment_and_secure_redis_url(monkeypatch, tmp
 
     assert settings.security.jwt_secret == "jwt-from-file"
     assert settings.security.exchange_config_secret == "exchange-from-file"
-    assert settings.redis.url == "redis://:redis-password@redis:16379/0"
+    assert settings.redis.url == "redis://:redis-password@redis:6391/0"
     get_settings.cache_clear()
