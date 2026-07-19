@@ -22,6 +22,6 @@ if ((Test-Path $EnvFile) -and (-not $Force)) {
 
 Copy-Item -Path $EnvExample -Destination $EnvFile -Force
 
-Write-Host ".env created. JWT、交易所加密密钥和 Redis 密码将在首次启动时自动生成。"
+Write-Host ".env created. 请手动填写 JWT_SECRET、EXCHANGE_CONFIG_SECRET 和 REDIS_PASSWORD。"
 Write-Host "如需指定 MT5 登录参数，请复制 .mt5-gateway.env.example 为 .mt5-gateway.env。"
 Write-Host $EnvFile

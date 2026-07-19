@@ -1,16 +1,4 @@
 services:
-  secrets-init:
-    image: python:3.12-alpine
-    restart: "no"
-    command: ["python", "/opt/crosshedge/init-secrets.py"]
-    environment:
-      # 升级旧部署时仅用于首次迁移；新安装不再在 .env 中配置这两个值。
-      LEGACY_JWT_SECRET: ${JWT_SECRET:-}
-      LEGACY_EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:-}
-    volumes:
-      - ./docker/init-secrets.py:/opt/crosshedge/init-secrets.py:ro
-      - app_secrets:/run/crosshedge-secrets
-
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -60,19 +48,15 @@ services:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
       REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
-      JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
-      EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
+      JWT_SECRET: ${JWT_SECRET:?请在环境变量中配置 JWT_SECRET}
+      EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:?请在环境变量中配置 EXCHANGE_CONFIG_SECRET}
       ENVIRONMENT: ${ENVIRONMENT:-local}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
       QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
       SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
       SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
-    volumes:
-      - app_secrets:/run/crosshedge-secrets:ro
     depends_on:
-      secrets-init:
-        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -95,14 +79,12 @@ services:
       DATABASE_URL: postgresql+psycopg2://crosshedge:${POSTGRES_PASSWORD:-crosshedge_local}@postgres:5432/crosshedge
       REDIS_URL: ${REDIS_URL:?请在 .env 中配置 REDIS_URL}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?请在 .env 中配置 REDIS_PASSWORD}
-      JWT_SECRET_FILE: /run/crosshedge-secrets/jwt_secret
-      EXCHANGE_CONFIG_SECRET_FILE: /run/crosshedge-secrets/exchange_config_secret
+      JWT_SECRET: ${JWT_SECRET:?请在环境变量中配置 JWT_SECRET}
+      EXCHANGE_CONFIG_SECRET: ${EXCHANGE_CONFIG_SECRET:?请在环境变量中配置 EXCHANGE_CONFIG_SECRET}
       ENVIRONMENT: ${ENVIRONMENT:-local}
       QUOTE_SOURCE_MODE: ${QUOTE_SOURCE_MODE:-paper}
       SCANNER_INTERVAL_MS: ${SCANNER_INTERVAL_MS:-1000}
       SYMBOL_MAPPING_PATH: /app/config/symbol_mappings.yaml
-    volumes:
-      - app_secrets:/run/crosshedge-secrets:ro
     depends_on:
       backend:
         condition: service_healthy
@@ -121,4 +103,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  app_secrets:
