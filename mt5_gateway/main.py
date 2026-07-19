@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 from redis import Redis
-from redis.exceptions import ResponseError
+from redis.exceptions import RedisError, ResponseError
 from loguru import logger
 
 # 原生实现保留在独立进程加载路径；业务后端导出的是 Redis 代理连接器。
@@ -43,6 +43,13 @@ class MT5Gateway:
         self.events = redis_key("mt5", "events")
         self.stop_event = threading.Event()
         self.symbols: set[str] = set()
+        self._instrument_cache: dict[str, Any] = {}
+        self._instrument_refresh_at: dict[str, float] = {}
+        self._redis_state_lock = threading.Lock()
+        self._redis_unavailable = False
+        self._last_redis_warning_at = 0.0
+        self._redis_retry_initial_seconds = 1.0
+        self._redis_retry_max_seconds = 15.0
         self.connector = connector or NativeMT5Connector(
             credentials={"login": settings.mt5.login, "password": settings.mt5.password, "server": settings.mt5.server},
             environment=gateway_environment,
@@ -60,30 +67,46 @@ class MT5Gateway:
         )
 
     def run(self) -> None:
-        self.redis.ping()
         self.connector.subscribe_private_events(self._publish_event)
         self.connector.start()
-        try:
-            self.redis.xgroup_create(self.commands, self.group, id="0-0", mkstream=True)
-        except ResponseError as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
         snapshot_thread = threading.Thread(target=self._snapshot_loop, name="mt5-snapshots", daemon=True)
         snapshot_thread.start()
+        retry_seconds = self._redis_retry_initial_seconds
         try:
-            self._recover_pending()
             while not self.stop_event.is_set():
-                rows = self.redis.xreadgroup(
-                    self.group, self.consumer, {self.commands: ">"}, count=20, block=1000,
-                )
-                for _, messages in rows:
-                    for message_id, fields in messages:
-                        self._handle(message_id, fields)
+                try:
+                    self._run_redis_session()
+                    retry_seconds = self._redis_retry_initial_seconds
+                except (RedisError, OSError) as exc:
+                    if self.stop_event.is_set():
+                        break
+                    self._mark_redis_unavailable("命令消费", exc)
+                    if self.stop_event.wait(retry_seconds):
+                        break
+                    retry_seconds = min(retry_seconds * 2, self._redis_retry_max_seconds)
         finally:
             self.stop_event.set()
             snapshot_thread.join(timeout=3)
             self.connector.stop()
             self._write_health(False, "Gateway 已停止")
+
+    def _run_redis_session(self) -> None:
+        """建立一次 Redis 会话；断线异常交给外层退避重连。"""
+        self.redis.ping()
+        try:
+            self.redis.xgroup_create(self.commands, self.group, id="0-0", mkstream=True)
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+        self._mark_redis_connected()
+        self._recover_pending()
+        while not self.stop_event.is_set():
+            rows = self.redis.xreadgroup(
+                self.group, self.consumer, {self.commands: ">"}, count=20, block=1000,
+            )
+            for _, messages in rows:
+                for message_id, fields in messages:
+                    self._handle(message_id, fields)
 
     def stop(self, *_: Any) -> None:
         self.stop_event.set()
@@ -126,7 +149,7 @@ class MT5Gateway:
         if operation == "get_instruments":
             return self.connector.get_instruments(payload.get("symbols"))
         if operation == "get_instrument":
-            return self.connector.get_instrument(payload["symbol"], refresh=bool(payload.get("refresh")))
+            return self._instrument_snapshot(payload["symbol"], refresh=bool(payload.get("refresh")))
         if operation == "get_ticker":
             return self.connector.get_ticker(payload["symbol"])
         if operation == "get_order_book":
@@ -234,37 +257,88 @@ class MT5Gateway:
         interval = max(self.settings.quote.mt5_quote_poll_interval_ms / 1000, 0.05)
         while not self.stop_event.is_set():
             try:
-                ttl = self.settings.redis.mt5_snapshot_ttl_seconds
-                account = self.connector.get_account()
-                positions = self.connector.get_positions()
-                pipe = self.redis.pipeline(transaction=False)
-                pipe.set(redis_key("mt5", "snapshot", "account"), codec.dumps(account), ex=ttl)
-                pipe.set(redis_key("mt5", "snapshot", "positions"), codec.dumps(positions), ex=ttl)
-                for symbol in tuple(self.symbols):
-                    ticker = self.connector.get_ticker(symbol)
-                    book = self.connector.get_order_book(symbol, 20)
-                    pipe.set(redis_key("mt5", "ticker", symbol), codec.dumps(ticker), ex=ttl)
-                    pipe.set(redis_key("mt5", "orderbook", symbol), codec.dumps(book), ex=ttl)
-                pipe.execute()
-                self._write_health(True)
+                self._snapshot_once()
             except Exception as exc:
                 self._write_health(False, f"{type(exc).__name__}: {exc}")
             self.stop_event.wait(interval)
 
+    def _snapshot_once(self) -> None:
+        """生成一轮只读快照；品种规格在 Gateway 内低频刷新。"""
+        ttl = self.settings.redis.mt5_snapshot_ttl_seconds
+        account = self.connector.get_account()
+        positions = self.connector.get_positions()
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.set(redis_key("mt5", "snapshot", "account"), codec.dumps(account), ex=ttl)
+        pipe.set(redis_key("mt5", "snapshot", "positions"), codec.dumps(positions), ex=ttl)
+        for symbol in tuple(self.symbols):
+            instrument = self._instrument_snapshot(symbol)
+            ticker = self.connector.get_ticker(symbol)
+            book = self.connector.get_order_book(symbol, 20)
+            pipe.set(redis_key("mt5", "snapshot", "instrument", symbol), codec.dumps(instrument), ex=ttl)
+            pipe.set(redis_key("mt5", "ticker", symbol), codec.dumps(ticker), ex=ttl)
+            pipe.set(redis_key("mt5", "orderbook", symbol), codec.dumps(book), ex=ttl)
+        pipe.set(
+            redis_key("mt5", "health"), codec.dumps(self._health_payload(True)),
+            ex=self.settings.redis.mt5_heartbeat_ttl_seconds,
+        )
+        pipe.execute()
+        self._mark_redis_connected()
+
+    def _instrument_snapshot(self, symbol: str, *, refresh: bool = False):
+        normalized = str(symbol)
+        now = time.monotonic()
+        cached = self._instrument_cache.get(normalized)
+        if not refresh and cached is not None and now < self._instrument_refresh_at.get(normalized, 0.0):
+            return cached
+        instrument = self.connector.get_instrument(normalized, refresh=refresh)
+        self._instrument_cache[normalized] = instrument
+        interval = max(float(self.settings.venues.instrument_refresh_seconds), 1.0)
+        self._instrument_refresh_at[normalized] = now + interval
+        return instrument
+
     def _write_health(self, connected: bool, error: str = "") -> None:
-        health = {
+        try:
+            self.redis.set(
+                redis_key("mt5", "health"), codec.dumps(self._health_payload(connected, error)),
+                ex=self.settings.redis.mt5_heartbeat_ttl_seconds,
+            )
+            self._mark_redis_connected()
+        except (RedisError, OSError) as exc:
+            self._mark_redis_unavailable("健康状态写入", exc)
+
+    def _health_payload(self, connected: bool, error: str = "") -> dict[str, Any]:
+        return {
             "status": "ok" if connected else "degraded", "connected": connected,
             "consumer": self.consumer, "environment": self.connector.environment,
             "read_only": self.connector.read_only,
             "updated_at": time.time(), "error": error,
         }
-        self.redis.set(
-            redis_key("mt5", "health"), codec.dumps(health),
-            ex=self.settings.redis.mt5_heartbeat_ttl_seconds,
-        )
 
     def _publish_event(self, event) -> None:
-        self.redis.xadd(self.events, {"data": codec.dumps(event)}, maxlen=10000, approximate=True)
+        try:
+            self.redis.xadd(self.events, {"data": codec.dumps(event)}, maxlen=10000, approximate=True)
+            self._mark_redis_connected()
+        except (RedisError, OSError) as exc:
+            # Redis 恢复后由订单/持仓对账补齐断线期间事件，不能让回调终止 Gateway。
+            self._mark_redis_unavailable("私有事件发布", exc)
+
+    def _mark_redis_unavailable(self, operation: str, exc: Exception) -> None:
+        now = time.monotonic()
+        with self._redis_state_lock:
+            self._redis_unavailable = True
+            should_log = now - self._last_redis_warning_at >= 5.0
+            if should_log:
+                self._last_redis_warning_at = now
+        if should_log:
+            logger.warning("Redis 暂时不可用，Gateway 将继续重连: operation={}, error={}", operation, exc)
+
+    def _mark_redis_connected(self) -> None:
+        with self._redis_state_lock:
+            recovered = self._redis_unavailable
+            self._redis_unavailable = False
+            self._last_redis_warning_at = 0.0
+        if recovered:
+            logger.info("Redis 连接已恢复，Gateway 继续运行")
 
 
 def main() -> None:
