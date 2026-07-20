@@ -207,7 +207,12 @@ class PaperConnector:
                 request.side.value == "sell" and request.price is not None and request.price <= best_bid
             )
             if marketable:
-                return self._snapshot(request, venue_order_id, OrderStatus.REJECTED)
+                return self._snapshot(
+                    request,
+                    venue_order_id,
+                    OrderStatus.REJECTED,
+                    error_message="Paper Post-only 订单会立即成交，模拟器拒绝挂单",
+                )
             return self._snapshot(request, venue_order_id, OrderStatus.ACCEPTED)
 
         levels = book.asks if request.side.value == "buy" else book.bids
@@ -224,7 +229,16 @@ class PaperConnector:
         average = notional / filled if filled > 0 else None
         status = OrderStatus.FILLED if remaining <= 0 else OrderStatus.PARTIALLY_FILLED if filled > 0 else OrderStatus.REJECTED
         fee_rate = self._maker_fee_rate if request.post_only else self._taker_fee_rate
-        return self._snapshot(request, venue_order_id, status, filled, average, notional * fee_rate)
+        error_message = "" if filled > 0 else "Paper 盘口没有可用深度，订单未成交"
+        return self._snapshot(
+            request,
+            venue_order_id,
+            status,
+            filled,
+            average,
+            notional * fee_rate,
+            error_message=error_message,
+        )
 
     def _snapshot(
         self,
@@ -234,6 +248,8 @@ class PaperConnector:
         filled: Decimal = Decimal("0"),
         average: Decimal | None = None,
         commission: Decimal = Decimal("0"),
+        *,
+        error_message: str = "",
     ) -> OrderSnapshot:
         return OrderSnapshot(
             venue=self.venue,
@@ -250,6 +266,8 @@ class PaperConnector:
             price=request.price,
             commission=commission,
             position_side=request.position_side,
+            error_message=error_message,
+            raw={"error_message": error_message} if error_message else {},
         )
 
     def _record_fill(self, order: OrderSnapshot, request: OrderRequest) -> None:

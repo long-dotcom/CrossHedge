@@ -479,6 +479,7 @@ class HybridPaperProbeConnector:
             price=Decimal(str(state["price"])) if state.get("price") else None,
             commission=Decimal("0"),
             position_side=PositionSide(str(state["strategy_position_side"])),
+            error_message=str(state.get("error") or "") if status == OrderStatus.REJECTED else "",
             raw={"paper_execution": "real_minimum_probe", "probe_status": state.get("stage")},
         )
 
@@ -495,6 +496,7 @@ class HybridPaperProbeConnector:
             remaining_quantity=request.quantity,
             price=request.price,
             position_side=request.position_side,
+            error_message=message,
             raw={"error_message": message, "paper_execution": "real_minimum_probe"},
         )
 

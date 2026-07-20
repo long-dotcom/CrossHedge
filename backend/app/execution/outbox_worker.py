@@ -17,14 +17,16 @@ from typing import Any, Callable
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.logging import get_logger
 from app.core.time_utils import utc_now
-from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, HedgeGroupEvent, Order, VenueOrder
+from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, HedgeGroupEvent, Order, SystemLog, VenueOrder
 from app.db.session import SessionLocal
 from app.venues.domain.models import OrderRequest, OrderStatus, OrderType, PositionSide, Side, TimeInForce
 from app.venues.manager import native_venue_manager
 
 
 AdapterFactory = Callable[[str, str], Any]
+logger = get_logger(__name__)
 
 NON_TERMINAL_ORDER_STATUSES = {
     "INITIALIZED", "NEW", "SUBMITTED", "ACCEPTED", "PENDING", "OPEN",
@@ -272,6 +274,7 @@ def _process_claim(
 
         # 多腿外部调用并行发出，数据库更新仍在当前线程串行完成。
         completed: list[tuple[DispatchCommand, Any]] = []
+        failed: list[tuple[DispatchCommand, Exception]] = []
         unknown: list[tuple[DispatchCommand, Exception]] = []
         with ThreadPoolExecutor(max_workers=max(len(commands), 1), thread_name_prefix="execution-leg") as executor:
             futures = {executor.submit(_submit_dispatch_command, adapter_factory, command): command for command in commands}
@@ -280,7 +283,10 @@ def _process_claim(
                 try:
                     completed.append((command, future.result()))
                 except Exception as exc:
-                    unknown.append((command, exc))
+                    if _exception_outcome_unknown(exc):
+                        unknown.append((command, exc))
+                    else:
+                        failed.append((command, exc))
 
         outbox = db.get(ExecutionOutbox, claim.outbox_id)
         intent = db.get(ExecutionIntent, outbox.intent_id) if outbox else None
@@ -291,10 +297,17 @@ def _process_claim(
             venue_order = db.get(VenueOrder, command.venue_order_id)
             if leg is not None and venue_order is not None:
                 _apply_gateway_result(db, outbox, intent, leg, venue_order, result)
+        for command, exc in failed:
+            _persist_dispatch_exception(db, outbox, intent, command, exc, outcome_unknown=False)
+        for command, exc in unknown:
+            _persist_dispatch_exception(db, outbox, intent, command, exc, outcome_unknown=True)
         db.flush()
         legs = db.query(ExecutionLeg).filter(ExecutionLeg.intent_id == intent.id).order_by(ExecutionLeg.id).all()
         if unknown:
-            detail = "; ".join(f"{command.client_order_id}:{exc}" for command, exc in unknown)
+            detail = "; ".join(
+                f"{command.client_order_id}:{_exception_message(exc, outcome_unknown=True)}"
+                for command, exc in unknown
+            )
             # 外部调用结果未知，只允许之后按稳定 ClientOrderId 查询恢复。
             outbox.status = "PROCESSING"
             outbox.locked_at = utc_now()
@@ -537,6 +550,10 @@ def _apply_gateway_result(
     else:
         leg.status = "SUBMITTED"
     _append_execution_event(db, outbox, intent, leg, venue_order, result, reconciliation=reconciliation)
+    if status in FAILURE_ORDER_STATUSES:
+        message = _result_error_message(result) or f"{leg.venue} 返回订单终态 {status}，未提供详细原因"
+        intent.error_message = message
+        _record_execution_failure(db, intent, leg, venue_order, message, source="venue_result")
 
 
 def _sync_legacy_order_and_fills(db: Session, venue_order: VenueOrder, result: Any) -> None:
@@ -550,7 +567,7 @@ def _sync_legacy_order_and_fills(db: Session, venue_order: VenueOrder, result: A
     order.external_order_id = venue_order.venue_order_id
     if venue_order.average_price is not None:
         order.price = venue_order.average_price
-    order.error_message = str(getattr(result, "error_message", "") or "")
+    order.error_message = _result_error_message(result)
     recorded = sum(
         abs(float(quantity or 0.0))
         for (quantity,) in db.query(Fill.quantity).filter(Fill.order_id == order.id).all()
@@ -605,6 +622,147 @@ def _append_execution_event(
         payload=canonical,
         processed_at=utc_now(),
     ))
+
+
+def _persist_dispatch_exception(
+    db: Session,
+    outbox: ExecutionOutbox,
+    intent: ExecutionIntent,
+    command: DispatchCommand,
+    exc: Exception,
+    *,
+    outcome_unknown: bool,
+) -> None:
+    """持久化下单调用异常，避免异常只存在于 Worker 内存或容器标准输出。"""
+    leg = db.get(ExecutionLeg, command.leg_id)
+    venue_order = db.get(VenueOrder, command.venue_order_id)
+    if leg is None or venue_order is None:
+        return
+    message = _exception_message(exc, outcome_unknown=outcome_unknown)
+    status = "UNKNOWN" if outcome_unknown else "REJECTED"
+    venue_order.status = status
+    venue_order.reconciliation_state = "SUBMIT_UNKNOWN" if outcome_unknown else "SUBMIT_FAILED"
+    venue_order.last_event_at = utc_now()
+    venue_order.raw_last_report = json.dumps({
+        "success": False,
+        "status": status.lower(),
+        "message": message,
+        "exception_type": type(exc).__name__,
+        "outcome_unknown": outcome_unknown,
+        "client_order_id": command.client_order_id,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    leg.status = "UNKNOWN" if outcome_unknown else "FAILED"
+    if venue_order.legacy_order_id is not None:
+        order = db.get(Order, venue_order.legacy_order_id)
+        if order is not None:
+            order.status = "unknown" if outcome_unknown else "failed"
+            order.error_message = message
+    intent.error_message = message
+    _append_execution_event(
+        db,
+        outbox,
+        intent,
+        leg,
+        venue_order,
+        _FailureResult(status=status, error_message=message),
+        reconciliation=False,
+    )
+    _record_execution_failure(
+        db,
+        intent,
+        leg,
+        venue_order,
+        message,
+        source="submit_exception_unknown" if outcome_unknown else "submit_exception",
+        exception_type=type(exc).__name__,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureResult:
+    status: str
+    error_message: str
+    venue_order_id: str = ""
+    filled_quantity: float = 0.0
+    average_price: float = 0.0
+    commission: float = 0.0
+
+
+def _record_execution_failure(
+    db: Session,
+    intent: ExecutionIntent,
+    leg: ExecutionLeg,
+    venue_order: VenueOrder,
+    message: str,
+    *,
+    source: str,
+    exception_type: str = "",
+) -> None:
+    context = json.dumps({
+        "source": source,
+        "outcome_unknown": source == "submit_exception_unknown",
+        "intent_id": intent.id,
+        "hedge_group_id": intent.hedge_group_id,
+        "leg_id": leg.id,
+        "venue_order_id": venue_order.id,
+        "client_order_id": venue_order.client_order_id,
+        "external_order_id": venue_order.venue_order_id,
+        "venue": leg.venue,
+        "symbol": leg.venue_symbol,
+        "execution_mode": intent.execution_mode,
+        "order_status": venue_order.status,
+        "exception_type": exception_type,
+        "error_message": message,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    db.add(SystemLog(
+        level="error",
+        category="execution",
+        message=f"订单执行失败: Intent #{intent.id} {leg.venue}:{leg.venue_symbol}",
+        context=context,
+    ))
+    logger.error(
+        "订单执行失败: intent_id={}, leg_id={}, venue={}, symbol={}, client_order_id={}, source={}, error={}",
+        intent.id,
+        leg.id,
+        leg.venue,
+        leg.venue_symbol,
+        venue_order.client_order_id,
+        source,
+        message,
+    )
+
+
+def _exception_outcome_unknown(exc: Exception) -> bool:
+    marker = getattr(exc, "outcome_unknown", None)
+    if marker is not None:
+        return bool(marker)
+    # 本地参数/权限错误确定发生在提交之前；其他未分类异常按结果未知处理，避免误重发。
+    return not isinstance(exc, (PermissionError, ValueError, LookupError))
+
+
+def _exception_message(exc: Exception, *, outcome_unknown: bool | None = None) -> str:
+    unknown = _exception_outcome_unknown(exc) if outcome_unknown is None else outcome_unknown
+    details = [f"{type(exc).__name__}: {exc}"]
+    for name in ("code", "status", "retry_after"):
+        value = getattr(exc, name, None)
+        if value is not None:
+            details.append(f"{name}={value}")
+    details.append(f"outcome_unknown={unknown}")
+    return "; ".join(details)
+
+
+def _result_error_message(result: Any) -> str:
+    direct = str(getattr(result, "error_message", "") or "").strip()
+    if direct:
+        return direct
+    raw = getattr(result, "raw", {}) or {}
+    if not isinstance(raw, dict):
+        return ""
+    for key in ("error_message", "message", "msg", "reject_reason", "rejectReason", "reason", "r"):
+        value = str(raw.get(key) or "").strip()
+        if value and value.upper() not in {"NONE", "NO_ERROR"}:
+            return value
+    return ""
 
 
 def _recover_without_resubmit(
@@ -678,12 +836,13 @@ def _finish_command(
         intent.status = "COMPLETED"
         intent.completed_at = intent.completed_at or utc_now()
     elif "FAILED" in statuses:
+        detail = _intent_failure_detail(db, intent.id)
         if statuses & {"PLANNED", "SUBMITTED", "PARTIALLY_FILLED", "UNKNOWN"}:
             intent.status = "RECOVERY_REQUIRED"
-            intent.error_message = "至少一腿失败且仍有非终态订单，继续对账并禁止重复提交"
+            intent.error_message = detail or "至少一腿失败且仍有非终态订单，继续对账并禁止重复提交"
         else:
             intent.status = "FAILED"
-            intent.error_message = "至少一条执行腿被 venue 拒绝或失败"
+            intent.error_message = detail or "至少一条执行腿被 venue 拒绝或失败"
             intent.completed_at = intent.completed_at or utc_now()
     else:
         intent.status = "RUNNING"
@@ -858,8 +1017,21 @@ def _result_payload(result: Any) -> dict[str, Any]:
         "filled_quantity": float(getattr(result, "filled_quantity", 0.0) or 0.0),
         "average_price": float(getattr(result, "average_price", 0.0) or 0.0),
         "fee": float(getattr(result, "commission", 0.0) or 0.0),
-        "message": str(getattr(result, "error_message", "") or ""),
+        "message": _result_error_message(result),
     }
+
+
+def _intent_failure_detail(db: Session, intent_id: int) -> str:
+    rows = (
+        db.query(Order.error_message)
+        .join(VenueOrder, VenueOrder.legacy_order_id == Order.id)
+        .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+        .filter(ExecutionLeg.intent_id == intent_id, Order.error_message != "")
+        .order_by(Order.id)
+        .all()
+    )
+    messages = list(dict.fromkeys(str(message or "").strip() for (message,) in rows if message))
+    return "; ".join(messages)
 
 
 def _event_type(status: str) -> str:

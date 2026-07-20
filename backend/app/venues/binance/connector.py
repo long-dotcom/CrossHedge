@@ -414,6 +414,7 @@ class BinanceFuturesConnector:
             average_price=average if average and average > 0 else None,
             price=_optional_decimal(data.get("price")) or (fallback.price if fallback else None),
             position_side=PositionSide.NET if raw_position_side == "BOTH" else PositionSide(raw_position_side),
+            error_message=str(data.get("msg") or data.get("rejectReason") or ""),
             updated_at=_millis_datetime(data.get("updateTime")) or utc_now(),
             raw=data,
         )

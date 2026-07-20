@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
-from app.db.models import Base, ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, VenueOrder
+from app.db.models import Base, ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Order, SystemLog, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
 from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
@@ -40,6 +40,16 @@ class PendingThenFilledAdapter:
 
     def get_order(self, symbol, **kwargs):
         return order_snapshot(venue="binance", symbol=symbol, requested=0.01, filled=0.01, price=4001, commission=0.01, venue_order_id="venue-pending")
+
+
+class FailingAdapter:
+    def __init__(self, *, outcome_unknown: bool = False) -> None:
+        self.outcome_unknown = outcome_unknown
+
+    def submit_order(self, order):
+        error = RuntimeError("Binance 私有 WebSocket 尚未连接")
+        error.outcome_unknown = self.outcome_unknown
+        raise error
 
 
 def _factory_and_session():
@@ -156,3 +166,55 @@ def test_sent_order_is_not_polled_and_explicit_recovery_does_not_resubmit() -> N
         assert db.get(ExecutionIntent, intent_id).status == "COMPLETED"
         assert db.query(VenueOrder).one().status == "FILLED"
         assert db.query(ExecutionEvent).count() == 2
+
+
+def test_deterministic_submit_failure_is_persisted_everywhere() -> None:
+    factory = _factory_and_session()
+    intent_id = _create(factory)
+
+    assert run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: FailingAdapter(),
+    ) == 1
+
+    with factory() as db:
+        intent = db.get(ExecutionIntent, intent_id)
+        order = db.query(Order).one()
+        venue_order = db.query(VenueOrder).one()
+        outbox = db.query(ExecutionOutbox).one()
+        event = db.query(ExecutionEvent).one()
+        system_log = db.query(SystemLog).one()
+        assert intent.status == "FAILED"
+        assert "私有 WebSocket 尚未连接" in intent.error_message
+        assert order.status == "failed"
+        assert order.error_message == intent.error_message
+        assert venue_order.status == "REJECTED"
+        assert outbox.status == "SENT"
+        assert event.event_type == "ORDER_REJECTED"
+        assert "私有 WebSocket 尚未连接" in event.payload
+        assert system_log.category == "execution"
+        assert '"outcome_unknown":false' in system_log.context
+
+
+def test_unknown_submit_failure_keeps_recovery_state_and_records_reason() -> None:
+    factory = _factory_and_session()
+    intent_id = _create(factory)
+
+    assert run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: FailingAdapter(outcome_unknown=True),
+    ) == 1
+
+    with factory() as db:
+        intent = db.get(ExecutionIntent, intent_id)
+        order = db.query(Order).one()
+        venue_order = db.query(VenueOrder).one()
+        outbox = db.query(ExecutionOutbox).one()
+        assert intent.status == "RECOVERY_REQUIRED"
+        assert "私有 WebSocket 尚未连接" in intent.error_message
+        assert order.status == "unknown"
+        assert order.error_message
+        assert venue_order.status == "UNKNOWN"
+        assert outbox.status == "PROCESSING"
+        assert "提交结果未知" in outbox.last_error
+        assert db.query(SystemLog).filter_by(category="execution").count() == 1
