@@ -13,7 +13,8 @@
 - PUT  /settings/symbol-mappings                           —— 批量更新品种映射
 - PUT  /settings/symbol-mappings/{mapping_id}              —— 更新单个品种映射
 - DELETE /settings/symbol-mappings/{mapping_id}            —— 删除品种映射
-- POST /settings/symbol-mappings/{mapping_id}/sync-broker  —— 从 MT5 同步品种信息
+- POST /settings/symbol-mappings/{mapping_id}/sync-instruments —— 从两侧交易所同步品种信息
+- POST /settings/symbol-mappings/{mapping_id}/sync-broker  —— 兼容旧版的品种同步入口
 - POST /settings/symbol-mappings/{mapping_id}/sync-sessions —— 同步会话模板
 - GET  /settings/exchanges                                 —— 交易所凭据列表
 - POST /settings/exchanges                                 —— 新建交易所凭据
@@ -102,19 +103,99 @@ def _clear_scan_results_for_symbols(db: Session, symbols: set[str]) -> None:
 
 
 def _effective_min_order_size(row: SymbolMapping) -> float:
-    """根据 MT5 最小基数、leg_a 最小基数和报价计算有效最小下单量。"""
+    """根据 MT5 与加密腿的最小限制计算有效基础资产下单量。"""
     from app.adapters.venue import mapping_leg
-    leg_a_venue, _ = mapping_leg(row, "a")
-    leg_a_quote = quote_cache.latest(leg_a_venue, row.symbol)
-    leg_a_mid = leg_a_quote.mid if leg_a_quote else 0.0
-    leg_a_notional_base = (row.leg_a_min_notional / leg_a_mid) if leg_a_mid > 0 and row.leg_a_min_notional > 0 else 0.0
-    return max(row.mt5_min_base_size or 0.0, row.leg_a_min_base_size or 0.0, leg_a_notional_base)
+
+    crypto_venue = next(
+        (venue for leg in ("a", "b") if (venue := mapping_leg(row, leg)[0]) != "mt5"),
+        "",
+    )
+    crypto_quote = quote_cache.latest(crypto_venue, row.symbol) if crypto_venue else None
+    crypto_mid = crypto_quote.mid if crypto_quote else 0.0
+    notional_base = (
+        row.leg_a_min_notional / crypto_mid
+        if crypto_mid > 0 and row.leg_a_min_notional > 0
+        else 0.0
+    )
+    return max(row.mt5_min_base_size or 0.0, row.leg_a_min_base_size or 0.0, notional_base)
 
 
 def _decimal_places(value: float) -> int:
     """计算浮点数的小数位数。"""
     text = f"{value:.12f}".rstrip("0").rstrip(".")
     return len(text.split(".", 1)[1]) if "." in text else 0
+
+
+def _mapping_legs(row: SymbolMapping) -> list[tuple[str, str, str]]:
+    """返回去重后的映射腿，供交易所规格同步使用。"""
+    from app.adapters.venue import mapping_leg
+
+    legs: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for leg in ("a", "b"):
+        venue, symbol = mapping_leg(row, leg)
+        key = (str(venue).lower(), str(symbol))
+        if key not in seen:
+            legs.append((leg, *key))
+            seen.add(key)
+    return legs
+
+
+def _sync_mapping_instruments(row: SymbolMapping) -> list[dict[str, Any]]:
+    """同步映射两腿规格；通用精度始终来自非 MT5 执行腿。"""
+    synced: list[dict[str, Any]] = []
+    crypto_instrument = None
+    mt5_instrument = None
+    for leg, venue, symbol in _mapping_legs(row):
+        try:
+            instrument = native_venue_manager.connector_for(venue, "live").get_instrument(symbol, refresh=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{venue} 品种 {symbol} 同步失败: {exc}") from exc
+        if not instrument.trading_enabled:
+            raise HTTPException(status_code=400, detail=f"{venue} 品种 {symbol} 当前不可交易")
+        payload = {
+            "leg": leg,
+            "venue": venue,
+            "symbol": instrument.symbol,
+            "quantity_step": float(instrument.quantity_step),
+            "minimum_quantity": float(instrument.minimum_quantity),
+            "price_tick": float(instrument.price_tick),
+            "minimum_notional": float(instrument.minimum_notional),
+        }
+        synced.append(payload)
+        if venue == "mt5":
+            mt5_instrument = instrument
+        else:
+            if crypto_instrument is not None:
+                raise HTTPException(status_code=400, detail="一个品种映射当前只能包含一个非 MT5 执行腿")
+            crypto_instrument = instrument
+
+    if mt5_instrument is not None:
+        info = mt5_instrument.raw
+        row.mt5_min_lot = float(mt5_instrument.minimum_quantity)
+        row.mt5_volume_step = float(mt5_instrument.quantity_step)
+        row.mt5_contract_size = float(mt5_instrument.contract_size)
+        row.mt5_currency_base = mt5_instrument.base_asset
+        row.mt5_currency_profit = mt5_instrument.quote_asset or row.quote_asset or "USD"
+        row.mt5_currency_margin = mt5_instrument.settlement_asset or row.mt5_currency_profit
+        row.mt5_calc_mode = int(info.get("trade_calc_mode", 0) or 0)
+        row.quote_asset = row.mt5_currency_profit or row.quote_asset
+        row.mt5_min_base_size = row.mt5_min_lot * row.mt5_contract_size
+        row.contract_multiplier = row.mt5_contract_size
+
+    if crypto_instrument is not None:
+        quantity_step = float(crypto_instrument.quantity_step)
+        price_tick = float(crypto_instrument.price_tick)
+        row.leg_a_min_base_size = float(crypto_instrument.minimum_quantity)
+        row.leg_a_min_notional = float(crypto_instrument.minimum_notional)
+        row.quantity_precision = max(_decimal_places(quantity_step), 0)
+        # Hyperliquid 的价格规则是动态有效数字，price_tick=0 时保留人工配置。
+        if price_tick > 0:
+            row.min_tick = price_tick
+            row.price_precision = max(_decimal_places(price_tick), 0)
+
+    row.min_order_size = _effective_min_order_size(row)
+    return synced
 
 
 # ---------------------------------------------------------------------------
@@ -293,73 +374,26 @@ def delete_symbol_mapping(
     return {"status": "ok"}
 
 
-@router.post("/symbol-mappings/{mapping_id}/sync-broker")
-def sync_symbol_mapping_from_broker(
+@router.post("/symbol-mappings/{mapping_id}/sync-instruments")
+@router.post("/symbol-mappings/{mapping_id}/sync-broker", include_in_schema=False)
+def sync_symbol_mapping_instruments(
     mapping_id: int,
     user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """通过 MT5 Gateway 同步品种信息到品种映射。"""
+    """从映射两侧交易所同步真实品种规格。"""
     row = db.get(SymbolMapping, mapping_id)
     if not row:
         raise HTTPException(status_code=404, detail="品种映射不存在")
-    from app.venues.manager import native_venue_manager
-    try:
-        instrument = native_venue_manager.connector_for("mt5", "live").get_instrument(row.mt5_symbol, refresh=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"MT5 Gateway 品种同步失败: {exc}") from exc
-    info = instrument.raw
-
-    volume_min = float(instrument.minimum_quantity)
-    volume_step = float(instrument.quantity_step)
-    contract_size = float(instrument.contract_size)
-    currency_base = instrument.base_asset
-    currency_profit = instrument.quote_asset or row.quote_asset or "USD"
-    currency_margin = instrument.settlement_asset or currency_profit
-    calc_mode = int(info.get("trade_calc_mode", 0) or 0)
-    digits = int(info.get("digits", row.price_precision))
-    tick_size = float(instrument.price_tick)
-    mt5_min_base_size = volume_min * contract_size
-    mt5_base_step = volume_step * contract_size
-
-    row.mt5_min_lot = volume_min
-    row.mt5_volume_step = volume_step
-    row.mt5_contract_size = contract_size
-    row.mt5_currency_base = currency_base
-    row.mt5_currency_profit = currency_profit
-    row.mt5_currency_margin = currency_margin
-    row.mt5_calc_mode = calc_mode
-    row.quote_asset = currency_profit or row.quote_asset
-    row.mt5_min_base_size = mt5_min_base_size
-    row.contract_multiplier = contract_size
-    row.leg_a_min_notional = row.leg_a_min_notional or get_settings().hyperliquid.default_min_notional
-    row.min_order_size = _effective_min_order_size(row)
-    row.quantity_precision = max(_decimal_places(mt5_base_step), 0)
-    row.price_precision = digits
-    row.min_tick = tick_size
-
-    audit(db, user.id, "sync_symbol_mapping_from_broker", "settings", row.symbol)
+    instruments = _sync_mapping_instruments(row)
+    audit(db, user.id, "sync_symbol_mapping_instruments", "settings", row.symbol)
     db.commit()
     clear_symbol_mapping_cache()
     clear_signal_stats_cache()
     db.refresh(row)
     return {
         **as_dict(row),
-        "broker": {
-            "volume_min": volume_min,
-            "volume_step": volume_step,
-            "volume_max": float(info.get("volume_max", 0.0)),
-            "trade_contract_size": contract_size,
-            "currency_base": currency_base,
-            "currency_profit": currency_profit,
-            "currency_margin": currency_margin,
-            "trade_calc_mode": calc_mode,
-            "digits": digits,
-            "trade_tick_size": tick_size,
-            "swap_long": float(info.get("swap_long", 0.0)),
-            "swap_short": float(info.get("swap_short", 0.0)),
-            "swap_mode": int(info.get("swap_mode", 0)),
-        },
+        "instruments": instruments,
     }
 
 

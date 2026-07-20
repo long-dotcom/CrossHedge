@@ -125,6 +125,43 @@ def test_connector_maps_instrument_and_hedge_mode_order() -> None:
     assert order.client_order_id == "native-binance-1"
 
 
+@pytest.mark.parametrize(
+    ("side", "raw_price", "expected_price"),
+    [
+        (Side.BUY, Decimal("60000.19"), "60000.10"),
+        (Side.SELL, Decimal("60000.11"), "60000.20"),
+    ],
+)
+def test_connector_normalizes_order_to_exchange_steps(side, raw_price, expected_price) -> None:
+    class CapturingRest(FakeBinanceRest):
+        def __init__(self):
+            self.params = None
+
+        def place_order(self, params):
+            self.params = params
+            return super().place_order(params)
+
+    rest = CapturingRest()
+    connector = BinanceFuturesConnector(rest_client=rest, read_only=False)
+
+    connector.submit_order(
+        OrderRequest(
+            venue="binance",
+            symbol="BTCUSDT",
+            side=side,
+            quantity=Decimal("0.0109"),
+            client_order_id=f"normalized-{side.value}",
+            order_type=OrderType.LIMIT,
+            price=raw_price,
+            post_only=True,
+            position_side=PositionSide.LONG,
+        )
+    )
+
+    assert rest.params["quantity"] == "0.010"
+    assert rest.params["price"] == expected_price
+
+
 def test_read_only_connector_rejects_order_before_network_call() -> None:
     connector = BinanceFuturesConnector(rest_client=FakeBinanceRest(), read_only=True)
     with pytest.raises(PermissionError, match="只读"):
