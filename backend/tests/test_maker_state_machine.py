@@ -156,6 +156,36 @@ def test_market_fallback_is_enqueued_only_after_cancel_confirmation() -> None:
         assert db.get(ExecutionIntent, intent_id).status == "COMPLETED"
 
 
+def test_maker_rejection_preserves_venue_error_instead_of_ttl_message() -> None:
+    factory = _session_factory()
+    intent_id = _create_maker_open(factory)
+    state = {"maker_fill": 0.0}
+
+    class RejectedMakerAdapter(MakerAdapter):
+        def submit_order(self, order):
+            self.state.setdefault("placed", []).append((self.venue, order))
+            return order_snapshot(
+                order,
+                venue=self.venue,
+                status="rejected",
+                error_message="Paper Post-only 订单会立即成交，模拟器拒绝挂单",
+            )
+
+    run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: RejectedMakerAdapter(venue, state),
+    )
+
+    with factory() as db:
+        intent = db.get(ExecutionIntent, intent_id)
+        group = db.get(HedgeGroup, intent.hedge_group_id)
+        venue_order = db.query(VenueOrder).one()
+        assert intent.status == "FAILED"
+        assert intent.error_message == "Paper Post-only 订单会立即成交，模拟器拒绝挂单"
+        assert group.close_reason == intent.error_message
+        assert venue_order.status == "REJECTED"
+
+
 def test_failed_hedge_creates_separate_flatten_compensation() -> None:
     factory = _session_factory()
     intent_id = _create_maker_open(

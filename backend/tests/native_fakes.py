@@ -16,6 +16,7 @@ def order_snapshot(
     filled: float = 0.0,
     price: float = 0.0,
     commission: float = 0.0,
+    error_message: str = "",
 ) -> OrderSnapshot:
     quantity = Decimal(str(requested if requested is not None else getattr(request, "quantity", filled)))
     filled_quantity = Decimal(str(filled))
@@ -32,4 +33,6 @@ def order_snapshot(
         remaining_quantity=max(quantity - filled_quantity, Decimal("0")),
         average_price=Decimal(str(price)) if price else None,
         commission=Decimal(str(commission)),
+        error_message=error_message,
+        raw={"error_message": error_message} if error_message else {},
     )

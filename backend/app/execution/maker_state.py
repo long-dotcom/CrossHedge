@@ -309,6 +309,8 @@ def _complete_maker_intent(
     intent.completed_at = intent.completed_at or utc_now()
     if group is None:
         intent.status = "COMPLETED" if ratio > 0 else "FAILED"
+        if ratio <= 1e-12 and not intent.error_message:
+            intent.error_message = "Maker 到期未成交，未建立敞口"
         return
     event_type = f"maker_{intent.intent_type.lower()}_completed"
     if _group_event_exists(db, group.id, event_type):
@@ -317,7 +319,9 @@ def _complete_maker_intent(
     if intent.intent_type == "OPEN":
         if ratio <= 1e-12:
             group.status = "failed"
-            group.close_reason = "Maker 到期未成交，未建立敞口"
+            # 若交易场所已给出拒绝原因，保留真实原因，不再被 TTL 泛化文案覆盖。
+            intent.error_message = intent.error_message or "Maker 到期未成交，未建立敞口"
+            group.close_reason = intent.error_message
             intent.status = "FAILED"
         else:
             group.status = "open" if ratio >= 1.0 - 1e-9 else "open_partial"
@@ -344,7 +348,8 @@ def _complete_maker_intent(
             group.close_reason = f"Maker 到期后完成 {ratio:.2%} 部分平仓"
         else:
             group.status = str(spec.get("previous_group_status") or "open")
-            group.close_reason = "Maker 到期未成交，平仓取消"
+            intent.error_message = intent.error_message or "Maker 到期未成交，平仓取消"
+            group.close_reason = intent.error_message
         intent.status = "COMPLETED" if ratio > 0 else "FAILED"
     db.add(HedgeGroupEvent(
         hedge_group_id=group.id,

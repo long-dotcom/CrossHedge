@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
+from app.core.logging import get_logger
 from app.core.time_utils import utc_now
 from app.core.redis_client import redis_client, redis_key
 from app.db.models import (
@@ -24,6 +25,7 @@ from app.db.models import (
     Fill as DatabaseFill,
     Order,
     Position as DatabasePosition,
+    SystemLog,
     VenueOrder,
 )
 from app.db.session import SessionLocal
@@ -31,6 +33,7 @@ from app.venues.domain.events import VenueEvent
 
 venue_event_queue: SimpleQueue[VenueEvent] = SimpleQueue()
 _reconciliation_requested = Event()
+logger = get_logger(__name__)
 
 
 def enqueue_venue_event(event: VenueEvent) -> None:
@@ -114,7 +117,7 @@ def _project_event(db, event: VenueEvent) -> tuple[bool, int | None]:
     if venue_order is None or leg is None:
         return True, None
     if event.order is not None:
-        _apply_order(venue_order, leg, event.order)
+        _apply_order(db, venue_order, leg, event.order)
     if event.fill is not None:
         _apply_fill(db, venue_order, leg, event.fill)
     return True, intent_id
@@ -194,7 +197,7 @@ def _find_venue_order(db, client_order_id: str, venue_order_id: str) -> VenueOrd
     return None
 
 
-def _apply_order(venue_order: VenueOrder, leg: ExecutionLeg, snapshot) -> None:
+def _apply_order(db, venue_order: VenueOrder, leg: ExecutionLeg, snapshot) -> None:
     venue_order.venue_order_id = snapshot.venue_order_id or venue_order.venue_order_id
     venue_order.status = snapshot.status.value
     venue_order.filled_quantity = max(float(venue_order.filled_quantity or 0), float(snapshot.filled_quantity))
@@ -206,6 +209,50 @@ def _apply_order(venue_order: VenueOrder, leg: ExecutionLeg, snapshot) -> None:
     venue_order.last_event_at = snapshot.updated_at
     venue_order.raw_last_report = json.dumps(snapshot.raw, ensure_ascii=False, default=_json_default)
     leg.status = _leg_status(snapshot.status.value, venue_order.filled_quantity)
+    error_message = str(getattr(snapshot, "error_message", "") or "").strip()
+    if not error_message and isinstance(snapshot.raw, dict):
+        error_message = str(
+            snapshot.raw.get("error_message")
+            or snapshot.raw.get("msg")
+            or snapshot.raw.get("rejectReason")
+            or snapshot.raw.get("r")
+            or ""
+        ).strip()
+    if error_message.upper() in {"NONE", "NO_ERROR"}:
+        error_message = ""
+    if venue_order.legacy_order_id is not None:
+        order = db.get(Order, venue_order.legacy_order_id)
+        if order is not None:
+            order.status = venue_order.status.lower()
+            order.external_order_id = venue_order.venue_order_id
+            order.error_message = error_message
+    if leg.status == "FAILED":
+        intent = db.get(ExecutionIntent, leg.intent_id)
+        message = error_message or f"{leg.venue} 返回订单终态 {snapshot.status.value}，未提供详细原因"
+        if intent is not None:
+            intent.error_message = message
+        context = json.dumps({
+            "source": "venue_event",
+            "intent_id": leg.intent_id,
+            "leg_id": leg.id,
+            "venue_order_id": venue_order.id,
+            "client_order_id": venue_order.client_order_id,
+            "external_order_id": venue_order.venue_order_id,
+            "venue": leg.venue,
+            "symbol": leg.venue_symbol,
+            "order_status": venue_order.status,
+            "error_message": message,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        db.add(SystemLog(
+            level="error",
+            category="execution",
+            message=f"订单事件失败: Intent #{leg.intent_id} {leg.venue}:{leg.venue_symbol}",
+            context=context,
+        ))
+        logger.error(
+            "订单事件失败: intent_id={}, leg_id={}, venue={}, symbol={}, client_order_id={}, error={}",
+            leg.intent_id, leg.id, leg.venue, leg.venue_symbol, venue_order.client_order_id, message,
+        )
 
 
 def _apply_fill(db, venue_order: VenueOrder, leg: ExecutionLeg, fill) -> None:

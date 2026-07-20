@@ -77,6 +77,8 @@ def test_paper_post_only_marketable_order_is_rejected() -> None:
 
     assert order.status == OrderStatus.REJECTED
     assert order.filled_quantity == 0
+    assert order.error_message == "Paper Post-only 订单会立即成交，模拟器拒绝挂单"
+    assert order.raw["error_message"] == order.error_message
 
 
 def test_paper_resting_maker_can_be_canceled() -> None:

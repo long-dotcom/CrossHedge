@@ -94,6 +94,14 @@ mt5_gateway/
 
 FastAPI 只创建不可变 Intent、ExecutionLeg 和 Outbox。独立执行 Worker 是唯一允许调用 `submit_order` 的业务进程：
 
+- 下单前校验异常、确定性提交失败、结果未知异常以及交易所拒绝都会写入旧订单的
+  `error_message`、Intent、Outbox/ExecutionEvent 和 `SystemLog(category=execution)`；
+  系统日志上下文包含 Intent、执行腿、ClientOrderId、场所、品种、执行模式和原始异常类型。
+- `outcome_unknown=true` 的网络/服务端异常只会进入恢复对账，不会自动重发；确定性错误会直接
+  投影为失败并保留交易场所原始错误。执行记录列表会直接展示失败原因，无需展开订单。
+- Paper 执行不会向真实交易所发送订单。模拟 Post-only 会立即成交时，Paper 撮合器会明确记录
+  “模拟器拒绝挂单”，避免把交易场所拒绝误报为普通 Maker 超时。
+
 1. 先持久化稳定 `client_order_id`。
 2. 并行提交双腿命令。
 3. Binance/Hyperliquid 的 Paper 探针与 Live 订单统一以账户私有 WebSocket 作为成交确认主路径：Hyperliquid 订阅 `orderUpdates`/`userFills`/`clearinghouseState`，Binance 使用 User Data Stream 的订单与 `ACCOUNT_UPDATE`，并每 30 分钟续期 listenKey。账户和持仓事件同步投影到数据库及 Redis。正常运行不轮询 REST 查单或持仓；仅在 Worker 启动或私有流断线重连后执行一次补偿快照。

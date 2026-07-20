@@ -171,6 +171,8 @@ class OrderSnapshot:
     price: Decimal | None = None
     commission: Decimal = Decimal("0")
     position_side: PositionSide = PositionSide.NET
+    # 交易场所返回的原始拒绝/失败原因；终态失败时必须向执行记录继续传递。
+    error_message: str = ""
     updated_at: datetime = field(default_factory=utc_now)
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 

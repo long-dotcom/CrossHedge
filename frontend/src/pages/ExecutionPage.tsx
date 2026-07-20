@@ -76,6 +76,7 @@ export function ExecutionPage() {
     { title: '类型', dataIndex: 'order_type', width: 82, render: orderTypeTag },
     { title: '数量', dataIndex: 'quantity', width: 110, align: 'right', render: (v) => fmtNum(v, 6) },
     { title: '价格', dataIndex: 'price', width: 110, align: 'right', render: fmtMoney },
+    { title: '失败原因', dataIndex: 'error_message', width: 260, ellipsis: true, render: (v) => <EllipsisCell value={v} /> },
     { title: '创建时间', dataIndex: 'created_at', width: 180, render: fmtLocalTime }
   ];
 

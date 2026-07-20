@@ -124,6 +124,7 @@ def order(data: dict[str, Any]) -> OrderSnapshot:
         average_price=_decimal(data["average_price"]) if data.get("average_price") is not None else None,
         price=_decimal(data["price"]) if data.get("price") is not None else None,
         commission=_decimal(data.get("commission")), position_side=PositionSide(data.get("position_side", "NET")),
+        error_message=str(data.get("error_message") or (data.get("raw") or {}).get("error_message") or ""),
         updated_at=_dt(data.get("updated_at")) or utc_now(), raw=data.get("raw", {}),
     )
 

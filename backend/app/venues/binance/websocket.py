@@ -424,6 +424,7 @@ def _order_from_update(data: dict[str, Any], envelope: dict[str, Any]) -> OrderS
         # 手续费只由独立 Fill 事件累计，避免订单事件与 Fill 双计。
         commission=Decimal("0"),
         position_side=PositionSide.NET if raw_position_side == "BOTH" else PositionSide(raw_position_side),
+        error_message="" if str(data.get("r") or "NONE") == "NONE" else str(data.get("r") or ""),
         updated_at=_millis_datetime(envelope.get("T") or envelope.get("E")) or utc_now(),
         raw=data,
     )
