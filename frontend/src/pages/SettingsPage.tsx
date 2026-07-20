@@ -164,10 +164,11 @@ export function SettingsPage() {
       queryClient.invalidateQueries({ queryKey: ['opportunities'] });
     }
   });
-  const syncBroker = useMutation({
-    mutationFn: async (id: number) => (await api.post(`/settings/symbol-mappings/${id}/sync-broker`)).data,
+  const syncInstruments = useMutation({
+    mutationFn: async (id: number) => (await api.post(`/settings/symbol-mappings/${id}/sync-instruments`)).data,
     onSuccess: (data) => {
-      messageApi.success(`已同步 MT5 规格：最小量 ${data.min_order_size}`);
+      const venues = (data.instruments || []).map((item: any) => venueLabel(item.venue)).join('、');
+      messageApi.success(`已同步 ${venues || '两侧交易所'} 品种规格`);
       queryClient.invalidateQueries({ queryKey: ['settings-symbols'] });
     },
     onError: (err: any) => messageApi.error(err.response?.data?.detail || '同步失败')
@@ -361,7 +362,7 @@ export function SettingsPage() {
       render: (_, row) => (
         <Space>
           <Button size="small" onClick={() => openSymbolModal(row)}>编辑</Button>
-          <Button size="small" loading={syncBroker.isPending} onClick={() => syncBroker.mutate(row.id)}>同步MT5</Button>
+          <Button size="small" loading={syncInstruments.isPending} onClick={() => syncInstruments.mutate(row.id)}>同步规格</Button>
           <Popconfirm title="确认删除该映射？" onConfirm={() => deleteSymbol.mutate(row.id)}>
             <Button size="small" danger>删除</Button>
           </Popconfirm>
@@ -522,7 +523,7 @@ export function SettingsPage() {
               label: '交易所配置',
               children: (
                 <Space direction="vertical" size={12} className="full-width">
-                  <Alert type="info" showIcon message="API 密钥会加密保存到数据库且不回显明文。Hyperliquid、MT5、Binance Futures 均使用项目原生连接器；Paper 模式由独立本地撮合引擎执行。" />
+                  <Alert type="info" showIcon message="API 密钥会加密保存到数据库且不回显明文。Hyperliquid、MT5、Binance Futures 均使用项目原生连接器；Paper 模式使用加密交易所真实最小探针与 MT5 Demo。" />
                   <Button type="primary" onClick={() => openExchangeModal()}>新增交易所</Button>
                   <Table rowKey="venue" columns={exchangeColumns} dataSource={exchanges.data || []} loading={exchanges.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1160, (exchanges.data || []).length, 'calc(100vh - 404px)', 8)} />
                 </Space>
@@ -533,7 +534,7 @@ export function SettingsPage() {
               label: '品种映射',
               children: (
                 <Space direction="vertical" size={12} className="full-width">
-                  <Alert type="info" showIcon message="同步 MT5 会写入最小手数、步进、合约大小和计价币种；扫描时按目标 USD 名义价值自动计算两条腿数量。" />
+                  <Alert type="info" showIcon message="同步规格会同时读取两侧交易所：加密交易所同步价格/数量步进及最小下单限制，MT5 同步手数、步进、合约大小和计价币种。" />
                   <Button type="primary" onClick={() => openSymbolModal()}>新增映射</Button>
                   <Table rowKey="id" columns={columns} dataSource={symbolRows} loading={symbols.isLoading} tableLayout="fixed" pagination={{ pageSize: 10 }} scroll={tableScrollAutoY(1474, symbolRows.length, 'calc(100vh - 404px)', 8)} />
                 </Space>
@@ -828,13 +829,14 @@ export function SettingsPage() {
                 forceRender: true,
                 children: <>
                   <div className="mapping-section">
-                    <div className="mapping-section-title">通用精度与最小量</div>
+                    <div className="mapping-section-title">加密交易所精度与最小量</div>
+                    <div className="mapping-section-note">由“同步规格”读取交易所实时规则；Hyperliquid 动态价格有效数字仍保留人工价格配置。</div>
                     <div className="mapping-field-grid mapping-field-grid-3">
                       <Form.Item name="quantity_precision" label="数量精度"><InputNumber min={0} max={8} /></Form.Item>
                       <Form.Item name="price_precision" label="价格精度"><InputNumber min={0} max={8} /></Form.Item>
                       <Form.Item name="min_tick" label="最小价格跳动"><InputNumber min={0} step={0.0001} /></Form.Item>
-                      <Form.Item name="leg_a_min_base_size" label="A 腿最小基础量"><InputNumber min={0} step={0.001} /></Form.Item>
-                      <Form.Item name="leg_a_min_notional" label="A 腿最小名义额"><InputNumber min={0} step={1} /></Form.Item>
+                      <Form.Item name="leg_a_min_base_size" label="加密腿最小基础量"><InputNumber min={0} step={0.001} /></Form.Item>
+                      <Form.Item name="leg_a_min_notional" label="加密腿最小名义额"><InputNumber min={0} step={1} /></Form.Item>
                       <Form.Item name="min_order_size" label="最终最小量（自动）"><InputNumber min={0} step={0.001} disabled /></Form.Item>
                     </div>
                   </div>

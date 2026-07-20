@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
 
 from app.core.time_utils import utc_now
@@ -263,11 +263,18 @@ class BinanceFuturesConnector:
         if not self._ws.private_stream_ready:
             raise RuntimeError("Binance 账户私有 WebSocket 尚未连接，禁止提交无法实时确认的订单")
         symbol = normalize_symbol(request.symbol)
+        instrument = self.get_instrument(symbol)
+        quantity = _floor_to_step(request.quantity, instrument.quantity_step)
+        if quantity < instrument.minimum_quantity:
+            raise ValueError(
+                f"Binance {symbol} 数量 {request.quantity} 规整后为 {quantity}，"
+                f"低于最小数量 {instrument.minimum_quantity}"
+            )
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": request.side.value.upper(),
             "type": request.order_type.value.upper(),
-            "quantity": decimal_text(request.quantity),
+            "quantity": decimal_text(quantity),
             "newClientOrderId": request.client_order_id,
             "newOrderRespType": "RESULT",
         }
@@ -278,7 +285,11 @@ class BinanceFuturesConnector:
         if request.order_type == OrderType.LIMIT:
             if request.price is None:
                 raise ValueError("Binance 限价单缺少价格")
-            params["price"] = decimal_text(request.price)
+            rounding = ROUND_FLOOR if request.side == Side.BUY else ROUND_CEILING
+            price = _round_to_step(request.price, instrument.price_tick, rounding)
+            if price <= 0:
+                raise ValueError(f"Binance {symbol} 限价规整后必须大于 0")
+            params["price"] = decimal_text(price)
             params["timeInForce"] = "GTX" if request.post_only else request.time_in_force.value
         return self._order_from_payload(self.rest.place_order(params), fallback=request)
 
@@ -445,6 +456,19 @@ def _optional_decimal(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     return _decimal(value)
+
+
+def _round_to_step(value: Decimal, step: Decimal, rounding: str) -> Decimal:
+    """按交易所步进规整 Decimal，避免浮点精度产生非法参数。"""
+    if step <= 0:
+        return value
+    units = (value / step).to_integral_value(rounding=rounding)
+    return units * step
+
+
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """数量只向下规整，避免静默放大策略下单规模。"""
+    return _round_to_step(value, step, ROUND_FLOOR)
 
 
 def decimal_text(value: Decimal) -> str:
