@@ -120,11 +120,10 @@ def create_open_intent(
         if not synced:
             record_risk_event(db, "strict_quote_sync", sync_reason, opportunity.symbol)
             raise ValueError(sync_reason)
-        if refreshed:
-            still_executable, refresh_reason = refreshed_opportunity_still_executable(opportunity, synced, strategy)
-            if not still_executable and not force_strategy_checks:
-                record_risk_event(db, "execution_quote_refresh", refresh_reason, opportunity.symbol)
-                raise ValueError(refresh_reason)
+        still_executable, refresh_reason = refreshed_opportunity_still_executable(opportunity, synced, strategy)
+        if not still_executable and not force_strategy_checks:
+            record_risk_event(db, "execution_quote_recheck", refresh_reason, opportunity.symbol)
+            raise ValueError(refresh_reason)
         use_live_account_risk = mode == "live" or (mode == "paper" and strategy.paper_use_live_account_risk)
         slippage_bps = settings.cost.default_slippage_bps if refreshed else synced.time_diff_ms / 10
         decision = pre_trade_check(

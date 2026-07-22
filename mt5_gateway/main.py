@@ -273,10 +273,8 @@ class MT5Gateway:
         for symbol in tuple(self.symbols):
             instrument = self._instrument_snapshot(symbol)
             ticker = self.connector.get_ticker(symbol)
-            book = self.connector.get_order_book(symbol, 20)
             pipe.set(redis_key("mt5", "snapshot", "instrument", symbol), codec.dumps(instrument), ex=ttl)
             pipe.set(redis_key("mt5", "ticker", symbol), codec.dumps(ticker), ex=ttl)
-            pipe.set(redis_key("mt5", "orderbook", symbol), codec.dumps(book), ex=ttl)
         pipe.set(
             redis_key("mt5", "health"), codec.dumps(self._health_payload(True)),
             ex=self.settings.redis.mt5_heartbeat_ttl_seconds,

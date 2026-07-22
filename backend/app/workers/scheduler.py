@@ -7,7 +7,6 @@
 - **scanner_job** — 主扫描循环（价差扫描）
 - **scan_persistence_job** — 扫描状态持久化
 - **execution_maintenance_job** — 执行维护（自动开仓 + 自动平仓 + 对账）
-- **carry_cost_job** — 资金费/过夜费同步
 - 执行 Outbox 由独立 OS Worker 处理，本调度器禁止触碰交易所
 - **signal_stats_job** — 统计信号缓存刷新
 - **mt5_tradability_job** — MT5 交易能力缓存刷新
@@ -37,7 +36,6 @@ from app.core.db_session import db_session
 from app.core.logging import get_logger
 from app.execution.auto_closer import run_auto_close
 from app.execution.auto_executor import run_auto_execute
-from app.execution.carry_costs import run_carry_cost_sync
 from app.execution.circuit_breaker import reload_config as reload_cb_config
 from app.execution.reconciler import run_execution_reconcile
 from app.market.mt5_schedule import sync_mt5_session_templates
@@ -59,7 +57,6 @@ _tradability_timer: Optional[threading.Timer] = None
 _session_template_timer: Optional[threading.Timer] = None
 _scan_persistence_timer: Optional[threading.Timer] = None
 _execution_timer: Optional[threading.Timer] = None
-_carry_cost_timer: Optional[threading.Timer] = None
 _cb_config_timer: Optional[threading.Timer] = None
 _venue_metadata_timer: Optional[threading.Timer] = None
 _account_snapshot_timer: Optional[threading.Timer] = None
@@ -70,7 +67,6 @@ _tradability_refreshing = False
 _session_template_refreshing = False
 _scan_persisting = False
 _execution_running = False
-_carry_cost_running = False
 _cb_config_running = False
 _venue_metadata_running = False
 _account_snapshot_running = False
@@ -112,23 +108,6 @@ def execution_maintenance_job() -> None:
     finally:
         _execution_running = False
     _schedule_next_execution()
-
-
-def carry_cost_job() -> None:
-    """资金费/过夜费同步任务。"""
-    global _carry_cost_running
-    if _carry_cost_running:
-        _schedule_next_carry_cost()
-        return
-    _carry_cost_running = True
-    try:
-        with db_session() as db:
-            run_carry_cost_sync(db)
-    except Exception as exc:
-        logger.exception("资金费/过夜费同步任务失败: {}", exc)
-    finally:
-        _carry_cost_running = False
-    _schedule_next_carry_cost()
 
 
 def scan_persistence_job() -> None:
@@ -305,18 +284,6 @@ def _schedule_next_execution() -> None:
     _execution_timer.start()
 
 
-def _schedule_next_carry_cost() -> None:
-    """调度下一轮资金费同步。"""
-    global _carry_cost_timer
-    if not _running:
-        return
-    settings = get_settings()
-    interval = max(settings.cost.carry_cost_sync_interval_seconds, 1)
-    _carry_cost_timer = threading.Timer(interval, carry_cost_job)
-    _carry_cost_timer.daemon = True
-    _carry_cost_timer.start()
-
-
 def _schedule_next_tradability() -> None:
     """调度下一轮 MT5 交易能力刷新。"""
     global _tradability_timer
@@ -383,7 +350,6 @@ def start_scheduler() -> None:
         _schedule_next()
         _schedule_next_scan_persistence()
         _schedule_next_execution()
-        _schedule_next_carry_cost()
         _schedule_next_stats()
         _schedule_next_tradability()
         _schedule_next_session_templates()
@@ -409,8 +375,6 @@ def stop_scheduler() -> None:
         _scan_persistence_timer.cancel()
     if _execution_timer:
         _execution_timer.cancel()
-    if _carry_cost_timer:
-        _carry_cost_timer.cancel()
     if _cb_config_timer:
         _cb_config_timer.cancel()
     if _venue_metadata_timer:

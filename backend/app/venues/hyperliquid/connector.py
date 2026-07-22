@@ -195,7 +195,6 @@ class HyperliquidConnector:
                 minimum_notional=self.default_min_notional,
                 maker_fee_rate=fees[0],
                 taker_fee_rate=fees[1],
-                funding_rate=_optional_decimal(context.get("funding")),
                 trading_enabled=not bool(item.get("isDelisted", False)),
                 raw={"meta": item, "context": context},
             )

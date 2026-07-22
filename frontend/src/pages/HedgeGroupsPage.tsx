@@ -48,11 +48,6 @@ function directionTags(direction: string, row?: any) {
   return <Tag>{direction || '-'}</Tag>;
 }
 
-function fmtCarryCost(value?: number) {
-  if (value === undefined || value === null || Number.isNaN(Number(value))) return '-';
-  return fmtMoney(-Number(value));
-}
-
 function hasTriggerPrices(row: any) {
   return ['trigger_leg_a_bid', 'trigger_leg_a_ask', 'trigger_leg_b_bid', 'trigger_leg_b_ask'].some((key) => Number(row[key] || 0) !== 0);
 }
@@ -80,8 +75,6 @@ function detailItems(row: any) {
     { key: 'exit_target', label: '退出线（平仓价差分位）', children: fmtSpread(row.exit_target) },
     { key: 'open_cost', label: '开仓成本', children: fmtMoney(row.open_cost) },
     { key: 'fees', label: '手续费成本', children: fmtMoney(row.fees) },
-    { key: 'funding', label: `${venueLabel(row.leg_a_venue)} 资金费`, children: fmtCarryCost(row.funding) },
-    { key: 'swap', label: `${venueLabel(row.leg_b_venue)} 隔夜费`, children: fmtCarryCost(row.swap) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
     { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
     { key: 'source', label: '来源', children: <EllipsisCell value={row.source} /> },
@@ -165,8 +158,6 @@ export function HedgeGroupsPage() {
     { title: '触发价差', dataIndex: 'trigger_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
     { title: '开仓价差', dataIndex: 'entry_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
     { title: '平仓价差', dataIndex: 'current_close_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
-    { title: '资金费', dataIndex: 'funding', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_a_venue)} ${fmtCarryCost(v)}`} align="right" /> },
-    { title: '隔夜费', dataIndex: 'swap', width: 92, align: 'right', render: (v, row) => <EllipsisCell value={`${venueLabel(row.leg_b_venue)} ${fmtCarryCost(v)}`} align="right" /> },
     { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
     { title: '操作', fixed: 'right', width: 230, render: (_, row) => (
       <Space size={4}>

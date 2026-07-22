@@ -50,6 +50,13 @@ def test_scanner_gate_combination_keeps_blockers_separate_from_signal() -> None:
     assert scanner_module._combine_gates(signal_gate, liquidity_gate, scanner_module.GateResult("pass", "", "market")) == liquidity_gate
     assert scanner_module._combine_gates(signal_gate, scanner_module.GateResult("pass", "", "liquidity"), scanner_module.GateResult("pass", "", "market")).status == "executable"
 
+
+def test_liquidity_gate_uses_executable_side_bbo_quantity() -> None:
+    quote = SimpleNamespace(depth_notional=999, bid_depth_notional=100, ask_depth_notional=200)
+
+    assert scanner_module._directional_depth_notional(quote, "buy") == 200
+    assert scanner_module._directional_depth_notional(quote, "sell") == 100
+
 def test_quote_synchronizer_accepts_aligned_quotes() -> None:
     cache = QuoteCache()
     sync = QuoteSynchronizer(cache)
@@ -112,7 +119,6 @@ def test_market_data_isolates_one_venue_connector_failure(monkeypatch) -> None:
 
     monkeypatch.setattr("app.workers.market_data.native_venue_manager.connector_for", connector_for)
     monkeypatch.setattr("app.workers.market_data.quote_cache", Sink())
-    monkeypatch.setattr("app.workers.market_data.order_book_cache", Sink())
     mappings = [
         SimpleNamespace(symbol="GOLD", leg_a_venue="binance", leg_a_symbol="XAUUSDT", leg_b_venue="mt5", leg_b_symbol="XAUUSD"),
         SimpleNamespace(symbol="BTC", leg_a_venue="hyperliquid", leg_a_symbol="BTC", leg_b_venue="mt5", leg_b_symbol="BTCUSD"),
@@ -122,6 +128,7 @@ def test_market_data_isolates_one_venue_connector_failure(monkeypatch) -> None:
 
     assert ("hyperliquid", "ticker") in calls
     assert ("mt5", "ticker") in calls
+    assert not any(operation == "orderbook" for _, operation in calls)
 
 def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
     mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
@@ -469,20 +476,12 @@ def test_hyperliquid_l2book_message_writes_exchange_timestamp() -> None:
     finally:
         market_data_module.quote_cache = original_worker_cache
 
-def test_scanner_liquidity_uses_l2_before_top_depth() -> None:
-    order_book_cache.put(
-        "hyperliquid",
-        "OIL-L2",
-        bids=[(73.70, 1.0), (73.69, 100.0)],
-        asks=[(73.72, 1.0), (73.73, 100.0)],
-        source="test",
-    )
-
-    enough = scanner_module._leg_a_liquidity_reason("OIL-L2", "sell", 70.0, 5000.0, 100.0)
-    not_enough = scanner_module._leg_a_liquidity_reason("OIL-L2", "sell", 200.0, 5000.0, 100.0)
+def test_scanner_liquidity_uses_bbo_depth_only() -> None:
+    enough = scanner_module._leg_a_liquidity_reason("OIL", "sell", 70.0, 5000.0, 6000.0)
+    not_enough = scanner_module._leg_a_liquidity_reason("OIL", "sell", 200.0, 7000.0, 6000.0)
 
     assert enough == ""
-    assert "L2 深度不足" in not_enough
+    assert "顶层深度不足" in not_enough
 
 def test_mt5_action_allowed_uses_mt5_leg_direction() -> None:
     state = MT5SessionState(

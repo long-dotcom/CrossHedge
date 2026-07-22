@@ -4,6 +4,7 @@ import json
 
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -137,6 +138,7 @@ def test_paper_close_runs_as_async_intent_and_closes_only_after_both_fills() -> 
         group = db.get(HedgeGroup, group_id)
         assert group.status == "closed"
         assert group.closed_at is not None
+        assert group.fees == pytest.approx(0.02)
         close_orders = db.query(Order).filter_by(hedge_group_id=group_id, reduce_only=True).all()
         assert len(close_orders) == 2
         assert db.query(Fill).join(Order, Fill.order_id == Order.id).filter(Order.hedge_group_id == group_id).count() == 2
@@ -169,7 +171,10 @@ def test_single_leg_close_fill_enters_manual_recovery_instead_of_false_closed() 
 def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(monkeypatch) -> None:
     factory = _factory()
     with factory() as db:
-        db.add(StrategySetting(execution_mode="paper", paper_use_live_account_risk=False))
+        db.add(StrategySetting(
+            execution_mode="paper", paper_use_live_account_risk=False,
+            min_net_profit=0.0, min_total_profit=0.0,
+        ))
         db.add(SymbolMapping(
             symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
             leg_b_venue="mt5", leg_b_symbol="XAUUSD", mt5_symbol="XAUUSD",
@@ -187,7 +192,8 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
 
         synced = SimpleNamespace(
             time_diff_ms=0.0,
-            leg_a=SimpleNamespace(local_recv_ts=utc_now()),
+            leg_a=SimpleNamespace(local_recv_ts=utc_now(), bid=99.0, ask=100.0),
+            leg_b=SimpleNamespace(local_recv_ts=utc_now(), bid=102.0, ask=103.0),
         )
         monkeypatch.setattr("app.execution.preflight.require_paper_execution_ready", lambda db: None)
         monkeypatch.setattr("app.execution.preflight.strict_sync_for_execution", lambda *args: (synced, "", False))
@@ -218,6 +224,7 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         group = db.get(HedgeGroup, group_id)
         assert group.status == "open"
         assert group.opened_at is not None
+        assert group.fees == pytest.approx(0.02)
         assert group.trigger_spread == 2.0
         assert group.entry_spread == -1.0
         # 新执行模型的交易所回报本身足以还原真实价差，不依赖迁移期旧 Fill 表。
@@ -228,10 +235,52 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         assert len(open_orders) == 2
 
 
+def test_open_request_rechecks_current_bbo_even_without_active_refresh(monkeypatch) -> None:
+    factory = _factory()
+    with factory() as db:
+        db.add(StrategySetting(
+            execution_mode="paper", paper_use_live_account_risk=False,
+            min_net_profit=0.0, min_total_profit=0.0,
+        ))
+        db.add(SymbolMapping(
+            symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
+            leg_b_venue="mt5", leg_b_symbol="XAUUSD", mt5_symbol="XAUUSD",
+        ))
+        opportunity = ArbitrageOpportunity(
+            symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
+            notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
+            gross_spread=2.0, total_cost=0.5, net_profit=1.5, annualized_return=0.1,
+            entry_threshold=1.0, exit_target=0.2,
+        )
+        db.add(opportunity)
+        db.commit()
+        synced = SimpleNamespace(
+            time_diff_ms=0.0,
+            leg_a=SimpleNamespace(local_recv_ts=utc_now(), bid=100.0, ask=101.0),
+            leg_b=SimpleNamespace(local_recv_ts=utc_now(), bid=101.5, ask=102.0),
+        )
+        monkeypatch.setattr("app.execution.preflight.require_paper_execution_ready", lambda db: None)
+        # refreshed=False 表示缓存报价已经足够新，仍必须按该 BBO 复核入场条件。
+        monkeypatch.setattr("app.execution.preflight.strict_sync_for_execution", lambda *args: (synced, "", False))
+        monkeypatch.setattr("app.execution.coordinator.mt5_session_state", lambda mapping: SimpleNamespace())
+        monkeypatch.setattr("app.execution.coordinator.mt5_action_allowed", lambda *args: (True, ""))
+
+        with pytest.raises(ValueError, match="当前价差不再满足入场线"):
+            create_open_intent(
+                db, opportunity_id=opportunity.id, requested_by="test",
+                idempotency_key="open:gold:stale-signal", source="manual",
+            )
+
+        assert db.query(ExecutionIntent).count() == 0
+
+
 def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) -> None:
     factory = _factory()
     with factory() as db:
-        db.add(StrategySetting(execution_mode="paper", paper_use_live_account_risk=False))
+        db.add(StrategySetting(
+            execution_mode="paper", paper_use_live_account_risk=False,
+            min_net_profit=0.0, min_total_profit=0.0,
+        ))
         db.add(SymbolMapping(
             symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
             leg_b_venue="mt5", leg_b_symbol="XAUUSD", mt5_symbol="XAUUSD",
@@ -248,8 +297,8 @@ def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) ->
         db.commit()
         synced = SimpleNamespace(
             time_diff_ms=0.0,
-            leg_a=SimpleNamespace(local_recv_ts=utc_now(), bid=4000.0, ask=4000.5),
-            leg_b=SimpleNamespace(local_recv_ts=utc_now(), bid=3999.0, ask=3999.5),
+            leg_a=SimpleNamespace(local_recv_ts=utc_now(), bid=3998.0, ask=3998.5),
+            leg_b=SimpleNamespace(local_recv_ts=utc_now(), bid=4000.0, ask=4000.5),
         )
         monkeypatch.setattr("app.execution.preflight.require_paper_execution_ready", lambda db: None)
         monkeypatch.setattr("app.execution.preflight.strict_sync_for_execution", lambda *args: (synced, "", False))

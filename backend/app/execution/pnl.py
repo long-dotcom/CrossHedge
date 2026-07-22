@@ -78,12 +78,12 @@ def actual_spread_from_fills(
 def pnl_from_close_spread(group: HedgeGroup, close_spread: float) -> float:
     """根据平仓价差估算已实现盈亏。
 
-    公式：(入场价差 - 平仓价差) × 数量 - 手续费 - 资金费 - 隔夜利息
+    公式：(入场价差 - 平仓价差) × 数量 - 开平仓交易手续费
     """
     quantity = safe_float(group.leg_a_quantity or group.quantity, 1.0)
     entry_spread = safe_float(group.entry_spread or group.entry_threshold)
     gross = (entry_spread - close_spread) * quantity
-    return gross - safe_float(group.fees) - safe_float(group.funding) - safe_float(group.swap)
+    return gross - safe_float(group.fees)
 
 
 def realized_pnl_from_fills(

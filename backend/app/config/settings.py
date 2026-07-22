@@ -250,7 +250,7 @@ class VenueSettings:
 
     # 连接器启动超时 / 秒（VENUE_STARTUP_TIMEOUT_SECONDS）
     startup_timeout_seconds: float = 30.0
-    # 品种、费率与资金费定时刷新间隔 / 秒（VENUE_INSTRUMENT_REFRESH_SECONDS）
+    # 品种规格与交易手续费定时刷新间隔 / 秒（VENUE_INSTRUMENT_REFRESH_SECONDS）
     instrument_refresh_seconds: int = 21600
     # 账户快照兜底对账间隔 / 秒（VENUE_ACCOUNT_RECONCILE_SECONDS）
     account_reconcile_seconds: int = 60

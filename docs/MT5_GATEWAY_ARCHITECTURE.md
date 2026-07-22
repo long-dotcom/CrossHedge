@@ -26,7 +26,6 @@ CrossHedge 现在分为两类运行环境：
 | `crosshedge:mt5:snapshot:positions` | String/JSON | 当前持仓完整快照 |
 | `crosshedge:mt5:snapshot:instrument:{symbol}` | String/JSON | MT5 品种合约规格快照 |
 | `crosshedge:mt5:ticker:{symbol}` | String/JSON | MT5 最新报价 |
-| `crosshedge:mt5:orderbook:{symbol}` | String/JSON | MT5 最新盘口 |
 | `crosshedge:mt5:health` | String/JSON | Gateway 心跳及连接状态 |
 | `crosshedge:mt5:idempotency:*` | String/JSON | 交易命令幂等结果，默认保留 24 小时 |
 | `crosshedge:mt5:idempotency-state:*` | String/JSON | 交易命令执行中状态，防止结果未知时自动重放 |
@@ -75,7 +74,7 @@ Market 模式按现有双腿调度并发提交。Maker 模式先完成加密 Pos
 
 ## 缓存边界
 
-已迁移到 Redis 的缓存包括通用 TTL、行情历史/最新值、订单簿、策略配置、品种映射、统计信号、成本、FX、SSE 快照、扫描结果、对冲组共享快照、断路器配置、MT5 交易能力、自动执行确认状态以及真实探针的锁、限额和恢复状态。连接器生命周期、线程停止标记、断路器滑动窗口以及单次扫描累加器属于进程运行状态，不作为业务缓存迁移。
+已迁移到 Redis 的缓存包括通用 TTL、行情历史/最新值、策略配置、品种映射、统计信号、成本、FX、SSE 快照、扫描结果、对冲组共享快照、断路器配置、MT5 交易能力、自动执行确认状态以及真实探针的锁、限额和恢复状态。扫描行情只维护 BBO，不再持续生成或缓存 MT5 订单簿。连接器生命周期、线程停止标记、断路器滑动窗口以及单次扫描累加器属于进程运行状态，不作为业务缓存迁移。
 
 ## 验证
 

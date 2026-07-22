@@ -326,7 +326,7 @@ class BinanceWebSocketRuntime:
                 continue
             streams = []
             for symbol in sorted(self._symbols):
-                streams.extend((f"{symbol.lower()}@bookTicker", f"{symbol.lower()}@depth@100ms"))
+                streams.append(f"{symbol.lower()}@bookTicker")
             url = PUBLIC_WS_URLS[self.environment]
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, open_timeout=10) as ws:

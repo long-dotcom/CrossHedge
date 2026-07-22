@@ -14,7 +14,7 @@ from sqlalchemy.exc import OperationalError
 from app.config.settings import get_settings
 from app.core.db_session import db_session
 from app.core.logging import get_logger
-from app.market.orderbook import order_book_cache, parse_hyperliquid_levels
+from app.market.orderbook import parse_hyperliquid_levels
 from app.market.quotes import quote_cache
 from app.market.symbols import enabled_mappings
 from app.venues.manager import native_venue_manager
@@ -113,10 +113,9 @@ class MarketDataManager:
                     continue
                 try:
                     ticker = connector.get_ticker(venue_symbol)
-                    depth_notional = min(
-                        ticker.bid * ticker.bid_quantity,
-                        ticker.ask * ticker.ask_quantity,
-                    )
+                    bid_depth_notional = ticker.bid * ticker.bid_quantity
+                    ask_depth_notional = ticker.ask * ticker.ask_quantity
+                    depth_notional = min(bid_depth_notional, ask_depth_notional)
                     quote_cache.put(
                         venue,
                         mapping.symbol,
@@ -125,15 +124,9 @@ class MarketDataManager:
                         float(max(depth_notional, Decimal("0"))),
                         "paper" if paper else f"native_{venue}",
                         ticker.exchange_time,
-                    )
-                    book = connector.get_order_book(venue_symbol, depth=20)
-                    order_book_cache.put(
-                        venue,
-                        mapping.symbol,
-                        [(float(price), float(size)) for price, size in book.bids],
-                        [(float(price), float(size)) for price, size in book.asks],
-                        "paper" if paper else f"native_{venue}",
-                        book.exchange_time,
+                        local_recv_ts=ticker.received_at,
+                        bid_depth_notional=float(max(bid_depth_notional, Decimal("0"))),
+                        ask_depth_notional=float(max(ask_depth_notional, Decimal("0"))),
                     )
                 except Exception as exc:
                     logger.warning("行情更新失败: mapping={}, venue={}, symbol={}, error={}", mapping.symbol, venue, venue_symbol, exc)
@@ -163,7 +156,6 @@ class MarketDataManager:
         if not bids or not asks:
             return
         exchange_time = _exchange_time_from_hyperliquid_ms(data.get("time"))
-        order_book_cache.put("hyperliquid", symbol, bids, asks, source, exchange_time)
         depth = min(bids[0][0] * bids[0][1], asks[0][0] * asks[0][1])
         quote_cache.put("hyperliquid", symbol, bids[0][0], asks[0][0], depth, source, exchange_time)
 

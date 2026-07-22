@@ -18,7 +18,6 @@ from app.core.time_utils import utc_now
 from app.core.worker_runner import run_worker
 from app.db.models import HedgeGroup, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
-from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
 from app.execution.coordinator import create_close_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.pnl import pnl_from_close_spread
@@ -70,18 +69,6 @@ def run_auto_close(db: Session) -> int:
                 db.flush()
                 hedge_pool.upsert_group(group)
                 continue
-            blocked, jitter, threshold = breaker_is_blocked(group.symbol)
-            if blocked:
-                logger.info(
-                    "断路器 OPEN，跳过平仓: symbol={} jitter={:.2f} threshold={:.2f}",
-                    group.symbol,
-                    jitter,
-                    threshold,
-                )
-                group.unrealized_pnl = evaluation.estimated_profit
-                db.flush()
-                hedge_pool.upsert_group(group)
-                continue
             result = create_close_intent(
                 db,
                 group_id=group.id,
@@ -126,11 +113,15 @@ def evaluate_auto_close(
     if mapping is None:
         mapping = next((item for item in enabled_mappings(db) if item.symbol == snapshot.symbol), None)
     settings = get_settings()
+    leg_a_venue = str(getattr(mapping, "leg_a_venue", "") or "hyperliquid").strip().lower() if mapping else "hyperliquid"
+    leg_b_venue = str(getattr(mapping, "leg_b_venue", "") or "mt5").strip().lower() if mapping else "mt5"
     synced, sync_reason = quote_synchronizer.synchronized(
         snapshot.symbol,
         mode="strict",
         max_time_diff_ms=settings.quote.strict_sync_ms,
         max_age_ms=settings.quote.stale_ms,
+        leg_a_venue=leg_a_venue,
+        leg_b_venue=leg_b_venue,
     )
     refreshed: list[str] = []
     if not synced and mapping is not None:
@@ -141,6 +132,8 @@ def evaluate_auto_close(
                 mode="strict",
                 max_time_diff_ms=settings.quote.strict_sync_ms,
                 max_age_ms=settings.quote.stale_ms,
+                leg_a_venue=leg_a_venue,
+                leg_b_venue=leg_b_venue,
             )
     if not synced:
         suffix = f"；执行前主动刷新: {','.join(refreshed)}" if refreshed else ""

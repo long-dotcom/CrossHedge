@@ -199,14 +199,11 @@ class BinanceFuturesConnector:
                 taker_fee_rate = _decimal(fee.get("takerCommissionRate"))
             except BinanceApiError:
                 pass
-        funding = self.rest.premium_index(key)
         instrument = Instrument(
             **{
                 **instrument.__dict__,
                 "maker_fee_rate": maker_fee_rate,
                 "taker_fee_rate": taker_fee_rate,
-                "funding_rate": _optional_decimal(funding.get("lastFundingRate")),
-                "next_funding_at": _millis_datetime(funding.get("nextFundingTime")),
             }
         )
         self._instrument_cache.set(key, instrument)

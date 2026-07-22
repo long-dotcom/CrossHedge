@@ -9,7 +9,7 @@
 本规范覆盖：
 
 1. 账户、余额、持仓、挂单和成交读取。
-2. 品种费率、资金费、最小数量、步进与订单簿维护。
+2. 品种交易手续费、最小数量、步进与 BBO 行情维护。
 3. API Key、签名身份、账户环境和交易权限校验。
 4. 混合 Paper（加密真实最小探针 + MT5 Demo）与 Live 执行。
 5. 低延迟订单事件、重连、兜底查询和完整订单生命周期。
@@ -48,7 +48,7 @@ Paper 不使用本地撮合结果。加密腿由 `HybridPaperProbeConnector` 调
 | 能力 | Hyperliquid | Binance Futures | MT5 |
 |---|---|---|---|
 | 账户/持仓 | Info API | 签名 REST | terminal API |
-| 公共行情 | bbo WS + 执行前 l2Book 快照 | bookTicker + depth WS | symbol tick/book |
+| 公共行情 | bbo WS | bookTicker WS | symbol tick |
 | 私有订单事件 | orderUpdates/userFills WS | User Data Stream | 活动订单轮询 |
 | 实盘提交 | 官方 Exchange SDK | 项目 HMAC REST | Redis Stream → Gateway → order_send |
 | 幂等标识 | 确定性 cloid | newClientOrderId | magic/comment + ticket |
@@ -91,28 +91,19 @@ CREATED -> SUBMITTING -> SUBMITTED -> ACCEPTED
 
 MT5 Python 与 Terminal 只运行在 Windows Gateway。业务后端通过 Redis Stream 发送命令，并从 Redis 快照读取账户、持仓、行情和品种数据。终端没有同等的账户私有 WS，因此 Gateway 采用只轮询活动订单的 75ms 默认周期。没有活动订单时不轮询历史；发现终态后一次性读取 deals 并按 ticket 去重，然后把统一事件发布到 Redis Stream。
 
-## 6. 订单簿一致性
+## 6. 行情边界
 
-Binance 本地簿必须：
-
-1. 缓存增量事件。
-2. 拉取 REST 快照。
-3. 丢弃 `u <= lastUpdateId` 的事件。
-4. 第一条应用事件满足覆盖快照序号。
-5. 后续严格校验 `pu == previous_u`。
-6. 缺口时标记失步、停止发布并重新同步。
-
-Hyperliquid 常规行情使用 bbo WS 更新最优买卖价，并在执行前按需读取 l2Book 快照复核深度。MT5 使用 terminal market book；不可用时只发布 ticker，不伪造 Live 深度。
+扫描链路仅维护两腿 BBO：Hyperliquid 使用 bbo WS，Binance 使用 bookTicker WS，MT5 使用 symbol tick。扫描器不订阅增量深度、不轮询 terminal market book，也不把完整订单簿写入 Redis。连接器仍可为真实执行探针等明确的单次操作按需查询订单簿，但该查询不得进入周期行情和扫描循环。
 
 ## 7. 品种与成本刷新
 
-Instrument 至少包含：数量步进、最小数量、价格 tick、最小名义额、合约乘数、费率、资金费或 swap 和交易状态。
+Instrument 的执行必需信息至少包含：数量步进、最小数量、价格 tick、最小名义额、合约乘数、Maker/Taker 手续费和交易状态。
 
 - 启动时按启用映射加载。
 - 默认每 6 小时强制刷新。
 - Binance 账户级 commission 覆盖公开或默认费率。
-- 当前 funding 可高频缓存；历史 funding 使用公开历史端点。
-- MT5 读取 volume_min、volume_step、trade_contract_size、swap mode/long/short。
+- Funding/Swap 不进入扫描、执行成本或 PnL，也不由持仓维护任务同步。
+- MT5 只读取执行所需的 volume_min、volume_step、trade_contract_size 等品种规格。
 
 ## 8. 凭据校验
 

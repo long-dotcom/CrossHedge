@@ -61,6 +61,8 @@ class Quote:
     local_recv_ts: object
     source: str
     sequence: int
+    bid_depth_notional: float = 0.0
+    ask_depth_notional: float = 0.0
 
     @property
     def mid(self) -> float:
@@ -138,6 +140,8 @@ class QuoteCache:
         source: str,
         exchange_ts=None,
         local_recv_ts=None,
+        bid_depth_notional: float | None = None,
+        ask_depth_notional: float | None = None,
     ) -> Quote:
         """写入一条新报价。
 
@@ -159,11 +163,13 @@ class QuoteCache:
             platform=platform, symbol=symbol, bid=float(bid), ask=float(ask),
             depth_notional=float(depth_notional), exchange_ts=exchange_ts,
             local_recv_ts=local_recv_ts or utc_now(), source=source, sequence=sequence,
+            bid_depth_notional=float(depth_notional if bid_depth_notional is None else bid_depth_notional),
+            ask_depth_notional=float(depth_notional if ask_depth_notional is None else ask_depth_notional),
         )
         serialized = _quote_json(quote)
         pipe = client.pipeline(transaction=False)
         pipe.set(self._latest_key(platform, symbol), serialized)
-        pipe.xadd(self._history_key(platform, symbol), {"data": serialized}, maxlen=self.max_history, approximate=False)
+        pipe.xadd(self._history_key(platform, symbol), {"data": serialized}, maxlen=self.max_history, approximate=True)
         pipe.sadd(self._symbols_key(), symbol)
         pipe.execute()
         return quote
@@ -202,6 +208,8 @@ def _quote_json(quote: Quote) -> str:
         "platform": quote.platform, "symbol": quote.symbol, "bid": quote.bid, "ask": quote.ask,
         "depth_notional": quote.depth_notional, "exchange_ts": _json_time(quote.exchange_ts),
         "local_recv_ts": _json_time(quote.local_recv_ts), "source": quote.source, "sequence": quote.sequence,
+        "bid_depth_notional": quote.bid_depth_notional,
+        "ask_depth_notional": quote.ask_depth_notional,
     }, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -218,6 +226,8 @@ def _quote_from_json(raw: str) -> Quote:
     data = json.loads(raw)
     data["exchange_ts"] = _parse_time(data.get("exchange_ts"))
     data["local_recv_ts"] = _parse_time(data["local_recv_ts"])
+    data.setdefault("bid_depth_notional", float(data.get("depth_notional") or 0.0))
+    data.setdefault("ask_depth_notional", float(data.get("depth_notional") or 0.0))
     return Quote(**data)
 
 

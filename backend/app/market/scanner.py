@@ -45,7 +45,6 @@ from app.db.models import (
 )
 from app.db.retention import prune_table_by_id
 from app.market.symbols import enabled_mappings
-from app.market.orderbook import order_book_cache, simulate_market_fill
 from app.market.quotes import quote_cache, quote_synchronizer
 from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
@@ -348,7 +347,8 @@ def run_scan(db: Session) -> int:
                         risk_tags = _risk_tags(gross_spread, statistical_signal)
                         liquidity_gate = _liquidity_gate(
                             mapping.symbol, leg_a_side, sizing.leg_a_quantity,
-                            notional, hl.depth_notional, signal_gate.status, leg_a_venue_name,
+                            notional, _directional_depth_notional(hl, leg_a_side),
+                            signal_gate.status, leg_a_venue_name,
                         )
                         market_gate = (
                             _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
@@ -645,16 +645,17 @@ def _combine_gates(signal_gate: GateResult, liquidity_gate: GateResult, market_g
 
 
 def _leg_a_liquidity_reason(symbol: str, side: str, quantity: float, notional: float, top_depth_notional: float, leg_a_venue: str = "hyperliquid") -> str:
-    """检查 Leg A 流动性是否充足，返回原因或空字符串。"""
-    book = order_book_cache.latest(leg_a_venue, symbol)
-    if book:
-        fill = simulate_market_fill(book, side, quantity)
-        if not fill.enough_liquidity:
-            return f"{leg_a_venue} L2 深度不足: 目标 {quantity:.8f}，可成交 {fill.filled_quantity:.8f}"
-        return ""
+    """使用 BBO 挂单量检查 Leg A 顶层流动性，不读取完整订单簿。"""
     if top_depth_notional > 0 and notional > top_depth_notional:
         return f"{leg_a_venue} 顶层深度不足: 目标 {notional:.2f} USD > 深度 {top_depth_notional:.2f} USD"
     return ""
+
+
+def _directional_depth_notional(quote, side: str) -> float:
+    """按实际吃单方向返回 BBO 名义量，兼容旧报价记录。"""
+    field = "ask_depth_notional" if str(side).lower() == "buy" else "bid_depth_notional"
+    directional = float(getattr(quote, field, 0.0) or 0.0)
+    return directional if directional > 0 else float(getattr(quote, "depth_notional", 0.0) or 0.0)
 
 
 def _effective_entry_threshold(mapping: SymbolMapping, statistical_threshold: float) -> float:
@@ -1088,6 +1089,10 @@ def _persist_opportunities(db: Session, opportunities: list[dict], ids_by_key: d
         current.signal_sample_count = payload["signal_sample_count"]
         current.status = payload["status"]
         current.reject_reason = payload.get("reason", "")
+        if current.status != "executable":
+            from app.execution.auto_executor import clear_opportunity_confirmation
+
+            clear_opportunity_confirmation(current)
         if current.id is None:
             db.flush()
         if _opportunity_signature(current) != before:
@@ -1099,6 +1104,9 @@ def _persist_opportunities(db: Session, opportunities: list[dict], ids_by_key: d
             continue
         row.status = "rejected"
         row.reject_reason = "价差回落，不再满足候选条件"
+        from app.execution.auto_executor import clear_opportunity_confirmation
+
+        clear_opportunity_confirmation(row)
         changed += 1
     return changed
 

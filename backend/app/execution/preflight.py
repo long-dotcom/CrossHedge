@@ -74,7 +74,7 @@ def refreshed_opportunity_still_executable(
     synced,
     strategy: StrategySetting,
 ) -> tuple[bool, str]:
-    """报价刷新后重新计算入场线和最低净利润。"""
+    """使用执行前当前 BBO 重新计算入场线和最低净利润。"""
     spread = spreads_for_direction(
         opportunity.direction,
         synced.leg_a.bid,
@@ -84,12 +84,12 @@ def refreshed_opportunity_still_executable(
     ).entry_spread
     threshold = float(opportunity.entry_threshold or 0.0)
     if threshold > 0 and spread < threshold:
-        return False, f"主动刷新后价差不再满足入场线: {spread:.6f} < {threshold:.6f}"
+        return False, f"执行前当前价差不再满足入场线: {spread:.6f} < {threshold:.6f}"
     quantity = float(opportunity.leg_a_quantity or opportunity.quantity or 0.0)
     net_profit = (spread - float(opportunity.unit_cost or 0.0)) * quantity
     minimum = max(float(strategy.min_total_profit or 0.0), float(strategy.min_net_profit or 0.0))
     if net_profit < minimum:
-        return False, f"主动刷新后净利润不足: {net_profit:.2f} < {minimum:.2f}"
+        return False, f"执行前当前净利润不足: {net_profit:.2f} < {minimum:.2f}"
     return True, ""
 
 

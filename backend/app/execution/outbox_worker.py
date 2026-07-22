@@ -884,6 +884,7 @@ def _project_hedge_group_state(
         group.status = "closed"
         group.closed_at = group.closed_at or utc_now()
         group.close_reason = reason
+        group.fees = _group_commission_total(db, group.id)
         event_type = "recovery_intent_completed" if recovery else "close_intent_completed"
         _add_group_event_once(db, group.id, event_type, f"Intent #{intent.id} 已确认全部成交")
         try:
@@ -927,15 +928,7 @@ def _project_open_group_state(
         group.status = "open"
         group.opened_at = group.opened_at or utc_now()
         group.close_reason = ""
-        group.fees = sum(
-            float(fee or 0.0)
-            for (fee,) in (
-                db.query(VenueOrder.commission)
-                .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
-                .filter(ExecutionLeg.intent_id == intent.id)
-                .all()
-            )
-        )
+        group.fees = _group_commission_total(db, group.id)
         try:
             from app.execution.pnl import actual_entry_spread_from_fills
 
@@ -974,6 +967,18 @@ def _add_group_event_once(db: Session, group_id: int, event_type: str, detail: s
     )
     if not exists:
         db.add(HedgeGroupEvent(hedge_group_id=group_id, event_type=event_type, detail=detail))
+
+
+def _group_commission_total(db: Session, group_id: int) -> float:
+    """汇总本组所有新执行模型订单的开仓、平仓及恢复手续费。"""
+    rows = (
+        db.query(VenueOrder.commission)
+        .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+        .join(ExecutionIntent, ExecutionIntent.id == ExecutionLeg.intent_id)
+        .filter(ExecutionIntent.hedge_group_id == group_id)
+        .all()
+    )
+    return sum(float(fee or 0.0) for (fee,) in rows)
 
 
 def _refresh_hedge_pool(db: Session, intent: ExecutionIntent) -> None:

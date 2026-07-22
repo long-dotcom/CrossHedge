@@ -78,11 +78,7 @@ def test_gateway_snapshot_publishes_and_reuses_instrument_specification() -> Non
             return Ticker("mt5", symbol, Decimal("100"), Decimal("101"))
 
         def get_order_book(self, symbol: str, depth: int):
-            return OrderBookSnapshot(
-                "mt5", symbol,
-                ((Decimal("100"), Decimal("1")),),
-                ((Decimal("101"), Decimal("1")),),
-            )
+            raise AssertionError("周期快照不应获取 MT5 订单簿")
 
     native = SnapshotConnector()
     gateway = MT5Gateway(redis_client=client, connector=native)
@@ -93,6 +89,7 @@ def test_gateway_snapshot_publishes_and_reuses_instrument_specification() -> Non
 
     raw = client.get(redis_key("mt5", "snapshot", "instrument", "SNAPUSD"))
     assert codec.instrument(codec.loads(raw)).symbol == "SNAPUSD"
+    assert client.get(redis_key("mt5", "orderbook", "SNAPUSD")) is None
     assert native.instrument_calls == 1
 
 

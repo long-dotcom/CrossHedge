@@ -106,7 +106,7 @@ def run_auto_execute(db: Session) -> int:
             opportunity.reject_reason = f"断路器 OPEN: jitter={jitter:.3f} threshold={threshold:.3f}"
             continue
         # 决策延迟（模拟人类犹豫时间）
-        decision_delay_ms = _decision_delay_ms(strategy)
+        decision_delay_ms = _decision_delay_ms(strategy) if strategy.execution_mode == "paper" else 0
         if decision_delay_ms > 0:
             time.sleep(decision_delay_ms / 1000)
         try:
@@ -196,6 +196,12 @@ def _confirm(strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tu
 def _confirmation_key(opportunity: ArbitrageOpportunity) -> str:
     """生成机会确认的唯一键。"""
     return f"{opportunity.id}:{opportunity.symbol}:{opportunity.direction}"
+
+
+def clear_opportunity_confirmation(opportunity: ArbitrageOpportunity) -> None:
+    """机会离开 executable 状态时清除连续确认，防止间断信号沿用旧计数。"""
+    if opportunity.id is not None:
+        _confirmations.invalidate(_confirmation_key(opportunity))
 
 
 def _decision_delay_ms(strategy: StrategySetting) -> int:
