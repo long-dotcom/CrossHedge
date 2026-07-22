@@ -156,7 +156,8 @@ def create_open_intent(
             trigger_leg_a_ask=opportunity.trigger_leg_a_ask,
             trigger_leg_b_bid=opportunity.trigger_leg_b_bid,
             trigger_leg_b_ask=opportunity.trigger_leg_b_ask,
-            entry_spread=opportunity.gross_spread,
+            # 真实开仓价差只能在双腿成交回报到齐后写入，0 表示尚未确认。
+            entry_spread=0.0,
             entry_threshold=opportunity.entry_threshold,
             exit_target=opportunity.exit_target,
             overheat_threshold=opportunity.overheat_threshold,

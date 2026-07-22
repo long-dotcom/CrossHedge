@@ -20,7 +20,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.core.type_utils import safe_float
-from app.db.models import Fill, HedgeGroup, Order, SymbolMapping
+from app.db.models import ExecutionIntent, ExecutionLeg, Fill, HedgeGroup, Order, SymbolMapping, VenueOrder
 
 
 def actual_entry_spread_from_fills(
@@ -59,8 +59,14 @@ def actual_spread_from_fills(
         mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).first()
     leg_a_venue = mapping.leg_a_venue if mapping else "hyperliquid"
     leg_b_venue = mapping.leg_b_venue if mapping else "mt5"
-    leg_a_price = weighted_fill_price(db, group.id, leg_a_venue, reduce_only=reduce_only)
-    leg_b_price = weighted_fill_price(db, group.id, leg_b_venue, reduce_only=reduce_only)
+    action = "CLOSE" if reduce_only else "OPEN"
+    leg_a_price = weighted_execution_price(db, group.id, leg_a_venue, action=action)
+    leg_b_price = weighted_execution_price(db, group.id, leg_b_venue, action=action)
+    # 兼容重构前仅写入 orders/fills 的历史成交。
+    if leg_a_price is None:
+        leg_a_price = weighted_fill_price(db, group.id, leg_a_venue, reduce_only=reduce_only)
+    if leg_b_price is None:
+        leg_b_price = weighted_fill_price(db, group.id, leg_b_venue, reduce_only=reduce_only)
     if leg_a_price is None or leg_b_price is None:
         return None
     # long_leg_a_short_leg_b: 价差 = leg_b 价格 - leg_a 价格
@@ -114,4 +120,33 @@ def weighted_fill_price(
     if quantity <= 0:
         return None
     notional = sum(safe_float(row.quantity) * safe_float(row.price) for row in rows)
+    return notional / quantity
+
+
+def weighted_execution_price(
+    db: Session, group_id: int, venue: str, *, action: str,
+) -> float | None:
+    """按新执行模型中的交易所回报计算指定腿的加权成交均价。
+
+    ``VenueOrder.average_price`` 和 ``filled_quantity`` 是订单回报/成交事件投影后的
+    权威字段。Maker 拆单或补单产生多条订单时，按各订单累计成交量加权。
+    """
+    rows = (
+        db.query(VenueOrder)
+        .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+        .join(ExecutionIntent, ExecutionIntent.id == ExecutionLeg.intent_id)
+        .filter(
+            ExecutionIntent.hedge_group_id == group_id,
+            ExecutionLeg.venue == str(venue or "").lower(),
+            ExecutionLeg.action == action.upper(),
+            VenueOrder.filled_quantity > 0,
+            VenueOrder.average_price.is_not(None),
+            VenueOrder.average_price > 0,
+        )
+        .all()
+    )
+    quantity = sum(safe_float(row.filled_quantity) for row in rows)
+    if quantity <= 0:
+        return None
+    notional = sum(safe_float(row.filled_quantity) * safe_float(row.average_price) for row in rows)
     return notional / quantity

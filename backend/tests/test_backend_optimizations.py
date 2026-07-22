@@ -1,5 +1,7 @@
 """后端高频查询与 SSE 共享快照回归测试。"""
 
+from datetime import timedelta
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -7,6 +9,7 @@ from app.accounts.sync import latest_account_snapshots
 from app.api import streaming
 from app.api.dashboard import _dashboard_summary_payload
 from app.db.models import AccountSnapshot, Base, HedgeGroup
+from app.core.time_utils import utc_now
 
 
 def _session():
@@ -35,6 +38,26 @@ def test_dashboard_realized_pnl_uses_closed_groups_only() -> None:
     ])
     db.commit()
     assert _dashboard_summary_payload(db)["realized_pnl"] == 7
+
+
+def test_dashboard_today_pnl_excludes_historical_realized_pnl() -> None:
+    db = _session()
+    db.add_all([
+        HedgeGroup(
+            symbol="TODAY", direction="long_leg_a_short_leg_b", status="closed",
+            notional=1, quantity=1, realized_pnl=7, closed_at=utc_now(),
+        ),
+        HedgeGroup(
+            symbol="HISTORY", direction="long_leg_a_short_leg_b", status="closed",
+            notional=1, quantity=1, realized_pnl=99, closed_at=utc_now() - timedelta(days=2),
+        ),
+    ])
+    db.commit()
+
+    result = _dashboard_summary_payload(db)
+
+    assert result["realized_pnl"] == 106
+    assert result["today_pnl"] == 7
 
 
 def test_sse_snapshot_is_shared_within_ttl(monkeypatch) -> None:

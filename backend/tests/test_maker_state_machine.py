@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
-from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, VenueOrder
+from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, SymbolMapping, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
 from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
@@ -65,6 +65,11 @@ def _create_maker_open(factory, *, unfilled_action="cancel", single_leg_action="
         order_type="market",
     )
     with factory() as db:
+        db.add(SymbolMapping(
+            symbol="BTC", leg_a_venue="binance", leg_a_symbol="BTCUSDT",
+            leg_a_venue_symbol="BTCUSDT", leg_b_venue="mt5",
+            leg_b_symbol="BTCUSD", mt5_symbol="BTCUSD",
+        ))
         group = HedgeGroup(
             symbol="BTC", direction="long_leg_a_short_leg_b", status="opening",
             execution_mode="live", notional=100.0, quantity=0.01,
@@ -125,6 +130,7 @@ def test_ttl_cancel_waits_for_terminal_then_hedges_partial_fill() -> None:
         assert group.status == "open_partial"
         assert group.leg_a_quantity == 0.004
         assert group.leg_b_quantity == 0.008
+        assert group.entry_spread == 100
     assert len(state["placed"]) == 2
 
 

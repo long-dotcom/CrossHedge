@@ -118,7 +118,11 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
         entry_spread=20,
         unrealized_pnl=0,
     )
-    closed = HedgeGroup(symbol="DASH-CLOSED", direction="long_leg_a_short_leg_b", status="closed", execution_mode="paper", notional=100, quantity=1, realized_pnl=3)
+    closed = HedgeGroup(
+        symbol="DASH-CLOSED", direction="long_leg_a_short_leg_b", status="closed",
+        execution_mode="paper", notional=100, quantity=1, realized_pnl=3,
+        closed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
     db.add_all([group, closed])
     db.commit()
     hedge_pool.load_from_db(db)
@@ -227,7 +231,7 @@ def test_hedge_groups_api_returns_realtime_spreads() -> None:
     result = hedge_groups_api.hedge_groups(user, db, page=1, page_size=20)
 
     item = result["items"][0]
-    assert item["entry_spread"] == 12
+    assert item["entry_spread"] is None
     assert item["current_entry_spread"] == 9
     assert item["current_close_spread"] == 12
     assert item["quote_time_diff_ms"] >= 0

@@ -70,7 +70,7 @@ export type HedgePoolItem = {
   notional: number;
   quantity: number;
   trigger_spread?: number | null;
-  entry_spread: number;
+  entry_spread: number | null;
   current_entry_spread?: number | null;
   current_close_spread?: number | null;
   quote_time_diff_ms?: number | null;

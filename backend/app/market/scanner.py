@@ -48,7 +48,7 @@ from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
 from app.market.mt5_tradability import mt5_tradability_cache
 from app.strategy.cost import estimate_pair_cost
-from app.strategy.live_costs import VenueCostUnavailable, mt5_cost_inputs, venue_cost_inputs
+from app.strategy.live_costs import VenueCostUnavailable, venue_cost_inputs
 from app.strategy.position_sizing import PositionSizing, calculate_position_sizing
 from app.strategy.statistical_signal import evaluate_entry_signal
 from app.execution.circuit_breaker import feed_spread as breaker_feed
@@ -277,32 +277,16 @@ def run_scan(db: Session) -> int:
                     notional = sizing.notional_usd
                     leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
                     leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
-                    mt5_costs = (
-                        mt5_cost_inputs(mapping.mt5_symbol, leg_b_side, sizing.leg_b_quantity, holding_hours / 24)
-                        if leg_b_venue_name == "mt5"
-                        else SimpleNamespace(swap_cost=0.0, source="no_mt5")
-                    )
                     cost = estimate_pair_cost(
                         notional=notional,
-                        holding_hours=holding_hours,
-                        max_slippage_bps=min(mapping.max_slippage_bps, settings.cost.default_slippage_bps),
                         leg_a_open_fee_rate=_venue_fee_rate(
                             open_order_type(mapping, "a"), leg_a_costs,
                             post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
                         ),
                         leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
-                        # 策略机会成本不纳入预测 funding；实际持仓 funding 仍单独记账。
-                        leg_a_funding_rate=0.0,
-                        leg_a_funding_interval_hours=1.0,
-                        leg_a_side=leg_a_side,
                         leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
                         leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
-                        leg_b_funding_rate=0.0,
-                        leg_b_funding_interval_hours=1.0,
-                        leg_b_side=leg_b_side,
-                        leg_b_swap_cost=mt5_costs.swap_cost,
-                        fx_cost_rate=settings.cost.default_fx_cost_rate,
-                        source=f"{leg_a_costs.source};{leg_b_costs.source};{mt5_costs.source}",
+                        source=f"{leg_a_costs.source};{leg_b_costs.source}",
                     )
                     unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
                     # 第一次评估用于得到统计退出线；最终收益必须扣除退出价差，
@@ -494,41 +478,16 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None) -> list[dict]:
             reason = f"自动成本不可用: {cost_error}"
             blocker = "cost"
         else:
-            mt5_swap = 0.0
-            mt5_source = "no_mt5"
-            if leg_b_venue == "mt5":
-                mt5_inputs = mt5_cost_inputs(
-                    leg_b_symbol,
-                    leg_b_side,
-                    sizing.leg_b_lots,
-                    holding_hours / 24,
-                )
-                mt5_swap = mt5_inputs.swap_cost
-                mt5_source = mt5_inputs.source
             cost = estimate_pair_cost(
                 notional=notional,
-                holding_hours=holding_hours,
-                max_slippage_bps=min(
-                    float(getattr(mapping, "max_slippage_bps", 0.0) or 0.0),
-                    float(settings.cost.default_slippage_bps or 0.0),
-                ),
                 leg_a_open_fee_rate=_venue_fee_rate(
                     open_order_type(mapping, "a"), leg_a_costs,
                     post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
                 ),
                 leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
-                # 策略机会成本不纳入预测 funding；实际持仓 funding 仍单独记账。
-                leg_a_funding_rate=0.0,
-                leg_a_funding_interval_hours=1.0,
-                leg_a_side=leg_a_side,
                 leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
                 leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
-                leg_b_funding_rate=0.0,
-                leg_b_funding_interval_hours=1.0,
-                leg_b_side=leg_b_side,
-                leg_b_swap_cost=mt5_swap,
-                fx_cost_rate=settings.cost.default_fx_cost_rate,
-                source=f"{leg_a_costs.source};{leg_b_costs.source};{mt5_source}",
+                source=f"{leg_a_costs.source};{leg_b_costs.source}",
             )
             logger.debug(
                 "成本明细: symbol={}, direction={}, notional={:.4f}, leg_a_qty={:.8f}, "

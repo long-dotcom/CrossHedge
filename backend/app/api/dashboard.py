@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -28,6 +29,7 @@ from app.db.models import (
 from app.db.session import get_db
 from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import pnl_from_close_spread
+from app.core.time_utils import utc_now
 from app.market.hedge_spreads import hedge_group_spreads
 from app.db.models import User
 
@@ -82,10 +84,24 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
         .scalar()
         or 0.0
     )
+    # 数据库时间统一保存为 naive UTC；“今日”也必须使用同一时区边界，
+    # 否则历史已平仓收益会被错误地永久计入今日盈亏。
+    day_start = datetime.combine(utc_now().date(), time.min)
+    day_end = day_start + timedelta(days=1)
+    today_realized_pnl = float(
+        db.query(func.coalesce(func.sum(HedgeGroup.realized_pnl), 0.0))
+        .filter(
+            HedgeGroup.status == "closed",
+            HedgeGroup.closed_at >= day_start,
+            HedgeGroup.closed_at < day_end,
+        )
+        .scalar()
+        or 0.0
+    )
     unrealized_pnl = _runtime_open_unrealized_pnl(db)
     return {
         "equity": equity,
-        "today_pnl": realized_pnl + unrealized_pnl,
+        "today_pnl": today_realized_pnl + unrealized_pnl,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "risk_mode": risk.mode if risk else "normal",

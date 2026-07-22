@@ -20,7 +20,7 @@ from app.market.scan_state import scan_state_store
 from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed, mt5_session_state
 from app.market.mt5_schedule import apply_mt5_session_template, infer_template, local_schedule_state
 from app.strategy.cost import estimate_cost
-from app.strategy.live_costs import _estimate_mt5_swap_cost, _hyperliquid_effective_fee_rates
+from app.strategy.live_costs import _hyperliquid_effective_fee_rates
 from app.strategy.signals import evaluate_signal
 from app.strategy.spread_math import spreads_for_direction
 from app.risk.engine import pre_trade_check
@@ -64,12 +64,9 @@ def test_hyperliquid_maker_open_taker_close_fee() -> None:
         notional=1000,
         leg_b_bid=100,
         leg_b_ask=100,
-        max_slippage_bps=0,
         leg_a_fee_rate=0.00015,
         leg_a_close_fee_rate=0.00045,
-        leg_a_funding_rate=0,
-        leg_b_commission_rate=0,
-        leg_b_swap_cost=0,
+        leg_b_fee_rate=0,
     )
     assert cost.leg_a_fee == 0.6
 
@@ -159,10 +156,6 @@ def test_mt5_session_template_infers_spcx_as_stock() -> None:
     mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCXz")
     assert infer_template(mapping) == "stock_us_close_only"
 
-def test_mt5_positive_swap_reduces_cost() -> None:
-    cost = _estimate_mt5_swap_cost(swap_value=10.0, swap_mode=1, point=0.01, contract_size=1.0, quantity=1, holding_days=1)
-    assert cost == -0.1
-
 def test_enabled_mappings_cache_requires_explicit_clear() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
@@ -237,10 +230,6 @@ def test_symbol_mapping_rejects_empty_leg_a_venue_symbol() -> None:
     with pytest.raises(ValueError, match="venue symbol"):
         SymbolMappingIn(symbol="BTC", leg_a_venue_symbol="", mt5_symbol="BTCUSD", leg_a_venue="hyperliquid")
 
-def test_mt5_points_swap_cost() -> None:
-    cost = _estimate_mt5_swap_cost(swap_value=-34.2, swap_mode=1, point=0.01, contract_size=1.0, quantity=0.5, holding_days=1)
-    assert cost == 0.171
-
 def test_l2_market_fill_walks_multiple_levels() -> None:
     book = order_book_cache.put(
         "hyperliquid",
@@ -262,15 +251,12 @@ def test_hyperliquid_roundtrip_fee_and_spread() -> None:
         notional=1000,
         leg_b_bid=100,
         leg_b_ask=100,
-        max_slippage_bps=0,
         quantity=0.01,
         leg_a_bid=64272,
         leg_a_ask=64273,
         leg_a_fee_rate=0.00045,
         leg_a_fee_round_trips=2,
-        leg_a_funding_rate=0,
-        leg_b_commission_rate=0,
-        leg_b_swap_cost=0,
+        leg_b_fee_rate=0,
     )
     assert cost.leg_a_fee == 0.9
     assert cost.leg_a_spread == 0.01
@@ -516,8 +502,7 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     )
     monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
     monkeypatch.setattr(scanner_module, "mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
-    monkeypatch.setattr(scanner_module, "venue_cost_inputs", lambda venue, symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0, funding_rate=0, funding_interval_hours=1))
-    monkeypatch.setattr(scanner_module, "mt5_cost_inputs", lambda *args, **kwargs: SimpleNamespace(source="test", commission_rate=0, swap_cost=0))
+    monkeypatch.setattr(scanner_module, "venue_cost_inputs", lambda venue, symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0))
     monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
 
     scanner_module.clear_strategy_setting_cache()
@@ -545,20 +530,17 @@ def test_leg_b_spread_rebate_reduces_spread_cost() -> None:
         notional=1000,
         leg_b_bid=100,
         leg_b_ask=101,
-        max_slippage_bps=0,
         quantity=1,
         leg_a_bid=100,
         leg_a_ask=101,
         leg_a_fee_rate=0,
-        leg_a_funding_rate=0,
-        leg_b_commission_rate=0,
-        leg_b_swap_cost=0,
+        leg_b_fee_rate=0,
         leg_b_spread_rebate_rate=0.2,
     )
     assert round(cost.leg_b_spread, 6) == round((1 / 100.5) * 1000 * 0.8, 6)
 
 def test_cost_model_positive_total() -> None:
-    cost = estimate_cost(1000, 64990, 65010, 8)
+    cost = estimate_cost(1000, 64990, 65010)
     assert cost.total > 0
     assert cost.leg_b_spread > 0
 
@@ -571,24 +553,6 @@ def test_local_mt5_quote_only_blocks_close_for_indices() -> None:
     assert state.status == "quote_only"
     assert not state.can_open_long
     assert not state.can_close_long
-
-def test_hyperliquid_short_positive_funding_reduces_cost() -> None:
-    cost = estimate_cost(
-        notional=1000,
-        leg_b_bid=100,
-        leg_b_ask=100.1,
-        max_slippage_bps=0,
-        quantity=0,
-        leg_a_bid=0,
-        leg_a_ask=0,
-        leg_a_fee_rate=0,
-        leg_a_funding_rate=0.001,
-        leg_a_side="sell",
-        leg_b_commission_rate=0,
-        leg_b_swap_cost=0,
-        holding_hours=1,
-    )
-    assert cost.leg_a_funding == -1
 
 def test_symbol_negative_close_spread_limit_tightens_exit_target() -> None:
     mapping = SymbolMapping(symbol="SPCX", leg_a_venue_symbol="xyz:SPCX", mt5_symbol="SPCX", max_close_spread=-0.11)

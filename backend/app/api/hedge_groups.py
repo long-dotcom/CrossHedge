@@ -25,7 +25,7 @@ from app.execution.actions import hedge_group_actions
 from app.execution.coordinator import create_close_intent, create_recovery_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.voiding import void_hedge_group
-from app.execution.pnl import pnl_from_close_spread
+from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
 from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn, VoidHedgeGroupIn
 
@@ -40,6 +40,14 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot, le
     """组装单个对冲组的完整数据（含价差和未实现盈亏）。"""
     data = as_dict(group)
     data.update(leg_metadata or _leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
+    if not isinstance(group, HedgeGroupSnapshot):
+        actual_entry_spread = actual_entry_spread_from_fills(db, group)
+        if actual_entry_spread is not None:
+            # 历史记录可能保留了建组时的占位值；列表读取时以成交事实为准。
+            data["entry_spread"] = actual_entry_spread
+        elif group.status in {"pending_open", "opening", "open", "open_partial"}:
+            # 没有双腿成交事实时不能把建组占位值称为真实开仓价差。
+            data["entry_spread"] = None
     spreads = hedge_group_spreads(group)
     data.update(spreads)
     current_close_spread = spreads.get("current_close_spread")

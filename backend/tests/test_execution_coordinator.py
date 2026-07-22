@@ -11,6 +11,7 @@ from app.core.time_utils import utc_now
 from app.db.models import ArbitrageOpportunity, Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, Order, StrategySetting, SymbolMapping
 from app.execution.coordinator import create_close_intent, create_open_intent, create_recovery_intent
 from app.execution.outbox_worker import run_execution_outbox_once
+from app.execution.pnl import actual_entry_spread_from_fills
 from tests.native_fakes import order_snapshot
 
 
@@ -204,6 +205,7 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         group_id = result.intent.hedge_group_id
         db.commit()
         assert db.get(HedgeGroup, group_id).status == "opening"
+        assert db.get(HedgeGroup, group_id).entry_spread == 0
         assert db.get(ArbitrageOpportunity, opportunity_id).status == "executing"
     calls = []
 
@@ -216,6 +218,11 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         group = db.get(HedgeGroup, group_id)
         assert group.status == "open"
         assert group.opened_at is not None
+        assert group.trigger_spread == 2.0
+        assert group.entry_spread == -1.0
+        # 新执行模型的交易所回报本身足以还原真实价差，不依赖迁移期旧 Fill 表。
+        db.query(Fill).delete()
+        assert actual_entry_spread_from_fills(db, group) == -1.0
         assert db.get(ArbitrageOpportunity, opportunity_id).status == "executed"
         open_orders = db.query(Order).filter_by(hedge_group_id=group_id, reduce_only=False).all()
         assert len(open_orders) == 2

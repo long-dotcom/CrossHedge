@@ -76,7 +76,9 @@ function toHedgeGroup(item: HedgePoolItem): V2HedgeGroup {
     sortStage: item.stage,
     pnl: Number(item.unrealized_pnl || 0),
     triggerSpread: item.trigger_spread == null ? undefined : Number(item.trigger_spread),
-    entrySpread: Number(item.entry_spread || 0),
+    entrySpread: item.entry_spread == null || (item.stage === 'opening' && Number(item.entry_spread) === 0)
+      ? undefined
+      : Number(item.entry_spread),
     currentSpread: item.current_close_spread == null ? undefined : Number(item.current_close_spread),
   };
 }

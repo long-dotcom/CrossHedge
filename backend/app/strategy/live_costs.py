@@ -2,26 +2,23 @@
 实时成本数据模块
 ================
 
-按 venue 自动获取实时费率数据，包括：
+按 venue 自动获取实时交易手续费率，包括：
 
 - Hyperliquid 用户费率（userFees）
-- Hyperliquid 资金费率（metaAndAssetCtxs）
-- 原生连接器返回的 maker/taker 费率和永续 funding
-- MT5 品种隔夜利息
+- Hyperliquid 资产元数据对应的费率倍率（metaAndAssetCtxs）
+- 原生连接器返回的 maker/taker 费率
 
 使用 ``TTLCache`` 缓存结果，避免频繁请求。
 
 使用方式::
 
-    from app.strategy.live_costs import leg_a_cost_inputs, mt5_cost_inputs
+    from app.strategy.live_costs import leg_a_cost_inputs
 
     hl_costs = leg_a_cost_inputs("ETH")
-    mt5_costs = mt5_cost_inputs("BTCUSD", "buy", 0.01, 0.5)
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from app.config.settings import get_settings
@@ -29,7 +26,6 @@ from app.core.cache import TTLCache
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
 from app.core.type_utils import safe_float
-from app.market.fx import fx_to_usd
 from app.venues.manager import native_venue_manager
 
 logger = get_logger(__name__)
@@ -42,15 +38,11 @@ class VenueCostInputs:
     属性:
         taker_fee_rate: Taker 费率
         maker_fee_rate: Maker 费率
-        funding_rate: 资金费率
-        funding_interval_hours: 资金费率对应的结算周期（小时）
         source: 数据来源标识
     """
     taker_fee_rate: float
     maker_fee_rate: float
-    funding_rate: float
     source: str
-    funding_interval_hours: float = 1.0
 
 
 # 向后兼容别名
@@ -58,29 +50,8 @@ HyperliquidCostInputs = VenueCostInputs
 
 
 @dataclass
-class MT5CostInputs:
-    """MT5 成本输入参数。
-
-    属性:
-        commission_rate: 佣金率
-        swap_cost: 隔夜利息成本（已折算为 USD）
-        swap_long: 多头隔夜利息原始值
-        swap_short: 空头隔夜利息原始值
-        swap_mode: 利息模式（0=金额, 1=点数, ...）
-        source: 数据来源标识
-    """
-    commission_rate: float
-    swap_cost: float
-    swap_long: float
-    swap_short: float
-    swap_mode: int
-    source: str
-
-
-@dataclass
 class HyperliquidMarketData:
-    """Hyperliquid 市场数据（资金费率 + 资产元数据）。"""
-    funding_rates: dict[str, float]
+    """用于确定 HIP-3 费率倍率的资产元数据。"""
     asset_meta: dict[str, dict]
 
 
@@ -90,16 +61,16 @@ _cost_cache_ttl = max(float(get_settings().cost.cost_cache_ttl_seconds), 1.0)
 _hl_market_cache: TTLCache[HyperliquidMarketData] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="hl-market-costs")
 # 用户费率缓存，TTL 同上
 _hl_user_fee_cache: TTLCache[tuple[float, float]] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="hl-user-fees")
-# 交易所成本缓存，避免扫描循环反复请求品种与 funding。
+# 交易所手续费缓存，避免扫描循环反复请求品种费率。
 _venue_cost_cache: TTLCache[VenueCostInputs] = TTLCache(ttl_seconds=_cost_cache_ttl, namespace="venue-costs")
 
 
 class VenueCostUnavailable(RuntimeError):
-    """venue 费率或 funding 无法自动获取。"""
+    """venue 交易手续费率无法自动获取。"""
 
 
 def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
-    """按 venue 自动获取 maker/taker 费率和 funding。
+    """按 venue 自动获取 maker/taker 交易手续费率。
 
     不支持或查询失败时抛出异常，调用方必须阻止成本未知的候选进入执行，
     禁止静默套用 Hyperliquid 费率或按零成本处理。
@@ -108,7 +79,7 @@ def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
     if normalized == "hyperliquid":
         return leg_a_cost_inputs(symbol)
     if normalized == "mt5":
-        return VenueCostInputs(0.0, 0.0, 0.0, "mt5_no_trading_fee", 1.0)
+        return VenueCostInputs(0.0, 0.0, "mt5_no_trading_fee")
 
     cache_key = f"{normalized}:{str(symbol or '').upper()}"
     cached = _venue_cost_cache.get(cache_key)
@@ -121,8 +92,6 @@ def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
         result = VenueCostInputs(
             taker_fee_rate=safe_float(instrument.taker_fee_rate),
             maker_fee_rate=safe_float(instrument.maker_fee_rate),
-            funding_rate=safe_float(instrument.funding_rate),
-            funding_interval_hours=8.0 if normalized == "binance" else 1.0,
             source=f"native_{normalized}",
         )
     except Exception as exc:
@@ -150,7 +119,7 @@ def estimated_pair_close_fee(mapping, notional: float) -> float:
 def leg_a_cost_inputs(symbol: str) -> VenueCostInputs:
     """获取 Leg A（Hyperliquid）的综合成本输入。
 
-    从 Hyperliquid API 读取用户费率和资金费率，结合资产元数据
+    从 Hyperliquid API 读取用户费率，结合资产元数据
     计算有效费率（考虑 growth mode 等）。
 
     参数:
@@ -167,103 +136,12 @@ def leg_a_cost_inputs(symbol: str) -> VenueCostInputs:
     return VenueCostInputs(
         taker_fee_rate=effective_taker,
         maker_fee_rate=effective_maker,
-        funding_rate=market_data.funding_rates.get(symbol, 0.00010),
-        funding_interval_hours=1.0,
         source=f"{fee_source}+metaAndAssetCtxs",
     )
 
 
 # 向后兼容别名
 hyperliquid_cost_inputs = leg_a_cost_inputs
-
-
-def mt5_cost_inputs(mt5_symbol: str, mt5_side: str, quantity: float, holding_days: float) -> MT5CostInputs:
-    """自动获取 MT5 品种隔夜利息；账户佣金固定按 0 处理。
-
-    参数:
-        mt5_symbol: MT5 品种名
-        mt5_side: 交易方向（``"buy"`` / ``"sell"``）
-        quantity: 交易数量（手数）
-        holding_days: 预估持仓天数
-
-    返回:
-        MT5CostInputs
-    """
-    try:
-        connector = native_venue_manager.connector_for("mt5", "live")
-        instrument = connector.get_instrument(mt5_symbol)
-        tick = connector.get_ticker(mt5_symbol)
-        account = connector.get_account()
-    except Exception as exc:
-        logger.warning("MT5 Gateway 成本数据不可用，使用默认 MT5 成本: {}", exc)
-        return MT5CostInputs(0.0, 0.0, 0.0, 0.0, 0, "mt5_swap_unavailable")
-    info = instrument.raw
-    swap_long = safe_float(instrument.long_carry_rate)
-    swap_short = safe_float(instrument.short_carry_rate)
-    swap_mode = int(info.get("swap_mode", 0))
-    point = safe_float(info.get("point", instrument.price_tick))
-    contract_size = safe_float(instrument.contract_size)
-    current_price = (safe_float(tick.bid) + safe_float(tick.ask)) / 2
-    currency_by_mode = {
-        2: instrument.base_asset or "USD",
-        3: instrument.settlement_asset or "USD",
-        4: account.currency or "USD",
-    }
-    swap_currency = currency_by_mode.get(swap_mode, "USD")
-    currency_rate_to_usd = fx_to_usd(swap_currency).rate_to_usd if swap_mode in currency_by_mode else 1.0
-    selected_swap = swap_long if mt5_side == "buy" else swap_short
-    swap_cost = _estimate_mt5_swap_cost(
-        selected_swap,
-        swap_mode,
-        point,
-        contract_size,
-        quantity,
-        holding_days,
-        current_price=current_price,
-        currency_rate_to_usd=currency_rate_to_usd,
-    )
-    return MT5CostInputs(
-        commission_rate=0.0,
-        swap_cost=swap_cost,
-        swap_long=swap_long,
-        swap_short=swap_short,
-        swap_mode=swap_mode,
-        source=f"mt5_symbol_info_swap_mode_{swap_mode}",
-    )
-
-
-def _estimate_mt5_swap_cost(
-    swap_value: float,
-    swap_mode: int,
-    point: float,
-    contract_size: float,
-    quantity: float,
-    holding_days: float,
-    *,
-    current_price: float = 0.0,
-    currency_rate_to_usd: float = 1.0,
-) -> float:
-    """估算 MT5 隔夜利息成本。
-
-    支持 MT5 的 points、货币、年化利率和 reopen 模式；负值表示支付，
-    正值表示收取。holding_days 表示期望持仓天数，因此结果是期望成本。
-    """
-    if swap_mode == 0 or holding_days <= 0:
-        return 0.0
-    if swap_mode in {1, 7, 8}:
-        # points / reopen：swap 参数以价格点数表示。
-        swap_pnl = swap_value * point * contract_size * quantity * holding_days
-        return -swap_pnl
-    if swap_mode in {2, 3, 4}:
-        # 指定货币金额/手/天，统一折算为 USD。
-        swap_pnl = swap_value * quantity * holding_days * currency_rate_to_usd
-        return -swap_pnl
-    if swap_mode in {5, 6}:
-        # 年化百分比，MT5 使用 360 天银行年；open 模式在估算阶段用当前价近似。
-        notional = current_price * contract_size * quantity
-        swap_pnl = notional * (swap_value / 100.0) * (holding_days / 360.0)
-        return -swap_pnl
-    raise ValueError(f"不支持的 MT5 swap_mode: {swap_mode}")
 
 
 def _leg_a_user_fee_rates() -> tuple[float, float]:
@@ -294,7 +172,7 @@ def _leg_a_user_fee_rates() -> tuple[float, float]:
 
 
 def _leg_a_market_data(symbol: str = "") -> HyperliquidMarketData:
-    """获取 Hyperliquid 资金费率和资产元数据。
+    """获取用于确定手续费倍率的 Hyperliquid 资产元数据。
 
     通过 ``metaAndAssetCtxs`` 接口读取所有品种的资金费率和元信息。
     结果按 dex 分组缓存。
@@ -309,19 +187,17 @@ def _leg_a_market_data(symbol: str = "") -> HyperliquidMarketData:
         payload: dict = {"type": "metaAndAssetCtxs"}
         if dex:
             payload["dex"] = dex
-        meta, contexts = post_hyperliquid_info(settings.hyperliquid.info_url, payload)
-        rates: dict[str, float] = {}
+        meta, _contexts = post_hyperliquid_info(settings.hyperliquid.info_url, payload)
         asset_meta: dict[str, dict] = {}
-        for asset, context in zip(meta.get("universe", []), contexts):
+        for asset in meta.get("universe", []):
             name = asset.get("name", "")
-            rates[name] = safe_float(context.get("funding", 0.0))
             asset_meta[name] = asset
-        market_data = HyperliquidMarketData(rates, asset_meta)
+        market_data = HyperliquidMarketData(asset_meta)
         _hl_market_cache.set(cache_key, market_data)
         return market_data
     except Exception as exc:
-        logger.warning("Hyperliquid funding 读取失败，使用默认 funding: {}", exc)
-        return HyperliquidMarketData({}, {})
+        logger.warning("Hyperliquid 资产费率元数据读取失败，使用保守费率倍率: {}", exc)
+        return HyperliquidMarketData({})
 
 
 def _hyperliquid_effective_fee_rates(

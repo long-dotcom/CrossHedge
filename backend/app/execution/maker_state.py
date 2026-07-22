@@ -335,6 +335,13 @@ def _complete_maker_intent(
         if opportunity is not None:
             opportunity.status = "executed" if ratio > 0 else "rejected"
             opportunity.reject_reason = group.close_reason
+        if ratio > 0:
+            # Maker 与后续 Hedge 都已形成成交事实后，才写入真实开仓价差。
+            from app.execution.pnl import actual_entry_spread_from_fills
+
+            actual_entry_spread = actual_entry_spread_from_fills(db, group)
+            if actual_entry_spread is not None:
+                group.entry_spread = actual_entry_spread
     else:
         if ratio >= 1.0 - 1e-9:
             group.status = "closed"

@@ -53,6 +53,7 @@ MT5 Gateway 会把账户、持仓、行情和品种合约规格定时写入 Redi
 在 Coolify 中应把这些值配置为运行时 Secret，并在重新部署时继续使用原值。
 
 默认访问地址为 `http://localhost:8080`。完整键名、启动顺序、幂等约束和故障处理见 [MT5 Gateway 架构](docs/MT5_GATEWAY_ARCHITECTURE.md)。
+行情管道当前延迟指标的口径、潜在瓶颈和后续采样顺序见 [行情管道高延迟调查](docs/PIPELINE_LATENCY_INVESTIGATION.md)。
 
 ## 原生交易所架构
 
@@ -93,6 +94,10 @@ mt5_gateway/
 ## 订单生命周期
 
 FastAPI 只创建不可变 Intent、ExecutionLeg 和 Outbox。独立执行 Worker 是唯一允许调用 `submit_order` 的业务进程：
+
+- 对冲组的“触发价差”保存策略满足条件时的双腿行情快照；“开仓价差”在双腿成交前保持未确认，成交后按交易所返回的累计成交均价计算。新执行模型的 `VenueOrder.average_price/filled_quantity` 为主数据源，旧 `orders/fills` 仅用于兼容历史记录。
+- 仪表盘“今日盈亏”按 UTC 自然日统计今日已实现盈亏，再加当前开放对冲组的实时未实现盈亏；“已实现盈亏”卡片仍展示全部历史已平仓汇总。
+- 扫描与候选阶段的成本口径仅包含可执行 bid/ask 已体现的双腿点差，以及两腿开仓、平仓交易手续费；不再读取或预测 Funding、MT5 Swap、滑点和 FX 附加成本。真实成交后已经发生的 Funding/Swap 仍保留在执行账本中，用于盈亏与审计。
 
 - 下单前校验异常、确定性提交失败、结果未知异常以及交易所拒绝都会写入旧订单的
   `error_message`、Intent、Outbox/ExecutionEvent 和 `SystemLog(category=execution)`；
