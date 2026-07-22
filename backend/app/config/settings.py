@@ -134,8 +134,10 @@ class QuoteSettings:
     stale_ms: int = 1500
     # 推送流间隔 / 毫秒（STREAM_INTERVAL_MS）
     stream_interval_ms: int = 1000
-    # 信号统计缓存 TTL / 毫秒（SIGNAL_STATS_CACHE_TTL_MS）
-    signal_stats_cache_ttl_ms: int = 10000
+    # 信号统计后台刷新间隔 / 毫秒（SIGNAL_STATS_REFRESH_INTERVAL_MS）
+    signal_stats_refresh_interval_ms: int = 10000
+    # 信号统计缓存 TTL / 毫秒（SIGNAL_STATS_CACHE_TTL_MS），应明显长于刷新间隔
+    signal_stats_cache_ttl_ms: int = 60000
 
 
 @dataclass
@@ -298,6 +300,7 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "STRICT_QUOTE_SYNC_MS":              ("quote", "strict_sync_ms"),
     "QUOTE_STALE_MS":                    ("quote", "stale_ms"),
     "STREAM_INTERVAL_MS":                ("quote", "stream_interval_ms"),
+    "SIGNAL_STATS_REFRESH_INTERVAL_MS":  ("quote", "signal_stats_refresh_interval_ms"),
     "SIGNAL_STATS_CACHE_TTL_MS":         ("quote", "signal_stats_cache_ttl_ms"),
     # --- ScannerSettings ---
     "SCANNER_INTERVAL_MS":               ("scanner", "interval_ms"),
@@ -488,6 +491,8 @@ def _validate_settings(settings: Settings) -> None:
         "STRICT_QUOTE_SYNC_MS": settings.quote.strict_sync_ms,
         "QUOTE_STALE_MS": settings.quote.stale_ms,
         "STREAM_INTERVAL_MS": settings.quote.stream_interval_ms,
+        "SIGNAL_STATS_REFRESH_INTERVAL_MS": settings.quote.signal_stats_refresh_interval_ms,
+        "SIGNAL_STATS_CACHE_TTL_MS": settings.quote.signal_stats_cache_ttl_ms,
         "SCAN_PERSIST_INTERVAL_MS": settings.scanner.persist_interval_ms,
         "EXECUTION_MAINTENANCE_INTERVAL_MS": settings.scanner.execution_maintenance_interval_ms,
         "SPREAD_HISTORY_INTERVAL_SECONDS": settings.scanner.spread_history_interval_seconds,

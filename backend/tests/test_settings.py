@@ -19,6 +19,14 @@ def test_runtime_security_allows_local_defaults() -> None:
 
     assert insecure_runtime_reasons(settings)
 
+
+def test_signal_stats_cache_outlives_refresh_interval() -> None:
+    settings = Settings(environment="local")
+
+    assert settings.quote.signal_stats_refresh_interval_ms == 10000
+    assert settings.quote.signal_stats_cache_ttl_ms == 60000
+    assert settings.quote.signal_stats_cache_ttl_ms > settings.quote.signal_stats_refresh_interval_ms
+
 def test_runtime_security_rejects_live_defaults_even_in_local() -> None:
     settings = Settings(environment="local", security=SecuritySettings(live_trading_enabled=True))
 

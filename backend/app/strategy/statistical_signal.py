@@ -63,7 +63,12 @@ class SignalStats:
 
 # 信号统计缓存：key → (monotonic_time, SignalStats)
 _stats_cache: TTLCache[SignalStats] = TTLCache(
-    ttl_seconds=max(get_settings().quote.signal_stats_cache_ttl_ms / 1000, 0.001),
+    # 兼容旧环境：即使 TTL 仍被配置成与刷新间隔相同，也至少保留三个刷新周期，
+    # 避免刷新期间扫描线程读到空缓存并同步回源数据库。
+    ttl_seconds=max(
+        get_settings().quote.signal_stats_cache_ttl_ms,
+        get_settings().quote.signal_stats_refresh_interval_ms * 3,
+    ) / 1000,
     namespace="signal-stats",
 )
 

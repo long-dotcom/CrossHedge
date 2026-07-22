@@ -275,7 +275,7 @@ def _schedule_next_stats() -> None:
     if not _running:
         return
     settings = get_settings()
-    interval = max(settings.quote.signal_stats_cache_ttl_ms / 1000, 1.0)
+    interval = max(settings.quote.signal_stats_refresh_interval_ms / 1000, 1.0)
     _stats_timer = threading.Timer(interval, signal_stats_job)
     _stats_timer.daemon = True
     _stats_timer.start()
