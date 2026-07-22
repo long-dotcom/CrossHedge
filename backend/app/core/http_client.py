@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import json
 import math
+from time import perf_counter
 from urllib import request
 from urllib.error import HTTPError
 
 from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
 from app.core.redis_client import redis_client, redis_key
 
 logger = get_logger(__name__)
@@ -59,7 +61,14 @@ def post_hyperliquid_info(
         Exception: 网络错误、超时或 JSON 解析失败时抛出，
             异常信息会通过 logger 记录。
     """
+    backoff_started = perf_counter()
     remaining = redis_client().ttl(_BACKOFF_KEY)
+    backoff_duration_ms = elapsed_ms(backoff_started)
+    payload_type = payload.get("type", "")
+    log_slow_operation(
+        logger, "redis", "hyperliquid_backoff_get", backoff_duration_ms,
+        payload_type=payload_type,
+    )
     if remaining > 0:
         raise HyperliquidRateLimitError(f"Hyperliquid 限流退避中，约 {remaining} 秒后重试")
 
@@ -70,12 +79,28 @@ def post_hyperliquid_info(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    request_started = perf_counter()
     try:
         with request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode("utf-8"))
+            request_duration_ms = elapsed_ms(request_started)
+            log_slow_operation(
+                logger, "http", "hyperliquid_info", request_duration_ms,
+                payload_type=payload_type, status=getattr(resp, "status", ""),
+            )
+            strikes_started = perf_counter()
             redis_client().delete(_STRIKES_KEY)
+            strikes_duration_ms = elapsed_ms(strikes_started)
+            log_slow_operation(
+                logger, "redis", "hyperliquid_strikes_delete", strikes_duration_ms,
+                payload_type=payload_type,
+            )
             return result
     except HTTPError as exc:
+        log_slow_operation(
+            logger, "http", "hyperliquid_info_error", elapsed_ms(request_started),
+            payload_type=payload_type, status=exc.code,
+        )
         if exc.code == 429:
             strikes = int(redis_client().incr(_STRIKES_KEY))
             redis_client().expire(_STRIKES_KEY, 300)
@@ -97,6 +122,10 @@ def post_hyperliquid_info(
         )
         raise
     except Exception as exc:
+        log_slow_operation(
+            logger, "http", "hyperliquid_info_error", elapsed_ms(request_started),
+            payload_type=payload_type, error_type=type(exc).__name__,
+        )
         logger.warning(
             "Hyperliquid 请求失败: url={}, payload_type={}, error={}",
             url,

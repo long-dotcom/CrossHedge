@@ -367,6 +367,26 @@ def test_scan_state_spread_dict_includes_compute_timings() -> None:
     assert data["signal_duration_ms"] == 0.4
     assert data["candidate_sync_duration_ms"] == 0.2
 
+
+def test_scanner_legacy_timings_are_rebuilt_from_non_overlapping_phases() -> None:
+    timings = {
+        "venue_cost_a_duration_ms": 1.0,
+        "venue_cost_b_duration_ms": 2.0,
+        "cost_compute_duration_ms": 3.0,
+        "signal_first_duration_ms": 4.0,
+        "signal_second_duration_ms": 5.0,
+        "gates_duration_ms": 6.0,
+        "candidate_build_duration_ms": 7.0,
+        "result_assembly_duration_ms": 8.0,
+    }
+
+    scanner_module._finalize_legacy_timings(timings)
+
+    assert timings["cost_duration_ms"] == 6.0
+    assert timings["signal_duration_ms"] == 9.0
+    assert timings["candidate_sync_duration_ms"] == 13.0
+    assert timings["persist_duration_ms"] == 8.0
+
 def test_xyz_missing_meta_falls_back_to_growth_fee_multiplier() -> None:
     taker, maker, source = _hyperliquid_effective_fee_rates("xyz:JPY", 0.00045, 0.00015, {})
     assert taker == pytest.approx(0.00009)

@@ -20,11 +20,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 from app.config.settings import get_settings
 from app.core.cache import TTLCache
 from app.core.http_client import post_hyperliquid_info
 from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
 from app.core.type_utils import safe_float
 from app.venues.manager import native_venue_manager
 
@@ -82,13 +84,32 @@ def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
         return VenueCostInputs(0.0, 0.0, "mt5_no_trading_fee")
 
     cache_key = f"{normalized}:{str(symbol or '').upper()}"
+    cache_started = perf_counter()
     cached = _venue_cost_cache.get(cache_key)
+    cache_duration_ms = elapsed_ms(cache_started)
+    log_slow_operation(
+        logger, "redis", "venue_cost_cache_get", cache_duration_ms,
+        venue=normalized, symbol=symbol, cache_hit=bool(cached),
+    )
     if cached:
         return cached
     try:
         from app.venues.manager import native_venue_manager
 
-        instrument = native_venue_manager.connector_for(normalized, "live").get_instrument(symbol)
+        connector_started = perf_counter()
+        connector = native_venue_manager.connector_for(normalized, "live")
+        connector_duration_ms = elapsed_ms(connector_started)
+        log_slow_operation(
+            logger, "database", "venue_connector_resolve", connector_duration_ms,
+            venue=normalized, symbol=symbol,
+        )
+        instrument_started = perf_counter()
+        instrument = connector.get_instrument(symbol)
+        instrument_duration_ms = elapsed_ms(instrument_started)
+        log_slow_operation(
+            logger, "venue", "instrument_get", instrument_duration_ms,
+            venue=normalized, symbol=symbol,
+        )
         result = VenueCostInputs(
             taker_fee_rate=safe_float(instrument.taker_fee_rate),
             maker_fee_rate=safe_float(instrument.maker_fee_rate),
@@ -96,7 +117,12 @@ def venue_cost_inputs(venue: str, symbol: str) -> VenueCostInputs:
         )
     except Exception as exc:
         raise VenueCostUnavailable(f"{normalized} {symbol} 自动成本查询失败: {exc}") from exc
+    cache_set_started = perf_counter()
     _venue_cost_cache.set(cache_key, result)
+    log_slow_operation(
+        logger, "redis", "venue_cost_cache_set", elapsed_ms(cache_set_started),
+        venue=normalized, symbol=symbol,
+    )
     return result
 
 
@@ -151,7 +177,12 @@ def _leg_a_user_fee_rates() -> tuple[float, float]:
     结果通过 TTLCache 缓存。
     """
     settings = get_settings()
+    cache_started = perf_counter()
     cached = _hl_user_fee_cache.get("user_fees")
+    log_slow_operation(
+        logger, "redis", "hyperliquid_user_fee_cache_get", elapsed_ms(cache_started),
+        cache_hit=bool(cached),
+    )
     if cached:
         return cached
     account_address = settings.hyperliquid.account_address
@@ -164,7 +195,11 @@ def _leg_a_user_fee_rates() -> tuple[float, float]:
         )
         taker = safe_float(data.get("userCrossRate"), settings.hyperliquid.default_taker_fee_rate)
         maker = safe_float(data.get("userAddRate"), settings.hyperliquid.default_maker_fee_rate)
+        cache_set_started = perf_counter()
         _hl_user_fee_cache.set("user_fees", (taker, maker))
+        log_slow_operation(
+            logger, "redis", "hyperliquid_user_fee_cache_set", elapsed_ms(cache_set_started),
+        )
         return taker, maker
     except Exception as exc:
         logger.warning("Hyperliquid userFees 读取失败，使用默认费率: {}", exc)
@@ -180,7 +215,12 @@ def _leg_a_market_data(symbol: str = "") -> HyperliquidMarketData:
     settings = get_settings()
     dex = symbol.split(":", 1)[0] if ":" in symbol else ""
     cache_key = f"market_{dex}"
+    cache_started = perf_counter()
     cached = _hl_market_cache.get(cache_key)
+    log_slow_operation(
+        logger, "redis", "hyperliquid_meta_cache_get", elapsed_ms(cache_started),
+        dex=dex or "default", cache_hit=bool(cached),
+    )
     if cached:
         return cached
     try:
@@ -193,7 +233,12 @@ def _leg_a_market_data(symbol: str = "") -> HyperliquidMarketData:
             name = asset.get("name", "")
             asset_meta[name] = asset
         market_data = HyperliquidMarketData(asset_meta)
+        cache_set_started = perf_counter()
         _hl_market_cache.set(cache_key, market_data)
+        log_slow_operation(
+            logger, "redis", "hyperliquid_meta_cache_set", elapsed_ms(cache_set_started),
+            dex=dex or "default",
+        )
         return market_data
     except Exception as exc:
         logger.warning("Hyperliquid 资产费率元数据读取失败，使用保守费率倍率: {}", exc)

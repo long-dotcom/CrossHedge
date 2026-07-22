@@ -154,6 +154,8 @@ class ScannerSettings:
     spread_history_interval_seconds: int = 5
     # 价差分桶窗口 / 秒（SPREAD_BUCKET_SECONDS）
     spread_bucket_seconds: int = 5
+    # 单阶段慢操作告警阈值 / 毫秒（SCANNER_SLOW_PHASE_MS）
+    slow_phase_ms: float = 50.0
 
 
 @dataclass
@@ -303,6 +305,7 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     "EXECUTION_MAINTENANCE_INTERVAL_MS": ("scanner", "execution_maintenance_interval_ms"),
     "SPREAD_HISTORY_INTERVAL_SECONDS":   ("scanner", "spread_history_interval_seconds"),
     "SPREAD_BUCKET_SECONDS":             ("scanner", "spread_bucket_seconds"),
+    "SCANNER_SLOW_PHASE_MS":            ("scanner", "slow_phase_ms"),
     # --- HyperliquidSettings ---
     "HYPERLIQUID_DEFAULT_TAKER_FEE_RATE": ("hyperliquid", "default_taker_fee_rate"),
     "HYPERLIQUID_DEFAULT_MAKER_FEE_RATE": ("hyperliquid", "default_maker_fee_rate"),
@@ -489,6 +492,7 @@ def _validate_settings(settings: Settings) -> None:
         "EXECUTION_MAINTENANCE_INTERVAL_MS": settings.scanner.execution_maintenance_interval_ms,
         "SPREAD_HISTORY_INTERVAL_SECONDS": settings.scanner.spread_history_interval_seconds,
         "SPREAD_BUCKET_SECONDS": settings.scanner.spread_bucket_seconds,
+        "SCANNER_SLOW_PHASE_MS": settings.scanner.slow_phase_ms,
         "COST_CACHE_TTL_SECONDS": settings.cost.cost_cache_ttl_seconds,
         "MT5_RPC_TIMEOUT_SECONDS": settings.redis.mt5_rpc_timeout_seconds,
         "MT5_SNAPSHOT_TTL_SECONDS": settings.redis.mt5_snapshot_ttl_seconds,

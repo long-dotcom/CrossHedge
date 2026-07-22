@@ -19,13 +19,17 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from time import perf_counter
 from typing import Literal
 
+from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
 from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 
 # 同步模式类型：loose（宽松）或 strict（严格）
 SyncMode = Literal["loose", "strict"]
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +170,13 @@ class QuoteCache:
 
     def latest(self, platform: str, symbol: str) -> Quote | None:
         """获取指定平台和品种的最新报价。"""
+        started = perf_counter()
         raw = redis_client().get(self._latest_key(platform, symbol))
+        duration_ms = elapsed_ms(started)
+        log_slow_operation(
+            logger, "redis", "quote_latest", duration_ms,
+            platform=platform, symbol=symbol,
+        )
         return _quote_from_json(raw) if raw else None
 
     def history(self, platform: str, symbol: str) -> list[Quote]:

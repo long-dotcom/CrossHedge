@@ -25,8 +25,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 from time import monotonic, perf_counter
 from types import SimpleNamespace
 
@@ -34,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation, slow_operation_threshold_ms
 from app.core.time_utils import utc_now
 from app.db.models import (
     ArbitrageOpportunity, MarketSnapshot, SpreadBucket, SpreadCurrent,
@@ -99,6 +102,7 @@ class GateResult:
 _bucket_accumulators: dict[tuple[str, str], BucketAccumulator] = {}
 _last_snapshot_flush: dict[tuple[str, str], float] = {}
 _scan_timings: dict[str, dict[str, float]] = {}
+_scan_sequence = count(1)
 
 # 策略配置缓存：使用 TTLCache 替代手写 tuple+monotonic
 from app.core.cache import TTLCache
@@ -150,22 +154,34 @@ def run_scan(db: Session) -> int:
         新增/更新的套利机会数量
     """
     started = perf_counter()
+    scan_id = next(_scan_sequence)
     created = 0
+    setup_started = perf_counter()
     strategy = get_strategy_setting(db)
     settings = get_settings()
-    logger.info("价差扫描开始")
+    setup_duration_ms = elapsed_ms(setup_started)
+    mapping_started = perf_counter()
+    mappings = list(enabled_mappings(db))
+    mapping_duration_ms = elapsed_ms(mapping_started)
+    log_slow_operation(logger, "scanner", "scan_setup", setup_duration_ms, scan_id=scan_id)
+    log_slow_operation(logger, "scanner", "mapping_load", mapping_duration_ms, scan_id=scan_id)
+    logger.info(
+        "价差扫描开始: scan_id={}, symbols={}, setup_ms={:.1f}, mapping_ms={:.1f}",
+        scan_id, len(mappings), setup_duration_ms, mapping_duration_ms,
+    )
     try:
         current_payloads: list[dict] = []
         direction_payloads_all: list[dict] = []
         opportunity_payloads: list[dict] = []
-        for mapping in enabled_mappings(db):
+        for mapping in mappings:
             symbol_started = perf_counter()
             timings: dict[str, float] = {}
             try:
                 # ── 非原生品种对：只读模式 ──────────────────────────────────
                 if not is_native_pair(mapping):
-                    persist_started = perf_counter()
-                    readonly_payloads = _readonly_leg_pair_payloads(mapping, settings, strategy)
+                    with _timed_phase(timings, "readonly_scan_duration_ms", scan_id, mapping.symbol):
+                        readonly_payloads = _readonly_leg_pair_payloads(mapping, settings, strategy)
+                    assembly_started = perf_counter()
                     if readonly_payloads:
                         direction_payloads_all.extend(readonly_payloads)
                         current_payloads.append(_best_current_payload(readonly_payloads))
@@ -179,20 +195,19 @@ def run_scan(db: Session) -> int:
                             status="rejected", reason="缺少原生连接器行情",
                             gate="quote", blocker="quote",
                         ))
-                    _record_duration(timings, "persist_duration_ms", persist_started)
+                    _record_duration(timings, "result_assembly_duration_ms", assembly_started)
                     continue
 
                 # ── MT5 会话状态检查 ──────────────────────────────────────
-                quote_sync_started = perf_counter()
                 has_mt5 = "mt5" in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}
-                session_state = mt5_session_state(mapping) if has_mt5 else SimpleNamespace(
-                    can_quote=True,
-                    status="not_applicable",
-                    reason="",
-                )
+                with _timed_phase(timings, "session_duration_ms", scan_id, mapping.symbol):
+                    session_state = mt5_session_state(mapping) if has_mt5 else SimpleNamespace(
+                        can_quote=True,
+                        status="not_applicable",
+                        reason="",
+                    )
                 if not session_state.can_quote:
-                    _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
-                    persist_started = perf_counter()
+                    assembly_started = perf_counter()
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
@@ -202,24 +217,24 @@ def run_scan(db: Session) -> int:
                         reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
                         gate="market", blocker="market",
                     ))
-                    _record_duration(timings, "persist_duration_ms", persist_started)
+                    _record_duration(timings, "result_assembly_duration_ms", assembly_started)
                     continue
 
                 # ── 报价同步 ──────────────────────────────────────────────
                 leg_a_venue_name, _ = mapping_leg(mapping, "a")
                 leg_b_venue_name, _ = mapping_leg(mapping, "b")
                 leg_meta = _leg_metadata(mapping)
-                synced, sync_reason = quote_synchronizer.synchronized(
-                    mapping.symbol,
-                    mode="loose",
-                    max_time_diff_ms=settings.quote.loose_sync_ms,
-                    max_age_ms=max(settings.quote.stale_ms, settings.quote.loose_sync_ms),
-                    leg_a_venue=leg_a_venue_name,
-                    leg_b_venue=leg_b_venue_name,
-                )
-                _record_duration(timings, "quote_sync_duration_ms", quote_sync_started)
+                with _timed_phase(timings, "quote_sync_duration_ms", scan_id, mapping.symbol):
+                    synced, sync_reason = quote_synchronizer.synchronized(
+                        mapping.symbol,
+                        mode="loose",
+                        max_time_diff_ms=settings.quote.loose_sync_ms,
+                        max_age_ms=max(settings.quote.stale_ms, settings.quote.loose_sync_ms),
+                        leg_a_venue=leg_a_venue_name,
+                        leg_b_venue=leg_b_venue_name,
+                    )
                 if not synced:
-                    persist_started = perf_counter()
+                    assembly_started = perf_counter()
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
@@ -228,20 +243,19 @@ def run_scan(db: Session) -> int:
                         status="rejected", reason=sync_reason,
                         gate="quote", blocker="quote",
                     ))
-                    _record_duration(timings, "persist_duration_ms", persist_started)
+                    _record_duration(timings, "result_assembly_duration_ms", assembly_started)
                     continue
 
                 hl = synced.leg_a
                 mt = synced.leg_b
 
                 # ── 仓位计算 ──────────────────────────────────────────────
-                sizing_started = perf_counter()
                 try:
-                    target_notional = getattr(mapping, "target_notional", strategy.default_notional)
-                    sizing = _position_sizing(mapping, mt.mid, hl.mid, target_notional)
+                    with _timed_phase(timings, "sizing_duration_ms", scan_id, mapping.symbol):
+                        target_notional = getattr(mapping, "target_notional", strategy.default_notional)
+                        sizing = _position_sizing(mapping, mt.mid, hl.mid, target_notional)
                 except ValueError as exc:
-                    _record_duration(timings, "sizing_duration_ms", sizing_started)
-                    persist_started = perf_counter()
+                    assembly_started = perf_counter()
                     current_payloads.append(_current_payload(
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=hl.bid, leg_a_ask=hl.ask, leg_b_bid=mt.bid, leg_b_ask=mt.ask,
@@ -252,80 +266,101 @@ def run_scan(db: Session) -> int:
                         status="rejected", reason=str(exc),
                         gate="market", blocker="sizing",
                     ))
-                    _record_duration(timings, "persist_duration_ms", persist_started)
+                    _record_duration(timings, "result_assembly_duration_ms", assembly_started)
                     continue
-                _record_duration(timings, "sizing_duration_ms", sizing_started)
 
                 # ── 成本估算 + 信号评估 + 门控判定 ────────────────────────
                 holding_minutes = getattr(mapping, "max_holding_minutes", strategy.max_holding_minutes)
                 holding_hours = max(holding_minutes / 60, 1)
                 leg_a_symbol = mapping_leg(mapping, "a")[1]
                 leg_b_symbol = mapping_leg(mapping, "b")[1]
-                leg_a_costs = venue_cost_inputs(leg_a_venue_name, leg_a_symbol)
-                leg_b_costs = venue_cost_inputs(leg_b_venue_name, leg_b_symbol)
-                persist_started = perf_counter()
+                with _timed_phase(
+                    timings, "venue_cost_a_duration_ms", scan_id, mapping.symbol,
+                    source=f"{leg_a_venue_name}:{leg_a_symbol}",
+                ):
+                    leg_a_costs = venue_cost_inputs(leg_a_venue_name, leg_a_symbol)
+                with _timed_phase(
+                    timings, "venue_cost_b_duration_ms", scan_id, mapping.symbol,
+                    source=f"{leg_b_venue_name}:{leg_b_symbol}",
+                ):
+                    leg_b_costs = venue_cost_inputs(leg_b_venue_name, leg_b_symbol)
                 direction_payloads = []
-                cost_started = perf_counter()
-                signal_started = perf_counter()
-                candidate_started = perf_counter()
                 for direction in DIRECTIONS:
-                    spread_values = spreads_for_direction(direction, hl.bid, hl.ask, mt.bid, mt.ask)
-                    gross_spread = spread_values.entry_spread
-                    breaker_feed(mapping.symbol, direction, spread_values.entry_spread)
-                    gross_profit = gross_spread * sizing.leg_a_quantity
-                    quantity = sizing.leg_b_quantity
-                    notional = sizing.notional_usd
-                    leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
-                    leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
-                    cost = estimate_pair_cost(
-                        notional=notional,
-                        leg_a_open_fee_rate=_venue_fee_rate(
-                            open_order_type(mapping, "a"), leg_a_costs,
-                            post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
-                        ),
-                        leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
-                        leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
-                        leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
-                        source=f"{leg_a_costs.source};{leg_b_costs.source}",
-                    )
-                    unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
+                    with _timed_phase(
+                        timings, "cost_compute_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        spread_values = spreads_for_direction(direction, hl.bid, hl.ask, mt.bid, mt.ask)
+                        gross_spread = spread_values.entry_spread
+                        breaker_feed(mapping.symbol, direction, spread_values.entry_spread)
+                        gross_profit = gross_spread * sizing.leg_a_quantity
+                        quantity = sizing.leg_b_quantity
+                        notional = sizing.notional_usd
+                        leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
+                        leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
+                        cost = estimate_pair_cost(
+                            notional=notional,
+                            leg_a_open_fee_rate=_venue_fee_rate(
+                                open_order_type(mapping, "a"), leg_a_costs,
+                                post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a",
+                            ),
+                            leg_a_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "a"), leg_a_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "a"),
+                            leg_b_open_fee_rate=_venue_fee_rate(open_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                            leg_b_close_fee_rate=_venue_fee_rate(close_order_type(mapping, "b"), leg_b_costs, post_only=execution_mode(mapping) == MAKER_THEN_MARKET and maker_leg(mapping) == "b"),
+                            source=f"{leg_a_costs.source};{leg_b_costs.source}",
+                        )
+                        unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
                     # 第一次评估用于得到统计退出线；最终收益必须扣除退出价差，
                     # 因为入场和平仓均使用可成交 bid/ask，不能另行重复扣点差。
                     provisional_net_profit = gross_profit - cost.total
                     provisional_unit_net_profit = gross_spread - unit_cost
                     provisional_annualized_return = (provisional_net_profit / notional) * (365 * 24 / holding_hours)
-                    statistical_signal = evaluate_entry_signal(
-                        db, strategy, mapping.symbol, direction,
-                        gross_spread, unit_cost, provisional_unit_net_profit,
-                        provisional_net_profit, provisional_annualized_return,
-                    )
-                    entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
-                    exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
-                    net_profit, unit_net_profit = _projected_profit(
-                        gross_spread, exit_target, cost.total, sizing.leg_a_quantity,
-                    )
-                    annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
+                    with _timed_phase(
+                        timings, "signal_first_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        statistical_signal = evaluate_entry_signal(
+                            db, strategy, mapping.symbol, direction,
+                            gross_spread, unit_cost, provisional_unit_net_profit,
+                            provisional_net_profit, provisional_annualized_return,
+                        )
+                    with _timed_phase(
+                        timings, "projection_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
+                        exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
+                        net_profit, unit_net_profit = _projected_profit(
+                            gross_spread, exit_target, cost.total, sizing.leg_a_quantity,
+                        )
+                        annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
                     # 用包含退出线摩擦的最终净利润再次执行利润门槛。
-                    statistical_signal = evaluate_entry_signal(
-                        db, strategy, mapping.symbol, direction,
-                        gross_spread, unit_cost, unit_net_profit, net_profit, annualized_return,
-                    )
-                    entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
-                    exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
-                    signal_gate = _signal_gate(mapping, statistical_signal.result, gross_spread)
-                    risk_tags = _risk_tags(gross_spread, statistical_signal)
-                    liquidity_gate = _liquidity_gate(
-                        mapping.symbol, leg_a_side, sizing.leg_a_quantity,
-                        notional, hl.depth_notional, signal_gate.status, leg_a_venue_name,
-                    )
-                    market_gate = (
-                        _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
-                        if has_mt5
-                        else GateResult("candidate", "", "market", "")
-                    )
-                    final_gate = _combine_gates(signal_gate, liquidity_gate, market_gate)
-                    reason = final_gate.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
-                    payload = dict(
+                    with _timed_phase(
+                        timings, "signal_second_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        statistical_signal = evaluate_entry_signal(
+                            db, strategy, mapping.symbol, direction,
+                            gross_spread, unit_cost, unit_net_profit, net_profit, annualized_return,
+                        )
+                    with _timed_phase(
+                        timings, "gates_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        entry_threshold = _effective_entry_threshold(mapping, statistical_signal.reachable_entry)
+                        exit_target = _effective_exit_target(mapping, statistical_signal.exit_target)
+                        signal_gate = _signal_gate(mapping, statistical_signal.result, gross_spread)
+                        risk_tags = _risk_tags(gross_spread, statistical_signal)
+                        liquidity_gate = _liquidity_gate(
+                            mapping.symbol, leg_a_side, sizing.leg_a_quantity,
+                            notional, hl.depth_notional, signal_gate.status, leg_a_venue_name,
+                        )
+                        market_gate = (
+                            _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
+                            if has_mt5
+                            else GateResult("candidate", "", "market", "")
+                        )
+                        final_gate = _combine_gates(signal_gate, liquidity_gate, market_gate)
+                        reason = final_gate.reason or f"loose_sync={synced.time_diff_ms:.0f}ms; mt5_session={session_state.status}"
+                    with _timed_phase(
+                        timings, "candidate_build_duration_ms", scan_id, mapping.symbol, direction=direction,
+                    ):
+                        payload = dict(
                         symbol=mapping.symbol, direction=direction, **leg_meta,
                         leg_a_bid=hl.bid, leg_a_ask=hl.ask, leg_b_bid=mt.bid, leg_b_ask=mt.ask,
                         quantity=quantity, leg_b_quantity=sizing.leg_b_quantity, leg_a_quantity=sizing.leg_a_quantity,
@@ -346,35 +381,43 @@ def run_scan(db: Session) -> int:
                         leg_b_captured_at=mt.local_recv_ts,
                         leg_a_depth_notional=hl.depth_notional,
                         leg_b_depth_notional=mt.depth_notional,
-                    )
-                    direction_payloads_all.append(payload)
-                    opportunity_payload = _opportunity_payload(
-                        payload, notional=notional, entry_threshold=entry_threshold,
-                        exit_target=exit_target,
-                        overheat_threshold=statistical_signal.overheat,
-                        signal_sample_count=statistical_signal.sample_count,
-                        reason=reason,
-                    )
-                    if opportunity_payload:
-                        created += 1
-                        opportunity_payloads.append(opportunity_payload)
-                    direction_payloads.append(payload)
-                _record_duration(timings, "cost_duration_ms", cost_started)
-                _record_duration(timings, "signal_duration_ms", signal_started)
-                _record_duration(timings, "candidate_sync_duration_ms", candidate_started)
+                        )
+                        direction_payloads_all.append(payload)
+                        opportunity_payload = _opportunity_payload(
+                            payload, notional=notional, entry_threshold=entry_threshold,
+                            exit_target=exit_target,
+                            overheat_threshold=statistical_signal.overheat,
+                            signal_sample_count=statistical_signal.sample_count,
+                            reason=reason,
+                        )
+                        if opportunity_payload:
+                            created += 1
+                            opportunity_payloads.append(opportunity_payload)
+                        direction_payloads.append(payload)
+                assembly_started = perf_counter()
                 best_payload = _best_current_payload(direction_payloads)
                 current_payloads.append(best_payload)
-                _record_duration(timings, "persist_duration_ms", persist_started)
+                _record_duration(timings, "result_assembly_duration_ms", assembly_started)
                 logger.debug(
-                    "扫描 {}: status={}, gate={}, spread={:.2f}",
-                    mapping.symbol, best_payload.get("status"), best_payload.get("gate"), best_payload.get("gross_spread", 0),
+                    "扫描 {}: scan_id={}, status={}, gate={}, spread={:.2f}",
+                    mapping.symbol, scan_id, best_payload.get("status"), best_payload.get("gate"), best_payload.get("gross_spread", 0),
                 )
             finally:
                 timings["symbol_scan_duration_ms"] = _elapsed_ms(symbol_started)
+                _finalize_legacy_timings(timings)
                 _scan_timings[mapping.symbol.upper()] = timings
+                _log_slow_symbol(scan_id, mapping.symbol, timings)
+        state_update_started = perf_counter()
         _update_scan_state_store(current_payloads, opportunity_payloads, direction_payloads_all)
-        elapsed_ms = (perf_counter() - started) * 1000
-        logger.info("价差扫描完成: 耗时 {:.0f}ms, 机会数 {}", elapsed_ms, created)
+        state_update_duration_ms = elapsed_ms(state_update_started)
+        log_slow_operation(logger, "scanner", "state_update", state_update_duration_ms, scan_id=scan_id)
+        total_duration_ms = (perf_counter() - started) * 1000
+        slowest_symbol, slowest_ms = _slowest_symbol_timing(mappings)
+        logger.info(
+            "价差扫描完成: scan_id={}, duration_ms={:.0f}, opportunities={}, state_update_ms={:.1f}, "
+            "slowest_symbol={}, slowest_ms={:.1f}",
+            scan_id, total_duration_ms, created, state_update_duration_ms, slowest_symbol, slowest_ms,
+        )
         return created
     except Exception as exc:
         db.rollback()
@@ -641,6 +684,83 @@ def _elapsed_ms(started: float) -> float:
 
 def _record_duration(timings: dict[str, float], key: str, started: float) -> None:
     timings[key] = _elapsed_ms(started)
+
+
+@contextmanager
+def _timed_phase(
+    timings: dict[str, float],
+    phase: str,
+    scan_id: int,
+    symbol: str,
+    *,
+    direction: str = "",
+    source: str = "",
+):
+    """记录互不重叠的扫描阶段，并只为慢调用输出告警。"""
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        duration_ms = _elapsed_ms(started)
+        timings[phase] = timings.get(phase, 0.0) + duration_ms
+        log_slow_operation(
+            logger,
+            "scanner",
+            phase.removesuffix("_duration_ms"),
+            duration_ms,
+            scan_id=scan_id,
+            symbol=symbol,
+            direction=direction,
+            source=source,
+        )
+
+
+def _finalize_legacy_timings(timings: dict[str, float]) -> None:
+    """用非重叠阶段重建旧诊断字段，保持 API 向后兼容。"""
+    timings["cost_duration_ms"] = sum(
+        timings.get(key, 0.0)
+        for key in ("venue_cost_a_duration_ms", "venue_cost_b_duration_ms", "cost_compute_duration_ms")
+    )
+    timings["signal_duration_ms"] = (
+        timings.get("signal_first_duration_ms", 0.0)
+        + timings.get("signal_second_duration_ms", 0.0)
+    )
+    timings["candidate_sync_duration_ms"] = (
+        timings.get("gates_duration_ms", 0.0)
+        + timings.get("candidate_build_duration_ms", 0.0)
+    )
+    timings["persist_duration_ms"] = timings.get("result_assembly_duration_ms", 0.0)
+
+
+def _log_slow_symbol(scan_id: int, symbol: str, timings: dict[str, float]) -> None:
+    """当品种总耗时超阈值时输出完整阶段分解。"""
+    total = timings.get("symbol_scan_duration_ms", 0.0)
+    if total < slow_operation_threshold_ms():
+        return
+    phase_timings = {
+        key: round(value, 1)
+        for key, value in timings.items()
+        if key.endswith("_duration_ms") and key not in {
+            "cost_duration_ms", "signal_duration_ms", "candidate_sync_duration_ms", "persist_duration_ms",
+        }
+    }
+    logger.warning(
+        "扫描慢品种: scan_id={}, symbol={}, total_ms={:.1f}, phases={}",
+        scan_id, symbol, total, phase_timings,
+    )
+
+
+def _slowest_symbol_timing(mappings) -> tuple[str, float]:
+    """返回本轮最慢品种及耗时。"""
+    slowest_symbol = "-"
+    slowest_ms = 0.0
+    for mapping in mappings:
+        symbol = str(mapping.symbol).upper()
+        duration = float(_scan_timings.get(symbol, {}).get("symbol_scan_duration_ms", 0.0))
+        if duration >= slowest_ms:
+            slowest_symbol = mapping.symbol
+            slowest_ms = duration
+    return slowest_symbol, slowest_ms
 
 
 def _current_payload(**values) -> dict:

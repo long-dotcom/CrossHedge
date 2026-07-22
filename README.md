@@ -54,6 +54,7 @@ MT5 Gateway 会把账户、持仓、行情和品种合约规格定时写入 Redi
 
 默认访问地址为 `http://localhost:8080`。完整键名、启动顺序、幂等约束和故障处理见 [MT5 Gateway 架构](docs/MT5_GATEWAY_ARCHITECTURE.md)。
 行情管道当前延迟指标的口径、潜在瓶颈和后续采样顺序见 [行情管道高延迟调查](docs/PIPELINE_LATENCY_INVESTIGATION.md)。
+扫描慢阶段默认以 `SCANNER_SLOW_PHASE_MS=50` 为阈值输出结构化日志，可通过同名环境变量调整。
 
 ## 原生交易所架构
 

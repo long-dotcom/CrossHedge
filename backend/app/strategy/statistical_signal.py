@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import mean, pstdev
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,10 @@ from app.db.models import StrategySetting, SymbolMapping
 from app.strategy.signals import SignalResult, evaluate_signal
 from app.config.settings import get_settings
 from app.core.cache import TTLCache
+from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -161,12 +166,30 @@ def refresh_signal_stats_cache(db: Session) -> int:
 def _signal_stats(db: Session, strategy: StrategySetting, symbol: str, direction: str) -> SignalStats:
     """获取信号统计结果（优先读缓存，缓存未命中则计算）。"""
     key = _stats_cache_key(db, strategy, symbol, direction)
+    cache_started = perf_counter()
     cached = _stats_cache.get(key)
+    cache_duration_ms = elapsed_ms(cache_started)
+    log_slow_operation(
+        logger, "redis", "signal_stats_cache_get", cache_duration_ms,
+        symbol=symbol, direction=direction, cache_hit=bool(cached),
+    )
     if cached:
         return cached
+    history_started = perf_counter()
     entry_points, close_points = _load_entry_and_close_points(db, symbol, direction, strategy.statistical_lookback_range)
+    history_duration_ms = elapsed_ms(history_started)
+    log_slow_operation(
+        logger, "database", "signal_history_load", history_duration_ms,
+        symbol=symbol, direction=direction,
+    )
     stats = _compute_signal_stats(entry_points, close_points, strategy)
+    cache_set_started = perf_counter()
     _stats_cache.set(key, stats)
+    cache_set_duration_ms = elapsed_ms(cache_set_started)
+    log_slow_operation(
+        logger, "redis", "signal_stats_cache_set", cache_set_duration_ms,
+        symbol=symbol, direction=direction,
+    )
     return stats
 
 

@@ -23,11 +23,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from time import perf_counter
 from typing import Any
 
 from app.config.settings import get_settings
 from app.core.cache import TTLCache
 from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
 from app.db.models import SymbolMapping
 from app.market.mt5_schedule import LocalScheduleState, local_schedule_state
 
@@ -133,14 +135,38 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
             mt5_leg=mt5_leg,
         )
     cache_key = f"session_{mapping.id or hash(mapping.mt5_symbol)}"
+    cache_started = perf_counter()
     cached = _session_cache.get(cache_key)
+    cache_duration_ms = elapsed_ms(cache_started)
+    log_slow_operation(
+        logger, "redis", "mt5_session_cache_get", cache_duration_ms,
+        symbol=mapping.symbol, mt5_symbol=mapping.mt5_symbol, cache_hit=bool(cached),
+    )
     if cached:
         return cached
     try:
         from app.venues.manager import native_venue_manager
+        connector_started = perf_counter()
         connector = native_venue_manager.connector_for("mt5", "live")
+        connector_duration_ms = elapsed_ms(connector_started)
+        log_slow_operation(
+            logger, "database", "mt5_connector_resolve", connector_duration_ms,
+            symbol=mapping.symbol, mt5_symbol=mapping.mt5_symbol,
+        )
+        instrument_started = perf_counter()
         info = connector.get_instrument(mapping.mt5_symbol)
+        instrument_duration_ms = elapsed_ms(instrument_started)
+        log_slow_operation(
+            logger, "redis", "mt5_instrument_get", instrument_duration_ms,
+            symbol=mapping.symbol, mt5_symbol=mapping.mt5_symbol,
+        )
+        ticker_started = perf_counter()
         tick = connector.get_ticker(mapping.mt5_symbol)
+        ticker_duration_ms = elapsed_ms(ticker_started)
+        log_slow_operation(
+            logger, "redis", "mt5_ticker_get", ticker_duration_ms,
+            symbol=mapping.symbol, mt5_symbol=mapping.mt5_symbol,
+        )
         return _remember_session(cache_key, _gateway_tick_state(mapping, info.raw, tick, current))
     except Exception as exc:
         return _remember_session(cache_key, _fallback_closed(mapping, f"MT5 Gateway 会话读取失败: {exc}"))
@@ -402,5 +428,8 @@ def _fallback_closed(mapping: SymbolMapping, reason: str) -> MT5SessionState:
 
 def _remember_session(cache_key: str, state: MT5SessionState) -> MT5SessionState:
     """将状态写入 TTLCache 并返回。"""
+    started = perf_counter()
     _session_cache.set(cache_key, state)
+    duration_ms = elapsed_ms(started)
+    log_slow_operation(logger, "redis", "mt5_session_cache_set", duration_ms, symbol=state.symbol)
     return state
