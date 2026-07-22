@@ -19,7 +19,7 @@
 - 异常捕获
 
 使用 ``utc_now`` 替代 ``datetime.now(timezone.utc).replace(tzinfo=None)``，
-使用 ``TTLCache`` 替代手写 strategy_cache，
+策略配置使用进程内缓存，并由配置更新接口主动失效，
 使用 ``get_logger`` 统一日志。
 """
 
@@ -52,7 +52,7 @@ from app.market.mt5_tradability import mt5_tradability_cache
 from app.strategy.cost import estimate_pair_cost
 from app.strategy.live_costs import VenueCostUnavailable, venue_cost_inputs
 from app.strategy.position_sizing import PositionSizing, calculate_position_sizing
-from app.strategy.statistical_signal import evaluate_entry_signal
+from app.strategy.statistical_signal import evaluate_entry_signal, signal_stats_snapshot
 from app.execution.circuit_breaker import feed_spread as breaker_feed
 from app.execution.modes import MAKER_THEN_MARKET, close_order_type, execution_mode, maker_leg, open_order_type
 from app.strategy.spread_math import DIRECTIONS, LONG_LEG_A_SHORT_LEG_B, spreads_for_direction
@@ -103,9 +103,9 @@ _last_snapshot_flush: dict[tuple[str, str], float] = {}
 _scan_timings: dict[str, dict[str, float]] = {}
 _scan_sequence = count(1)
 
-# 策略配置缓存：使用 TTLCache 替代手写 tuple+monotonic
-from app.core.cache import TTLCache
-_strategy_cache: TTLCache[SimpleNamespace] = TTLCache(ttl_seconds=2.0, namespace="strategy-settings")
+# 策略配置缓存：API 更新主动失效，TTL 仅作为异常修改兜底
+from app.core.cache import LocalTTLCache
+_strategy_cache: LocalTTLCache[SimpleNamespace] = LocalTTLCache(ttl_seconds=60.0)
 
 
 def clear_strategy_setting_cache() -> None:
@@ -114,7 +114,7 @@ def clear_strategy_setting_cache() -> None:
 
 
 def get_strategy_setting(db: Session) -> SimpleNamespace:
-    """获取策略配置（带 2 秒 TTL 缓存）。
+    """获取策略配置（进程内缓存，API 更新时主动失效）。
 
     生产数据库使用稳定 URL 键，供 API 与 Worker 共享；内存数据库按实例隔离。
     """
@@ -172,6 +172,50 @@ def run_scan(db: Session) -> int:
         current_payloads: list[dict] = []
         direction_payloads_all: list[dict] = []
         opportunity_payloads: list[dict] = []
+        native_mappings = [mapping for mapping in mappings if is_native_pair(mapping)]
+
+        # 扫描轮次快照：整轮计算只使用同一批报价和共享门控数据，避免按品种、
+        # 按方向反复访问 Redis，也避免同一轮前后读到不一致的报价版本。
+        quote_snapshot_started = perf_counter()
+        quote_snapshot = quote_cache.latest_many(
+            (venue, mapping.symbol)
+            for mapping in mappings
+            for venue in (mapping_leg(mapping, "a")[0], mapping_leg(mapping, "b")[0])
+        )
+        log_slow_operation(
+            logger, "scanner", "quote_snapshot_load", elapsed_ms(quote_snapshot_started),
+            scan_id=scan_id, quote_count=len(quote_snapshot),
+        )
+        session_snapshot_started = perf_counter()
+        session_snapshot = {
+            mapping.symbol: mt5_session_state(mapping)
+            for mapping in native_mappings
+            if "mt5" in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}
+        }
+        log_slow_operation(
+            logger, "scanner", "session_snapshot_load", elapsed_ms(session_snapshot_started),
+            scan_id=scan_id, session_count=len(session_snapshot),
+        )
+        signal_snapshot_started = perf_counter()
+        stats_snapshot = signal_stats_snapshot(
+            db, strategy,
+            ((mapping.symbol, direction) for mapping in native_mappings for direction in DIRECTIONS),
+        )
+        log_slow_operation(
+            logger, "scanner", "signal_snapshot_load", elapsed_ms(signal_snapshot_started),
+            scan_id=scan_id, stats_count=len(stats_snapshot),
+        )
+        tradability_snapshot_started = perf_counter()
+        tradability_snapshot = mt5_tradability_cache.allowed_snapshot(
+            (mapping.symbol, side)
+            for mapping in native_mappings
+            if "mt5" in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}
+            for side in ("buy", "sell")
+        )
+        log_slow_operation(
+            logger, "scanner", "tradability_snapshot_load", elapsed_ms(tradability_snapshot_started),
+            scan_id=scan_id, state_count=len(tradability_snapshot),
+        )
         for mapping in mappings:
             symbol_started = perf_counter()
             timings: dict[str, float] = {}
@@ -179,7 +223,9 @@ def run_scan(db: Session) -> int:
                 # ── 非原生品种对：只读模式 ──────────────────────────────────
                 if not is_native_pair(mapping):
                     with _timed_phase(timings, "readonly_scan_duration_ms", scan_id, mapping.symbol):
-                        readonly_payloads = _readonly_leg_pair_payloads(mapping, settings, strategy)
+                        readonly_payloads = _readonly_leg_pair_payloads(
+                            mapping, settings, strategy, quote_snapshot=quote_snapshot,
+                        )
                     assembly_started = perf_counter()
                     if readonly_payloads:
                         direction_payloads_all.extend(readonly_payloads)
@@ -200,7 +246,7 @@ def run_scan(db: Session) -> int:
                 # ── MT5 会话状态检查 ──────────────────────────────────────
                 has_mt5 = "mt5" in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}
                 with _timed_phase(timings, "session_duration_ms", scan_id, mapping.symbol):
-                    session_state = mt5_session_state(mapping) if has_mt5 else SimpleNamespace(
+                    session_state = session_snapshot[mapping.symbol] if has_mt5 else SimpleNamespace(
                         can_quote=True,
                         status="not_applicable",
                         reason="",
@@ -231,6 +277,7 @@ def run_scan(db: Session) -> int:
                         max_age_ms=max(settings.quote.stale_ms, settings.quote.loose_sync_ms),
                         leg_a_venue=leg_a_venue_name,
                         leg_b_venue=leg_b_venue_name,
+                        snapshot=quote_snapshot,
                     )
                 if not synced:
                     assembly_started = perf_counter()
@@ -296,6 +343,7 @@ def run_scan(db: Session) -> int:
                         notional = sizing.notional_usd
                         leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
                         leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
+                        mt5_side = leg_a_side if leg_a_venue_name == "mt5" else leg_b_side
                         cost = estimate_pair_cost(
                             notional=notional,
                             leg_a_open_fee_rate=_venue_fee_rate(
@@ -320,6 +368,7 @@ def run_scan(db: Session) -> int:
                             db, strategy, mapping.symbol, direction,
                             gross_spread, unit_cost, provisional_unit_net_profit,
                             provisional_net_profit, provisional_annualized_return,
+                            stats=stats_snapshot.get((mapping.symbol, direction)),
                         )
                     with _timed_phase(
                         timings, "projection_duration_ms", scan_id, mapping.symbol, direction=direction,
@@ -337,6 +386,7 @@ def run_scan(db: Session) -> int:
                         statistical_signal = evaluate_entry_signal(
                             db, strategy, mapping.symbol, direction,
                             gross_spread, unit_cost, unit_net_profit, net_profit, annualized_return,
+                            stats=stats_snapshot.get((mapping.symbol, direction)),
                         )
                     with _timed_phase(
                         timings, "gates_duration_ms", scan_id, mapping.symbol, direction=direction,
@@ -351,7 +401,10 @@ def run_scan(db: Session) -> int:
                             signal_gate.status, leg_a_venue_name,
                         )
                         market_gate = (
-                            _direction_market_gate(session_state, mapping.symbol, direction, leg_b_side)
+                            _direction_market_gate(
+                                session_state, mapping.symbol, direction, mt5_side,
+                                tradability_snapshot=tradability_snapshot,
+                            )
                             if has_mt5
                             else GateResult("candidate", "", "market", "")
                         )
@@ -470,13 +523,17 @@ def _projected_profit(
 # 只读品种对载荷
 # ---------------------------------------------------------------------------
 
-def _readonly_leg_pair_payloads(mapping, settings, strategy=None) -> list[dict]:
+def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snapshot=None) -> list[dict]:
     """为暂未进入自动执行矩阵的品种对生成只读价差载荷。"""
     leg_a_venue, leg_a_symbol = mapping_leg(mapping, "a")
     leg_b_venue, leg_b_symbol = mapping_leg(mapping, "b")
     leg_meta = _leg_metadata(mapping)
-    leg_a = quote_cache.latest(leg_a_venue, mapping.symbol)
-    leg_b = quote_cache.latest(leg_b_venue, mapping.symbol)
+    if quote_snapshot is None:
+        leg_a = quote_cache.latest(leg_a_venue, mapping.symbol)
+        leg_b = quote_cache.latest(leg_b_venue, mapping.symbol)
+    else:
+        leg_a = quote_snapshot.get((leg_a_venue, mapping.symbol))
+        leg_b = quote_snapshot.get((leg_b_venue, mapping.symbol))
     if not leg_a or not leg_b:
         return []
     now = utc_now()
@@ -619,12 +676,25 @@ def _liquidity_gate(symbol: str, side: str, quantity: float, notional: float, to
     return GateResult("pass", "", "liquidity")
 
 
-def _direction_market_gate(session_state, symbol: str, direction: str, mt5_side: str) -> GateResult:
+def _direction_market_gate(
+    session_state,
+    symbol: str,
+    direction: str,
+    mt5_side: str,
+    *,
+    tradability_snapshot: dict[tuple[str, str], tuple[bool, str]] | None = None,
+) -> GateResult:
     """市场门控：检查 MT5 会话和交易能力。"""
     mt5_open_allowed, mt5_open_reason = mt5_action_allowed(session_state, direction, "open")
     if not mt5_open_allowed:
         return GateResult("rejected", mt5_open_reason, "market", "market")
-    tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(symbol, mt5_side)
+    if tradability_snapshot is None:
+        tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(symbol, mt5_side)
+    else:
+        tradability_allowed, tradability_reason = tradability_snapshot.get(
+            (symbol.upper(), mt5_side.lower()),
+            (False, "MT5 交易能力批量快照缺失"),
+        )
     if not tradability_allowed:
         return GateResult("rejected", f"MT5 交易能力未确认: {tradability_reason}", "market", "market")
     return GateResult("pass", "", "market")

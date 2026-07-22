@@ -8,7 +8,7 @@ MT5 会话状态管理模块
 1. 本地时段模板（``mt5_schedule.local_schedule_state``）
 2. MT5 Gateway 的 tick 新鲜度 + trade_mode 兜底
 
-使用 ``TTLCache`` 替代手写 dict+Lock+TTL 缓存。
+会话兜底结果使用进程内 TTL 缓存，避免扫描热路径访问 Redis。
 
 使用方式::
 
@@ -27,7 +27,7 @@ from time import perf_counter
 from typing import Any
 
 from app.config.settings import get_settings
-from app.core.cache import TTLCache
+from app.core.cache import LocalTTLCache
 from app.core.logging import get_logger
 from app.core.performance import elapsed_ms, log_slow_operation
 from app.db.models import SymbolMapping
@@ -79,7 +79,12 @@ class MT5SessionState:
 
 
 # 会话状态缓存：使用 TTLCache 替代手写 dict+monotonic+Lock
-_session_cache: TTLCache[MT5SessionState] = TTLCache(ttl_seconds=30.0, namespace="mt5-sessions")
+_session_cache: LocalTTLCache[MT5SessionState] = LocalTTLCache(ttl_seconds=30.0)
+
+
+def clear_mt5_session_cache() -> None:
+    """清空 MT5 会话进程内缓存。"""
+    _session_cache.clear()
 
 
 def _mt5_leg(mapping: SymbolMapping) -> str:
@@ -135,13 +140,7 @@ def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT
             mt5_leg=mt5_leg,
         )
     cache_key = f"session_{mapping.id or hash(mapping.mt5_symbol)}"
-    cache_started = perf_counter()
     cached = _session_cache.get(cache_key)
-    cache_duration_ms = elapsed_ms(cache_started)
-    log_slow_operation(
-        logger, "redis", "mt5_session_cache_get", cache_duration_ms,
-        symbol=mapping.symbol, mt5_symbol=mapping.mt5_symbol, cache_hit=bool(cached),
-    )
     if cached:
         return cached
     try:

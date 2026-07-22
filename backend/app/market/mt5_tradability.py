@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import time
+from collections.abc import Iterable
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
@@ -31,6 +33,7 @@ from sqlalchemy.exc import OperationalError
 from app.adapters.mt5 import MT5OrderCheck, mt5_market_order_check
 from app.config.settings import get_settings
 from app.core.logging import get_logger
+from app.core.performance import elapsed_ms, log_slow_operation
 from app.core.redis_client import redis_client, redis_key
 from app.core.time_utils import utc_now
 from app.db.models import StrategySetting, SystemSetting
@@ -124,6 +127,50 @@ class MT5TradabilityCache:
         if not state.allowed:
             return False, state.message
         return True, ""
+
+    def allowed_snapshot(
+        self,
+        pairs: Iterable[tuple[str, str]],
+        ttl_ms: int | None = None,
+    ) -> dict[tuple[str, str], tuple[bool, str]]:
+        """一次 Redis 往返读取整轮扫描的交易能力与隔离状态。
+
+        该状态由独立执行进程更新，因此不能长期只保存在扫描进程内；使用
+        pipeline 批量读取既保留跨进程实时性，也避免逐方向网络往返。
+        """
+        normalized = list(dict.fromkeys(
+            (symbol.upper(), side.lower()) for symbol, side in pairs
+        ))
+        if not normalized:
+            return {}
+        fields = [self._field(symbol, side) for symbol, side in normalized]
+        block_keys = [self._block_key(symbol, side) for symbol, side in normalized]
+        started = perf_counter()
+        pipe = redis_client().pipeline(transaction=False)
+        pipe.hmget(self._states_key, fields)
+        pipe.mget(block_keys)
+        state_rows, blocks = pipe.execute()
+        log_slow_operation(
+            logger, "redis", "tradability_snapshot_get", elapsed_ms(started),
+            request_count=len(normalized),
+        )
+        max_age = ttl_ms if ttl_ms is not None else get_settings().mt5.tradability_cache_ttl_ms
+        result: dict[tuple[str, str], tuple[bool, str]] = {}
+        for pair, raw, blocked in zip(normalized, state_rows, blocks):
+            if blocked:
+                result[pair] = (False, str(blocked))
+                continue
+            if not raw:
+                result[pair] = (False, "MT5 交易能力缓存缺失")
+                continue
+            state = TradabilityState(**json.loads(raw))
+            if state.age_ms > max_age:
+                result[pair] = (False, f"MT5 交易能力缓存过期: {state.age_ms:.0f}ms > {max_age}ms")
+            elif not state.allowed:
+                result[pair] = (False, state.message)
+            else:
+                result[pair] = (True, "")
+        return result
 
     def update(self, symbol: str, mt5_symbol: str, side: str, quantity: float, check: MT5OrderCheck, source: str) -> TradabilityState:
         """更新交易能力状态。

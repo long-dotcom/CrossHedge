@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
-from typing import Literal
+from typing import Iterable, Literal, Mapping
 
 from app.core.logging import get_logger
 from app.core.performance import elapsed_ms, log_slow_operation
@@ -185,6 +185,24 @@ class QuoteCache:
         )
         return _quote_from_json(raw) if raw else None
 
+    def latest_many(self, requests: Iterable[tuple[str, str]]) -> dict[tuple[str, str], Quote]:
+        """一次 Redis MGET 读取一轮扫描需要的全部最新报价。"""
+        pairs = list(dict.fromkeys((str(platform), str(symbol)) for platform, symbol in requests))
+        if not pairs:
+            return {}
+        started = perf_counter()
+        raws = redis_client().mget([self._latest_key(platform, symbol) for platform, symbol in pairs])
+        result = {
+            pair: _quote_from_json(raw)
+            for pair, raw in zip(pairs, raws)
+            if raw is not None
+        }
+        log_slow_operation(
+            logger, "redis", "quote_latest_many", elapsed_ms(started),
+            request_count=len(pairs), cache_hits=len(result),
+        )
+        return result
+
     def history(self, platform: str, symbol: str) -> list[Quote]:
         """获取指定平台和品种的历史报价列表。"""
         rows = redis_client().xrange(self._history_key(platform, symbol))
@@ -254,6 +272,7 @@ class QuoteSynchronizer:
         *,
         leg_a_venue: str = "hyperliquid",
         leg_b_venue: str = "mt5",
+        snapshot: Mapping[tuple[str, str], Quote] | None = None,
     ) -> tuple[SynchronizedQuote | None, str]:
         """获取同步对齐的两腿报价。
 
@@ -275,8 +294,12 @@ class QuoteSynchronizer:
             ``(SynchronizedQuote, "")`` 成功时；
             ``(None, 原因描述)`` 失败时。
         """
-        hl = self.cache.latest(leg_a_venue, symbol)
-        mt5 = self.cache.latest(leg_b_venue, symbol)
+        if snapshot is None:
+            hl = self.cache.latest(leg_a_venue, symbol)
+            mt5 = self.cache.latest(leg_b_venue, symbol)
+        else:
+            hl = snapshot.get((leg_a_venue, symbol))
+            mt5 = snapshot.get((leg_b_venue, symbol))
         if not hl or not mt5:
             return None, "缺少实时行情"
 

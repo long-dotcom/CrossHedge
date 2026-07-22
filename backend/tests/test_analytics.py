@@ -14,7 +14,7 @@ from app.db.models import (
 from app.analytics.spreads import SpreadPoint, downsample_spreads, load_spread_points, summarize_spreads
 from app.analytics.funding import FundingPoint, bucket_funding_points, funding_history, summarize_funding
 from app.analytics.lead_lag import lead_lag_report
-from app.strategy.statistical_signal import evaluate_entry_signal, refresh_signal_stats_cache
+from app.strategy.statistical_signal import SignalStats, evaluate_entry_signal, refresh_signal_stats_cache
 from app.market.quotes import quote_cache
 from app.market import scanner as scanner_module
 import time
@@ -607,3 +607,21 @@ def test_statistical_signal_uses_reachable_entry() -> None:
         signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
         assert signal.result.status == "executable"
         assert signal.reachable_entry > 0
+
+
+def test_statistical_signal_reuses_supplied_stats(monkeypatch) -> None:
+    """同方向两次利润判定不应再次读取统计缓存。"""
+    strategy = StrategySetting(
+        signal_mode="statistical", statistical_min_samples=1, min_total_profit=0,
+    )
+    stats = SignalStats(100, 1.0, 0.1, 2.0, 0.2, 3.0)
+    monkeypatch.setattr(
+        "app.strategy.statistical_signal._signal_stats",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应重新读取统计缓存")),
+    )
+    for total_profit in (1.0, 2.0):
+        result = evaluate_entry_signal(
+            SimpleNamespace(), strategy, "TEST", "long_leg_a_short_leg_b",
+            1.5, 0.1, 1.4, total_profit, 1.0, stats=stats,
+        )
+        assert result.sample_count == 100

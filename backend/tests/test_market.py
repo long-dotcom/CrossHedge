@@ -41,6 +41,26 @@ def test_quote_synchronizer_rejects_unsynced_quotes() -> None:
     assert synced is None
     assert "过期" in reason or "未对齐" in reason
 
+
+def test_quote_cache_reads_scan_snapshot_with_one_mget(monkeypatch) -> None:
+    cache = QuoteCache()
+    cache.put("binance", "BTC", 100, 101, 10000, "test")
+    cache.put("mt5", "BTC", 102, 103, 10000, "test")
+    from app.market import quotes as quotes_module
+    client = quotes_module.redis_client()
+    calls = 0
+    original_mget = client.mget
+
+    def counted_mget(keys):
+        nonlocal calls
+        calls += 1
+        return original_mget(keys)
+
+    monkeypatch.setattr(client, "mget", counted_mget)
+    snapshot = cache.latest_many([("binance", "BTC"), ("mt5", "BTC"), ("binance", "BTC")])
+    assert calls == 1
+    assert set(snapshot) == {("binance", "BTC"), ("mt5", "BTC")}
+
 def test_scanner_gate_combination_keeps_blockers_separate_from_signal() -> None:
     signal_gate = scanner_module.GateResult("executable", "signal ok", "signal")
     liquidity_gate = scanner_module.GateResult("candidate", "depth low", "liquidity", "liquidity")
@@ -522,7 +542,11 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     monkeypatch.setattr(scanner_module.quote_synchronizer, "synchronized", lambda *args, **kwargs: (synced, ""))
     monkeypatch.setattr(scanner_module, "mt5_session_state", lambda mapping: MT5SessionState(mapping.symbol, "normal_trade", "", True, True, True, True, True))
     monkeypatch.setattr(scanner_module, "venue_cost_inputs", lambda venue, symbol: SimpleNamespace(source="test", maker_fee_rate=0, taker_fee_rate=0))
-    monkeypatch.setattr(scanner_module.mt5_tradability_cache, "is_fresh_allowed", lambda *args, **kwargs: (True, "ok"))
+    monkeypatch.setattr(
+        scanner_module.mt5_tradability_cache,
+        "allowed_snapshot",
+        lambda pairs, **kwargs: {(symbol.upper(), side.lower()): (True, "ok") for symbol, side in pairs},
+    )
 
     scanner_module.clear_strategy_setting_cache()
     symbol_module.clear_symbol_mapping_cache()

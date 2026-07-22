@@ -56,6 +56,7 @@ MT5 Gateway 会把账户、持仓、行情和品种合约规格定时写入 Redi
 行情管道当前延迟指标的口径、潜在瓶颈和后续采样顺序见 [行情管道高延迟调查](docs/PIPELINE_LATENCY_INVESTIGATION.md)。
 扫描慢阶段默认以 `SCANNER_SLOW_PHASE_MS=50` 为阈值输出结构化日志，可通过同名环境变量调整。
 统计信号默认每 `SIGNAL_STATS_REFRESH_INTERVAL_MS=10000` 毫秒后台刷新，Redis 缓存以 `SIGNAL_STATS_CACHE_TTL_MS=60000` 毫秒保留旧结果；缓存有效期必须长于刷新间隔，避免扫描线程在刷新空窗同步查询历史价差。
+扫描器每轮用批量快照一次性读取全部启用品种的双腿 BBO、统计结果和 MT5 交易能力；策略与品种映射使用设置 API 主动失效的进程内缓存，品种循环不再逐项读取这些共享数据。
 
 ## 原生交易所架构
 

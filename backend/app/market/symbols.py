@@ -24,15 +24,15 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.logging import get_logger
-from app.core.cache import TTLCache
+from app.core.cache import LocalTTLCache
 from app.db.models import SymbolMapping
 
 logger = get_logger(__name__)
 
 # 品种映射缓存：(bind_id, 缓存时间, 缓存数据)
-_MAPPING_CACHE_TTL_SECONDS = 2.0
-_mapping_cache: TTLCache[list[SimpleNamespace]] = TTLCache(
-    ttl_seconds=_MAPPING_CACHE_TTL_SECONDS, namespace="symbol-mappings",
+_MAPPING_CACHE_TTL_SECONDS = 60.0
+_mapping_cache: LocalTTLCache[list[SimpleNamespace]] = LocalTTLCache(
+    ttl_seconds=_MAPPING_CACHE_TTL_SECONDS,
 )
 
 
@@ -138,10 +138,10 @@ def clear_symbol_mapping_cache() -> None:
 
 
 def enabled_mappings(db: Session) -> list[SimpleNamespace]:
-    """获取所有已启用的品种映射（带 TTL 缓存）。
+    """获取所有已启用的品种映射（进程内 TTL 缓存）。
 
     缓存策略：
-    - 缓存有效期 2 秒
+    - 配置 API 更新时主动失效，60 秒 TTL 仅用于跨进程变更兜底
     - 按数据库连接 ID 区分，避免跨连接缓存污染
     - 返回 SimpleNamespace 列表，属性与 SymbolMapping 列一致
 

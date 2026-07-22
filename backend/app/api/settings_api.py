@@ -63,6 +63,7 @@ from app.exchanges.credentials import (
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.execution.runtime_settings import execution_settings_payload, set_execution_settings
 from app.market.mt5_schedule import apply_mt5_session_template, mt5_session_templates
+from app.market.mt5_sessions import clear_mt5_session_cache
 from app.market.quotes import quote_cache
 from app.market.symbols import clear_symbol_mapping_cache
 from app.market.scan_state import scan_state_store
@@ -296,6 +297,7 @@ def put_symbol_mappings(
     audit(db, user.id, "update_symbol_mappings", "settings")
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     native_venue_manager.invalidate()
     clear_signal_stats_cache()
     return [_row_with_leg_metadata(db, r) for r in db.query(SymbolMapping).order_by(SymbolMapping.symbol).all()]
@@ -315,6 +317,7 @@ def create_symbol_mapping(
     audit(db, user.id, "create_symbol_mapping", "settings", payload.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     native_venue_manager.invalidate()
     clear_signal_stats_cache()
     db.refresh(row)
@@ -347,6 +350,7 @@ def update_symbol_mapping(
     audit(db, user.id, "update_symbol_mapping", "settings", payload.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     native_venue_manager.invalidate()
     clear_signal_stats_cache()
     db.refresh(row)
@@ -369,6 +373,7 @@ def delete_symbol_mapping(
     audit(db, user.id, "delete_symbol_mapping", "settings", symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     native_venue_manager.invalidate()
     clear_signal_stats_cache()
     return {"status": "ok"}
@@ -389,6 +394,7 @@ def sync_symbol_mapping_instruments(
     audit(db, user.id, "sync_symbol_mapping_instruments", "settings", row.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     clear_signal_stats_cache()
     db.refresh(row)
     return {
@@ -412,6 +418,7 @@ def sync_symbol_mapping_sessions(
     audit(db, user.id, "sync_symbol_mapping_sessions", "settings", row.symbol)
     db.commit()
     clear_symbol_mapping_cache()
+    clear_mt5_session_cache()
     db.refresh(row)
     return as_dict(row)
 

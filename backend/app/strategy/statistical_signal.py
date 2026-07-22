@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import mean, pstdev
 from time import perf_counter
+from typing import Iterable
 
 from sqlalchemy.orm import Session
 
@@ -83,6 +84,8 @@ def evaluate_entry_signal(
     unit_net_profit: float,
     total_net_profit: float,
     annualized_return: float,
+    *,
+    stats: SignalStats | None = None,
 ) -> StatisticalSignal:
     """评估入场信号。
 
@@ -115,7 +118,7 @@ def evaluate_entry_signal(
             sample_count=0,
         )
 
-    stats = _signal_stats(db, strategy, symbol, direction)
+    stats = stats or _signal_stats(db, strategy, symbol, direction)
     # 样本不足时仅返回候选状态
     if stats.sample_count < strategy.statistical_min_samples:
         result = SignalResult("candidate", f"统计样本不足 {stats.sample_count}/{strategy.statistical_min_samples}，等待参考数据")
@@ -166,6 +169,45 @@ def refresh_signal_stats_cache(db: Session) -> int:
             _stats_cache.set(_stats_cache_key(db, strategy, symbol, direction), stats)
             refreshed += 1
     return refreshed
+
+
+def signal_stats_snapshot(
+    db: Session,
+    strategy: StrategySetting,
+    pairs: Iterable[tuple[str, str]],
+) -> dict[tuple[str, str], SignalStats]:
+    """批量取得一轮扫描需要的统计结果。
+
+    Redis 命中路径只执行一次 MGET；同一品种方向后续的两次利润判定复用
+    同一个不可变统计结果。缓存缺失时才从数据库回源并补写缓存。
+    """
+    if strategy.signal_mode != "statistical":
+        return {}
+    normalized = list(dict.fromkeys((symbol, direction) for symbol, direction in pairs))
+    keys = {
+        pair: _stats_cache_key(db, strategy, pair[0], pair[1])
+        for pair in normalized
+    }
+    started = perf_counter()
+    cached_by_key = _stats_cache.get_many(list(keys.values()))
+    log_slow_operation(
+        logger, "redis", "signal_stats_snapshot_get", elapsed_ms(started),
+        request_count=len(keys), cache_hits=len(cached_by_key),
+    )
+    result: dict[tuple[str, str], SignalStats] = {}
+    for pair, key in keys.items():
+        cached = cached_by_key.get(key)
+        if cached is not None:
+            result[pair] = cached
+            continue
+        symbol, direction = pair
+        entry_points, close_points = _load_entry_and_close_points(
+            db, symbol, direction, strategy.statistical_lookback_range,
+        )
+        stats = _compute_signal_stats(entry_points, close_points, strategy)
+        _stats_cache.set(key, stats)
+        result[pair] = stats
+    return result
 
 
 def _signal_stats(db: Session, strategy: StrategySetting, symbol: str, direction: str) -> SignalStats:
