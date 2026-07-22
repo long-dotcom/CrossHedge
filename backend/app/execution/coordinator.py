@@ -13,7 +13,7 @@ from app.db.models import ArbitrageOpportunity, ExecutionIntent, HedgeGroup, Hed
 from app.execution.actions import group_fill_residuals, hedge_group_actions, require_group_action
 from app.execution.intents import ExecutionLegPlan, IntentCreationResult, create_execution_intent
 from app.execution.modes import (
-    MAKER_THEN_MARKET, execution_mode, maker_leg, maker_offset_bps,
+    MAKER_THEN_MARKET, execution_mode, maker_leg,
     maker_ttl_seconds, maker_unfilled_action,
 )
 from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
@@ -249,7 +249,6 @@ def _maker_stage_plans(
         maker_plan.order_side.lower(),
         float(quote.bid),
         float(quote.ask),
-        maker_offset_bps(mapping),
         mapping,
     )
     if price <= 0:

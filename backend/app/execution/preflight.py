@@ -93,9 +93,9 @@ def refreshed_opportunity_still_executable(
     return True, ""
 
 
-def maker_price(side: str, bid: float, ask: float, offset_bps: float, mapping: SymbolMapping | None = None) -> float:
-    """计算并按 venue tick/精度规范化 Post-only 限价。"""
-    raw = bid * (1 - offset_bps / 10_000) if side == "buy" else ask * (1 + offset_bps / 10_000)
+def maker_price(side: str, bid: float, ask: float, mapping: SymbolMapping | None = None) -> float:
+    """直接使用买一/卖一并按 venue tick/精度规范化 Post-only 限价。"""
+    raw = bid if side == "buy" else ask
     if raw <= 0:
         return raw
     tick = float(getattr(mapping, "min_tick", 0.0) or 0.0) if mapping else 0.0

@@ -319,7 +319,7 @@ def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) ->
         assert legs[0].role == "MAKER"
         assert legs[0].post_only is True
         assert legs[0].order_type == "limit"
-        assert legs[0].limit_price < synced.leg_a.bid
+        assert legs[0].limit_price == synced.leg_a.bid
         assert payload["hedge_template"]["venue"] == "mt5"
         assert payload["hedge_template"]["role"] == "HEDGE"
         assert payload["maker_ttl_seconds"] == 3
@@ -351,6 +351,7 @@ def test_maker_close_uses_explicit_binance_position_side_without_reduce_only(mon
         assert maker.role == "MAKER"
         assert maker.action == "CLOSE"
         assert maker.order_side == "SELL"
+        assert maker.limit_price == synced.leg_a.ask
         assert maker.position_side == "LONG"
         assert maker.venue_reduce_only is False
         assert payload["hedge_template"]["order_side"] == "BUY"

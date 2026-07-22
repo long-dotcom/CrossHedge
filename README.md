@@ -119,7 +119,7 @@ FastAPI 只创建不可变 Intent、ExecutionLeg 和 Outbox。独立执行 Worke
 6. REST、历史成交与账户快照仅用于断线、重启和漏事件兜底。
 7. 原始事件按 event ID 幂等持久化，再投影 VenueOrder、Fill、Intent 和 HedgeGroup。
 
-Maker-then-Market、部分成交、撤单确认、单腿失败、补偿和人工恢复继续由持久化状态机处理。订单没有真实成交事件或明确 `FILLED` 状态时不会生成 Fill。
+Maker-then-Market、部分成交、撤单确认、单腿失败、补偿和人工恢复继续由持久化状态机处理。Maker 买单直接挂买一价、卖单直接挂卖一价，不再应用额外 bps 偏移。连续执行同一组的平仓 Intent 时，终态事件按 Intent 独立幂等，失败且无成交会恢复平仓前状态。订单没有真实成交事件或明确 `FILLED` 状态时不会生成 Fill。
 
 ## Binance 行情与私有流
 

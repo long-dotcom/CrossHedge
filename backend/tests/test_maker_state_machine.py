@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
-from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, SymbolMapping, VenueOrder
+from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, HedgeGroupEvent, SymbolMapping, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
 from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
@@ -97,6 +97,55 @@ def _create_maker_open(factory, *, unfilled_action="cancel", single_leg_action="
         )
         db.commit()
         return result.intent.id
+
+
+def _create_maker_close(factory, *, group_id: int | None = None, suffix: str) -> tuple[int, int]:
+    maker = ExecutionLegPlan(
+        leg_key="leg_a", role="MAKER", sequence=0,
+        venue="binance", instrument_id="BTCUSDT-PERP.BINANCE", venue_symbol="BTCUSDT",
+        action="CLOSE", position_side="LONG", order_side="SELL",
+        strategy_quantity=0.01, venue_order_quantity=0.01,
+        order_type="limit", limit_price=100.0, post_only=True, venue_reduce_only=True,
+    )
+    hedge = ExecutionLegPlan(
+        leg_key="leg_b", role="HEDGE", sequence=1,
+        venue="mt5", instrument_id="BTCUSD", venue_symbol="BTCUSD",
+        action="CLOSE", position_side="SHORT", order_side="BUY",
+        strategy_quantity=0.02, venue_order_quantity=0.02,
+        order_type="market", venue_reduce_only=True,
+    )
+    with factory() as db:
+        group = db.get(HedgeGroup, group_id) if group_id is not None else None
+        if group is None:
+            group = HedgeGroup(
+                symbol="BTC", direction="long_leg_a_short_leg_b", status="open",
+                execution_mode="live", notional=100.0, quantity=0.01,
+                leg_a_quantity=0.01, leg_b_quantity=0.02,
+            )
+            db.add(group)
+            db.flush()
+        result = create_execution_intent(
+            db,
+            intent_type="CLOSE",
+            execution_mode="live",
+            execution_style="maker_then_market",
+            idempotency_key=f"maker-close-{suffix}",
+            hedge_group_id=group.id,
+            legs=[maker],
+            command_payload={
+                "maker_state_version": 1,
+                "maker_target_quantity": 0.01,
+                "hedge_target_quantity": 0.02,
+                "hedge_template": asdict(hedge),
+                "maker_ttl_seconds": 1,
+                "maker_unfilled_action": "cancel",
+                "previous_group_status": "open",
+                "reason": "test close",
+            },
+        )
+        group.status = "closing"
+        db.commit()
+        return result.intent.id, group.id
 
 
 def test_ttl_cancel_waits_for_terminal_then_hedges_partial_fill() -> None:
@@ -190,6 +239,46 @@ def test_maker_rejection_preserves_venue_error_instead_of_ttl_message() -> None:
         assert intent.error_message == "Paper Post-only 订单会立即成交，模拟器拒绝挂单"
         assert group.close_reason == intent.error_message
         assert venue_order.status == "REJECTED"
+
+
+def test_repeated_maker_close_rejections_finish_each_intent_independently() -> None:
+    factory = _session_factory()
+    state = {"maker_fill": 0.0}
+
+    class RejectedCloseAdapter(MakerAdapter):
+        def submit_order(self, order):
+            self.state.setdefault("placed", []).append((self.venue, order))
+            return order_snapshot(
+                order,
+                venue=self.venue,
+                status="rejected",
+                error_message="真实探针未成交",
+            )
+
+    adapter_factory = lambda venue, mode: RejectedCloseAdapter(venue, state)
+    first_intent_id, group_id = _create_maker_close(factory, suffix="first")
+    assert run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory) == 1
+
+    second_intent_id, _ = _create_maker_close(factory, group_id=group_id, suffix="second")
+    assert run_execution_outbox_once(session_factory=factory, adapter_factory=adapter_factory) == 1
+
+    with factory() as db:
+        first = db.get(ExecutionIntent, first_intent_id)
+        second = db.get(ExecutionIntent, second_intent_id)
+        group = db.get(HedgeGroup, group_id)
+        events = db.query(HedgeGroupEvent).filter_by(
+            hedge_group_id=group_id,
+            event_type="maker_close_completed",
+        ).all()
+
+        assert first.status == "FAILED"
+        assert second.status == "FAILED"
+        assert group.status == "open"
+        assert len(events) == 2
+        assert {event.detail.split(";")[0] for event in events} == {
+            f"Intent #{first_intent_id}",
+            f"Intent #{second_intent_id}",
+        }
 
 
 def test_failed_hedge_creates_separate_flatten_compensation() -> None:

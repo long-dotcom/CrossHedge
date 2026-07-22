@@ -794,7 +794,6 @@ export function SettingsPage() {
                       <Form.Item name="maker_unfilled_action" label="Maker 到期动作">
                         <Select options={[{ value: 'cancel', label: '撤单并保留已对冲部分' }, { value: 'market_fallback', label: '撤单后转市价完成剩余数量' }]} />
                       </Form.Item>
-                      <Form.Item name="maker_offset_bps" label="挂单偏移 bps"><InputNumber min={0} step={0.1} /></Form.Item>
                       <Form.Item name="maker_order_ttl_seconds" label="挂单 TTL 秒"><InputNumber min={1} /></Form.Item>
                     </div>}
                   </div>

@@ -313,7 +313,8 @@ def _complete_maker_intent(
             intent.error_message = "Maker 到期未成交，未建立敞口"
         return
     event_type = f"maker_{intent.intent_type.lower()}_completed"
-    if _group_event_exists(db, group.id, event_type):
+    event_detail_prefix = f"Intent #{intent.id};"
+    if _group_event_exists(db, group.id, event_type, detail_prefix=event_detail_prefix):
         return
     hedge_template = dict(spec.get("hedge_template") or {})
     if intent.intent_type == "OPEN":
@@ -390,11 +391,20 @@ def _plan_from_dict(payload: dict[str, Any]) -> ExecutionLegPlan:
     return ExecutionLegPlan(**{name: payload[name] for name in names if name in payload})
 
 
-def _group_event_exists(db: Session, group_id: int, event_type: str) -> bool:
-    return db.query(HedgeGroupEvent.id).filter(
+def _group_event_exists(
+    db: Session,
+    group_id: int,
+    event_type: str,
+    *,
+    detail_prefix: str | None = None,
+) -> bool:
+    query = db.query(HedgeGroupEvent.id).filter(
         HedgeGroupEvent.hedge_group_id == group_id,
         HedgeGroupEvent.event_type == event_type,
-    ).first() is not None
+    )
+    if detail_prefix:
+        query = query.filter(HedgeGroupEvent.detail.like(f"{detail_prefix}%"))
+    return query.first() is not None
 
 
 def _set_group_leg_quantity(group: HedgeGroup, leg_key: str, quantity: float) -> None:

@@ -39,10 +39,6 @@ def close_order_type(mapping, leg: str) -> str:
     return open_order_type(mapping, leg)
 
 
-def maker_offset_bps(mapping) -> float:
-    return float(getattr(mapping, "maker_offset_bps", None) or getattr(mapping, "hl_maker_offset_bps", 1.0) or 0.0)
-
-
 def maker_ttl_seconds(mapping) -> int:
     value = getattr(mapping, "maker_order_ttl_seconds", None)
     return max(int(value if value is not None else getattr(mapping, "hl_order_ttl_seconds", 3) or 0), 0)
