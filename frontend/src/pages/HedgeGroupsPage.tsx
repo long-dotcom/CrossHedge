@@ -73,10 +73,12 @@ function detailItems(row: any) {
     { key: 'quote_age_ms', label: '报价年龄', children: row.quote_age_ms == null ? '-' : `${Math.round(row.quote_age_ms)}ms` },
     { key: 'entry_threshold', label: '入场线', children: fmtSpread(row.entry_threshold) },
     { key: 'exit_target', label: '退出线（平仓价差分位）', children: fmtSpread(row.exit_target) },
-    { key: 'open_cost', label: '开仓成本', children: fmtMoney(row.open_cost) },
-    { key: 'fees', label: '手续费成本', children: fmtMoney(row.fees) },
+    { key: 'estimated_open_fee', label: '预计开仓手续费', children: fmtMoney(row.estimated_open_fee) },
+    { key: 'estimated_close_fee', label: '预计平仓手续费', children: fmtMoney(row.estimated_close_fee) },
+    { key: 'fees', label: '已发生实际手续费', children: fmtMoney(row.fees) },
+    { key: 'remaining_close_fee', label: '当前预计待付平仓费', children: fmtMoney(row.remaining_close_fee) },
     { key: 'realized_pnl', label: '已实现', children: fmtMoney(row.realized_pnl) },
-    { key: 'unrealized_pnl', label: '未实现', children: fmtMoney(row.unrealized_pnl) },
+    { key: 'unrealized_pnl', label: '可平仓未实现净 PnL', children: fmtMoney(row.unrealized_pnl) },
     { key: 'source', label: '来源', children: <EllipsisCell value={row.source} /> },
     { key: 'close_reason', label: '平仓原因', children: <EllipsisCell value={row.close_reason} /> }
   ];
@@ -158,7 +160,7 @@ export function HedgeGroupsPage() {
     { title: '触发价差', dataIndex: 'trigger_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
     { title: '开仓价差', dataIndex: 'entry_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
     { title: '平仓价差', dataIndex: 'current_close_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
-    { title: 'PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
+    { title: '净 PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
     { title: '操作', fixed: 'right', width: 230, render: (_, row) => (
       <Space size={4}>
         <Popconfirm

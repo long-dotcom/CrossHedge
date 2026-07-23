@@ -102,7 +102,7 @@ export function SpreadAnalyticsPage() {
         trigger: 'axis',
         valueFormatter: (value: unknown) => fmtChartValue(value)
       },
-      legend: { top: 0, data: ['价差', '均值', '+1σ', '-1σ', '+2σ', '-2σ', '平均成本'] },
+      legend: { top: 0, data: ['价差', '均值', '+1σ', '-1σ', '+2σ', '-2σ', '平均完整成本'] },
       grid: { left: 48, right: 28, top: 48, bottom: 42 },
       xAxis: { type: 'category', data: times, boundaryGap: false },
       yAxis: { type: 'value', scale: true, axisLabel: { formatter: (value: number) => fmtChartValue(value) } },
@@ -114,7 +114,7 @@ export function SpreadAnalyticsPage() {
         { name: '-1σ', type: 'line', data: lower1, showSymbol: false, lineStyle: { width: 1, type: 'dotted', color: '#52c41a' } },
         { name: '+2σ', type: 'line', data: upper2, showSymbol: false, lineStyle: { width: 1, type: 'dashed', color: '#fa8c16' } },
         { name: '-2σ', type: 'line', data: lower2, showSymbol: false, lineStyle: { width: 1, type: 'dashed', color: '#fa8c16' } },
-        { name: '平均成本', type: 'line', data: cost, showSymbol: false, lineStyle: { width: 1, type: 'dashed', color: '#f5222d' } }
+        { name: '平均完整成本', type: 'line', data: cost, showSymbol: false, lineStyle: { width: 1, type: 'dashed', color: '#f5222d' } }
       ]
     };
   }, [items, summary]);
@@ -189,8 +189,16 @@ export function SpreadAnalyticsPage() {
                 <strong>{fmtChartValue(summary?.mean || 0)} / {fmtChartValue(summary?.std || 0)}</strong>
               </div>
               <div className="analytics-line">
-                <span>平均成本线</span>
+                <span>平均完整成本线</span>
                 <strong>{fmtChartValue(summary?.avg_total_cost || 0)}</strong>
+              </div>
+              <div className="analytics-line">
+                <span>其中：双腿点差</span>
+                <strong>{fmtChartValue(summary?.avg_spread_cost || 0)}</strong>
+              </div>
+              <div className="analytics-line">
+                <span>其中：开平手续费</span>
+                <strong>{fmtChartValue(summary?.avg_fee_cost || 0)}</strong>
               </div>
               <div className="analytics-line">
                 <span>估算半衰期</span>

@@ -78,6 +78,9 @@ export type HedgePoolItem = {
   exit_target: number;
   realized_pnl: number;
   unrealized_pnl: number;
+  accrued_fees: number;
+  remaining_close_fee: number;
+  pnl_basis: 'liquidation' | 'realized';
   close_reason: string;
   age_ms?: number | null;
 };

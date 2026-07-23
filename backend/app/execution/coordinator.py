@@ -150,6 +150,8 @@ def create_open_intent(
             leg_b_quantity=opportunity.leg_b_quantity or opportunity.quantity,
             leg_a_quantity=opportunity.leg_a_quantity or opportunity.quantity,
             open_cost=opportunity.total_cost,
+            estimated_open_fee=opportunity.estimated_open_fee,
+            estimated_close_fee=opportunity.estimated_close_fee,
             trigger_spread=opportunity.gross_spread,
             trigger_leg_a_bid=opportunity.trigger_leg_a_bid,
             trigger_leg_a_ask=opportunity.trigger_leg_a_ask,

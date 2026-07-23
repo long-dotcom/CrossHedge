@@ -13,6 +13,7 @@ from app.db.models import ArbitrageOpportunity, Base, ExecutionIntent, Execution
 from app.execution.coordinator import create_close_intent, create_open_intent, create_recovery_intent
 from app.execution.outbox_worker import run_execution_outbox_once
 from app.execution.pnl import actual_entry_spread_from_fills
+from app.execution.preflight import refreshed_opportunity_still_executable
 from tests.native_fakes import order_snapshot
 
 
@@ -183,7 +184,7 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         opportunity = ArbitrageOpportunity(
             symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
             notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
-            gross_spread=2.0, total_cost=0.5, net_profit=1.5, annualized_return=0.1,
+            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031, annualized_return=0.1,
             entry_threshold=1.0, exit_target=0.2,
         )
         db.add(opportunity)
@@ -290,7 +291,7 @@ def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) ->
         opportunity = ArbitrageOpportunity(
             symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
             notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
-            gross_spread=2.0, total_cost=0.5, net_profit=1.5, annualized_return=0.1,
+            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031, annualized_return=0.1,
             entry_threshold=1.0, exit_target=0.2,
         )
         db.add(opportunity)
@@ -412,3 +413,24 @@ def test_recovery_intent_refuses_unknown_pending_order() -> None:
                 db, group_id=group.id, reason="unsafe", requested_by="test",
                 idempotency_key="recover:gold:pending",
             )
+
+
+def test_execution_recheck_uses_exit_target_and_round_trip_fees() -> None:
+    opportunity = SimpleNamespace(
+        direction="long_leg_a_short_leg_b",
+        entry_threshold=1.0,
+        exit_target=1.5,
+        leg_a_quantity=1.0,
+        quantity=1.0,
+        total_cost=0.6,
+    )
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=99.0, ask=100.0),
+        leg_b=SimpleNamespace(bid=102.0, ask=103.0),
+    )
+    strategy = SimpleNamespace(min_total_profit=0.0, min_net_profit=0.0)
+
+    allowed, reason = refreshed_opportunity_still_executable(opportunity, synced, strategy)
+
+    assert allowed is False
+    assert "净利润不足" in reason

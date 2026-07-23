@@ -40,6 +40,7 @@ def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
         leg_a_quantity=2,
         leg_b_quantity=2,
         entry_spread=20,
+        estimated_close_fee=0.5,
         unrealized_pnl=0,
     )
     quote_cache.put("hyperliquid", "POOL-PNL", bid=100, ask=101, depth_notional=1000, source="test")
@@ -48,7 +49,7 @@ def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
     item = _pool_payload([group], now)["items"][0]
 
     assert item["current_close_spread"] == 16
-    assert item["unrealized_pnl"] == 8
+    assert item["unrealized_pnl"] == 7.5
 
 def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
@@ -116,6 +117,7 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
         leg_a_quantity=2,
         leg_b_quantity=2,
         entry_spread=20,
+        estimated_close_fee=0.5,
         unrealized_pnl=0,
     )
     closed = HedgeGroup(
@@ -133,8 +135,9 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
 
     assert result["equity"] == 100
     assert result["realized_pnl"] == 3
-    assert result["unrealized_pnl"] == 8
-    assert result["today_pnl"] == 11
+    assert result["unrealized_pnl"] == 7.5
+    assert result["remaining_close_fees"] == 0.5
+    assert result["today_pnl"] == 10.5
 
 def test_positions_stream_channel_returns_only_positions(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
@@ -304,6 +307,7 @@ def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
         leg_a_quantity=2,
         leg_b_quantity=2,
         entry_spread=20,
+        estimated_close_fee=0.5,
         unrealized_pnl=0,
     )
     db.add(group)
@@ -316,7 +320,8 @@ def test_hedge_groups_api_returns_runtime_unrealized_pnl() -> None:
 
     item = result["items"][0]
     assert item["current_close_spread"] == 16
-    assert item["unrealized_pnl"] == 8
+    assert item["unrealized_pnl"] == 7.5
+    assert item["remaining_close_fee"] == 0.5
 
 def test_pipeline_pool_payload_accepts_hedge_group_snapshot() -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)

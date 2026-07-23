@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from app.execution.auto_closer import evaluate_auto_close
 from app.execution.hedge_pool import HedgeGroupSnapshot
-from app.execution.pnl import pnl_from_close_spread
+from app.execution.pnl import liquidation_pnl_from_close_spread, pnl_from_close_spread
 
 
 def _snapshot(**overrides) -> HedgeGroupSnapshot:
@@ -51,3 +51,10 @@ def test_pnl_ignores_legacy_funding_and_swap_fields() -> None:
     group = _snapshot(entry_spread=10.0, fees=1.5, funding=999.0, swap=999.0)
 
     assert pnl_from_close_spread(group, 4.0) == 4.5
+
+
+def test_liquidation_pnl_includes_remaining_close_fee() -> None:
+    group = _snapshot(entry_spread=10.0, fees=1.5, estimated_close_fee=0.75)
+
+    assert pnl_from_close_spread(group, 4.0) == 4.5
+    assert liquidation_pnl_from_close_spread(group, 4.0) == 3.75

@@ -25,7 +25,7 @@ from app.execution.actions import hedge_group_actions
 from app.execution.coordinator import create_close_intent, create_recovery_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.voiding import void_hedge_group
-from app.execution.pnl import actual_entry_spread_from_fills, pnl_from_close_spread
+from app.execution.pnl import actual_entry_spread_from_fills, pnl_breakdown_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
 from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn, VoidHedgeGroupIn
 
@@ -40,6 +40,14 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot, le
     """组装单个对冲组的完整数据（含价差和未实现盈亏）。"""
     data = as_dict(group)
     data.update(leg_metadata or _leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
+    data.update({
+        "accrued_fees": float(getattr(group, "fees", 0.0) or 0.0),
+        "remaining_close_fee": (
+            float(getattr(group, "estimated_close_fee", 0.0) or 0.0)
+            if group.status in {"open", "open_partial"} else 0.0
+        ),
+        "pnl_basis": "liquidation" if group.status in {"open", "open_partial"} else "realized",
+    })
     if not isinstance(group, HedgeGroupSnapshot):
         actual_entry_spread = actual_entry_spread_from_fills(db, group)
         if actual_entry_spread is not None:
@@ -53,7 +61,16 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot, le
     current_close_spread = spreads.get("current_close_spread")
     if group.status in {"open", "open_partial"} and current_close_spread is not None:
         try:
-            data["unrealized_pnl"] = pnl_from_close_spread(group, float(current_close_spread))
+            pnl = pnl_breakdown_from_close_spread(
+                group, float(current_close_spread), include_estimated_close_fee=True,
+            )
+            data.update({
+                "unrealized_pnl": pnl.net_pnl,
+                "gross_unrealized_pnl": pnl.gross_pnl,
+                "accrued_fees": pnl.accrued_fees,
+                "remaining_close_fee": pnl.estimated_close_fee,
+                "pnl_basis": "liquidation",
+            })
         except (TypeError, ValueError):
             pass
     data["available_actions"] = hedge_group_actions(db, group)

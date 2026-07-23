@@ -20,7 +20,7 @@ from app.db.models import HedgeGroup, StrategySetting, SystemLog, WorkerRun
 from app.db.retention import prune_table_by_id
 from app.execution.coordinator import create_close_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
-from app.execution.pnl import pnl_from_close_spread
+from app.execution.pnl import pnl_breakdown_from_close_spread
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.quotes import quote_synchronizer
 from app.market.scanner import get_strategy_setting
@@ -147,13 +147,22 @@ def evaluate_auto_close(
         synced.leg_b.ask,
     ).close_spread
     exit_target = _effective_exit_target(snapshot, mapping)
-    estimated_profit = pnl_from_close_spread(snapshot, close_spread)
     try:
-        estimated_profit -= estimated_pair_close_fee(mapping, snapshot.notional) if mapping else 0.0
+        live_close_fee = estimated_pair_close_fee(mapping, snapshot.notional) if mapping else 0.0
     except VenueCostUnavailable as exc:
         if not force:
-            return CloseEvaluation(False, f"自动平仓成本不可用: {exc}", close_spread, exit_target, estimated_profit)
+            fallback_profit = pnl_breakdown_from_close_spread(
+                snapshot, close_spread, include_estimated_close_fee=True,
+            ).net_pnl
+            return CloseEvaluation(False, f"自动平仓成本不可用: {exc}", close_spread, exit_target, fallback_profit)
         logger.warning("强制平仓无法估算 close fee，继续执行: group_id={}, error={}", snapshot.id, exc)
+        live_close_fee = float(getattr(snapshot, "estimated_close_fee", 0.0) or 0.0)
+    estimated_profit = pnl_breakdown_from_close_spread(
+        snapshot,
+        close_spread,
+        include_estimated_close_fee=True,
+        estimated_close_fee=live_close_fee,
+    ).net_pnl
 
     min_profit = float(strategy.auto_close_min_profit or 0.0)
     hold_expired = _hold_expired(snapshot, strategy, mapping)

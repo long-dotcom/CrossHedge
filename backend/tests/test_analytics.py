@@ -75,6 +75,19 @@ def test_spread_analytics_empty_summary() -> None:
     assert summary["analytics_status"] == "no_data"
     assert summary["sample_count"] == 0
 
+
+def test_spread_analytics_complete_cost_includes_spread_and_fee() -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    points = [SpreadPoint(now, 1.0, 0.02, 0.5, spread_cost=0.03)]
+
+    summary = summarize_spreads(points, "1h")
+    series = downsample_spreads(points, "1h")
+
+    assert summary["avg_fee_cost"] == pytest.approx(0.02)
+    assert summary["avg_spread_cost"] == pytest.approx(0.03)
+    assert summary["avg_total_cost"] == pytest.approx(0.05)
+    assert series[0]["avg_total_cost"] == pytest.approx(0.05)
+
 def test_lead_lag_detects_following_move() -> None:
     symbol = "LLTEST"
     quote_cache.put("hyperliquid", symbol, 100, 101, 10000, "test")

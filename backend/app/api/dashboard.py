@@ -28,7 +28,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.execution.hedge_pool import hedge_pool
-from app.execution.pnl import pnl_from_close_spread
+from app.execution.pnl import pnl_breakdown_from_close_spread
 from app.core.time_utils import utc_now
 from app.market.hedge_spreads import hedge_group_spreads
 from app.db.models import User
@@ -40,8 +40,8 @@ router = APIRouter()
 # 内部辅助：开放对冲组未实现盈亏
 # ---------------------------------------------------------------------------
 
-def _runtime_open_unrealized_pnl(db: Session) -> float:
-    """遍历 open / open_partial 对冲组，用实时价差计算未实现盈亏。"""
+def _runtime_open_pnl(db: Session) -> tuple[float, float]:
+    """返回当前立即平仓净 PnL及其中尚未发生的预计平仓手续费。"""
     groups = (
         db.query(HedgeGroup)
         .filter(HedgeGroup.status.in_(["open", "open_partial"]))
@@ -50,6 +50,7 @@ def _runtime_open_unrealized_pnl(db: Session) -> float:
     )
     active_by_id = {s.id: s for s in hedge_pool.snapshot_groups()}
     total = 0.0
+    remaining_close_fees = 0.0
     for row in groups:
         group = active_by_id.get(row.id)
         group = group if group and group.symbol == row.symbol else row
@@ -57,12 +58,22 @@ def _runtime_open_unrealized_pnl(db: Session) -> float:
         current_close_spread = spreads.get("current_close_spread")
         if current_close_spread is None:
             total += float(group.unrealized_pnl or 0.0)
+            remaining_close_fees += float(getattr(group, "estimated_close_fee", 0.0) or 0.0)
             continue
         try:
-            total += pnl_from_close_spread(group, float(current_close_spread))
+            pnl = pnl_breakdown_from_close_spread(
+                group, float(current_close_spread), include_estimated_close_fee=True,
+            )
+            total += pnl.net_pnl
+            remaining_close_fees += pnl.estimated_close_fee
         except (TypeError, ValueError):
             total += float(group.unrealized_pnl or 0.0)
-    return total
+    return total, remaining_close_fees
+
+
+def _runtime_open_unrealized_pnl(db: Session) -> float:
+    """兼容旧调用名：返回当前立即平仓后的净 PnL。"""
+    return _runtime_open_pnl(db)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +109,14 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
         .scalar()
         or 0.0
     )
-    unrealized_pnl = _runtime_open_unrealized_pnl(db)
+    unrealized_pnl, remaining_close_fees = _runtime_open_pnl(db)
     return {
         "equity": equity,
         "today_pnl": today_realized_pnl + unrealized_pnl,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
+        "remaining_close_fees": remaining_close_fees,
+        "pnl_basis": "liquidation",
         "risk_mode": risk.mode if risk else "normal",
         "open_hedge_groups": open_groups,
         "unread_alerts": alerts,

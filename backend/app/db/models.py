@@ -640,6 +640,9 @@ class ArbitrageOpportunity(Base, TimestampMixin):
     unit_cost: Mapped[float] = mapped_column(Float, default=0.0)
     unit_net_profit: Mapped[float] = mapped_column(Float, default=0.0)
     total_cost: Mapped[float] = mapped_column(Float)
+    spread_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_open_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_close_fee: Mapped[float] = mapped_column(Float, default=0.0)
     net_profit: Mapped[float] = mapped_column(Float)
     annualized_return: Mapped[float] = mapped_column(Float)
     entry_threshold: Mapped[float] = mapped_column(Float, default=0.0)
@@ -663,7 +666,9 @@ class HedgeGroup(Base, TimestampMixin):
     - status: 生命周期状态（pending_open / opening / open / closing / closed / error）
     - execution_mode: 执行模式（paper / live）
     - notional / quantity: 名义价值与数量
-    - open_cost / realized_pnl / unrealized_pnl: 开仓成本 / 已实现盈亏 / 未实现盈亏
+    - open_cost: 兼容历史字段，保存扫描时预计开平手续费总额
+    - estimated_open_fee / estimated_close_fee: 扫描时的开仓、平仓手续费拆分
+    - realized_pnl / unrealized_pnl: 已实现盈亏 / 当前可平仓净盈亏
     - fees / funding / swap: 手续费 / 资金费 / 掉期
     - trigger_*: 触发时的市场数据快照
     - entry_spread / entry_threshold / exit_target / overheat_threshold: 价差阈值
@@ -684,6 +689,8 @@ class HedgeGroup(Base, TimestampMixin):
     leg_b_quantity: Mapped[float] = mapped_column(Float, default=1.0)
     leg_a_quantity: Mapped[float] = mapped_column(Float, default=1.0)
     open_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_open_fee: Mapped[float] = mapped_column(Float, default=0.0)
+    estimated_close_fee: Mapped[float] = mapped_column(Float, default=0.0)
     realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     fees: Mapped[float] = mapped_column(Float, default=0.0)

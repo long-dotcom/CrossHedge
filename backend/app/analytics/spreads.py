@@ -72,8 +72,14 @@ class SpreadPoint:
     """单个价差数据点"""
     created_at: datetime      # 创建时间
     spread: float             # 价差值
-    total_cost: float         # 总成本（含手续费、滑点等）
+    total_cost: float         # 单位手续费成本（兼容历史字段名）
     net_profit: float         # 净利润
+    spread_cost: float = 0.0  # 双腿可成交 bid/ask 的单位往返摩擦
+
+    @property
+    def complete_cost(self) -> float:
+        """研究展示用完整单位成本：点差摩擦 + 手续费。"""
+        return self.spread_cost + self.total_cost
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +143,7 @@ def _load_snapshot_points(db: Session, symbol: str, direction: str, start_at: da
             spread=float(_snapshot_spread(row, basis)),
             total_cost=float(row.unit_cost),
             net_profit=float(row.unit_net_profit),
+            spread_cost=float(getattr(row, "spread_cost", 0.0) or 0.0),
         )
         for row in rows
     ]
@@ -161,6 +168,7 @@ def _load_bucket_points(db: Session, symbol: str, direction: str, start_at: date
                 spread=float(_bucket_spread(row, basis)),
                 total_cost=float(row.avg_unit_cost),
                 net_profit=float(row.avg_unit_net_profit),
+                spread_cost=float(getattr(row, "avg_spread_cost", 0.0) or 0.0),
             )
             for row in bucket_rows
         ]
@@ -207,7 +215,9 @@ def summarize_spreads(points: list[SpreadPoint], range_value: str) -> dict[str, 
     std = pstdev(spreads) if sample_count > 1 else 0.0
     z_score = (current - avg) / std if std > 0 else 0.0
     percentile = sum(1 for value in spreads if value <= current) / sample_count
-    cost_line = mean(point.total_cost for point in points)
+    fee_cost_line = mean(point.total_cost for point in points)
+    spread_cost_line = mean(point.spread_cost for point in points)
+    cost_line = mean(point.complete_cost for point in points)
     half_life = estimate_half_life_seconds(points, avg)
     reversion_probability = estimate_reversion_probabilities(points, current, avg)
     max_adverse_spread = estimate_max_adverse_spread(spreads, current, avg)
@@ -225,6 +235,8 @@ def summarize_spreads(points: list[SpreadPoint], range_value: str) -> dict[str, 
         "reversion_probability": reversion_probability,
         "max_adverse_spread": max_adverse_spread,
         "avg_total_cost": cost_line,
+        "avg_fee_cost": fee_cost_line,
+        "avg_spread_cost": spread_cost_line,
         "analytics_status": status,
         "reason": reason,
         "opportunity_score": score_opportunity(z_score, reversion_probability.get("15m"), half_life, sample_count),
@@ -263,7 +275,9 @@ def downsample_spreads(points: list[SpreadPoint], range_value: str) -> list[dict
                 "low": min(values),
                 "close": values[-1],
                 "avg": mean(values),
-                "avg_total_cost": mean(point.total_cost for point in bucket),
+                "avg_total_cost": mean(point.complete_cost for point in bucket),
+                "avg_fee_cost": mean(point.total_cost for point in bucket),
+                "avg_spread_cost": mean(point.spread_cost for point in bucket),
                 "avg_net_profit": mean(point.net_profit for point in bucket),
                 "count": len(bucket),
             }
@@ -403,6 +417,8 @@ def _empty_summary(range_value: str) -> dict[str, object]:
         "reversion_probability": {key: None for key in REVERSION_HORIZONS},
         "max_adverse_spread": 0.0,
         "avg_total_cost": 0.0,
+        "avg_fee_cost": 0.0,
+        "avg_spread_cost": 0.0,
         "analytics_status": "no_data",
         "reason": "暂无价差快照",
         "opportunity_score": 0.0,

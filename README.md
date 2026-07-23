@@ -101,6 +101,8 @@ FastAPI 只创建不可变 Intent、ExecutionLeg 和 Outbox。独立执行 Worke
 - 对冲组的“触发价差”保存策略满足条件时的双腿行情快照；“开仓价差”在双腿成交前保持未确认，成交后按交易所返回的累计成交均价计算。新执行模型的 `VenueOrder.average_price/filled_quantity` 为主数据源，旧 `orders/fills` 仅用于兼容历史记录。
 - 仪表盘“今日盈亏”按 UTC 自然日统计今日已实现盈亏，再加当前开放对冲组的实时未实现盈亏；“已实现盈亏”卡片仍展示全部历史已平仓汇总。
 - 扫描、执行和盈亏的成本口径仅包含可执行 bid/ask 已体现的双腿点差，以及两腿开仓、平仓交易手续费；不再读取、预测或累计 Funding、MT5 Swap、滑点和 FX 附加成本。
+- 成本与 PnL 使用统一拆分：`spread_cost` 表示双腿 bid/ask 往返摩擦，`unit_cost/total_cost` 保持手续费口径，机会另外保存预计开仓/平仓手续费。价差研究展示两者之和；持仓“未实现盈亏”表示按当前可成交平仓价并预扣预计平仓手续费后的可平仓净 PnL；已实现盈亏只使用真实双腿 Fill 和实际手续费。
+- 执行前最后复核与扫描器使用同一公式：`(当前入场价差 - 退出目标) × 数量 - 预计开平手续费`，避免复核阶段漏掉退出目标。
 
 - 下单前校验异常、确定性提交失败、结果未知异常以及交易所拒绝都会写入旧订单的
   `error_message`、Intent、Outbox/ExecutionEvent 和 `SystemLog(category=execution)`；

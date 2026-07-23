@@ -47,6 +47,8 @@ class HedgeGroupSnapshot:
     opened_at: datetime | None
     closed_at: datetime | None
     source: str
+    estimated_open_fee: float = 0.0
+    estimated_close_fee: float = 0.0
 
     @classmethod
     def from_row(cls, row: HedgeGroup) -> "HedgeGroupSnapshot":
@@ -57,6 +59,8 @@ class HedgeGroupSnapshot:
             leg_b_quantity=float(row.leg_b_quantity if row.leg_b_quantity is not None else row.quantity or 0.0),
             leg_a_quantity=float(row.leg_a_quantity if row.leg_a_quantity is not None else row.quantity or 0.0),
             open_cost=float(row.open_cost or 0.0), fees=float(row.fees or 0.0),
+            estimated_open_fee=float(row.estimated_open_fee or 0.0),
+            estimated_close_fee=float(row.estimated_close_fee or 0.0),
             funding=float(row.funding or 0.0), swap=float(row.swap or 0.0),
             realized_pnl=float(row.realized_pnl or 0.0), unrealized_pnl=float(row.unrealized_pnl or 0.0),
             trigger_spread=float(row.trigger_spread or 0.0), entry_spread=float(row.entry_spread or 0.0),

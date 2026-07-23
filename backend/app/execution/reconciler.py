@@ -387,7 +387,9 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
             group.fees += _orders_fee(db, platform_orders.values())
             group.realized_pnl = realized_pnl_from_fills(db, group)
             if group.realized_pnl is None:
-                group.realized_pnl = group.unrealized_pnl - group.fees
+                # unrealized_pnl 统一保存“立即平仓净 PnL”，已经包含手续费；
+                # 成交事实缺失时只能沿用最后估值，禁止再次扣费。
+                group.realized_pnl = group.unrealized_pnl
             group.unrealized_pnl = 0.0
             db.add(HedgeGroupEvent(hedge_group_id=group.id, event_type="closed_reconciled", detail="订单回查确认双边平仓成交"))
             db.add(SystemLog(level="info", category="execution_reconcile", message=f"平仓回查完成: {group.symbol} #{group.id}"))

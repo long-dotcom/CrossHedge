@@ -152,7 +152,7 @@ function HedgeRow({ group }: { group: V2HedgeGroup }) {
         <span>开仓 <strong>{spreadLabel(group.entrySpread)}</strong></span>
         <span>当前 <strong>{spreadLabel(group.currentSpread)}</strong></span>
       </div>
-      <div className="v2-hedge-pnl">PnL <strong className={(group.pnl || 0) >= 0 ? 'positive' : 'negative'}>{(group.pnl || 0) >= 0 ? '+' : ''}{(group.pnl || 0).toFixed(2)}</strong></div>
+      <div className="v2-hedge-pnl" title="按当前可成交平仓价并预扣预计平仓手续费">净 PnL <strong className={(group.pnl || 0) >= 0 ? 'positive' : 'negative'}>{(group.pnl || 0) >= 0 ? '+' : ''}{(group.pnl || 0).toFixed(2)}</strong></div>
     </div>
   );
 }
@@ -174,7 +174,7 @@ function HedgePoolPanelV2({ hedgeGroups, releasedCount, archivedCount }: { hedge
         <div><span>持仓</span><strong>{counts.holding}</strong></div>
         <div><span>可平</span><strong>{counts.closable}</strong></div>
         <div><span>处理中</span><strong>{counts.building + counts.closing}</strong></div>
-        <div><span>浮盈亏</span><strong className={floatingPnl >= 0 ? 'positive' : 'negative'}>{floatingPnl >= 0 ? '+' : ''}{floatingPnl.toFixed(2)}</strong></div>
+        <div title="按当前可成交平仓价并预扣预计平仓手续费"><span>可平仓净 PnL</span><strong className={floatingPnl >= 0 ? 'positive' : 'negative'}>{floatingPnl >= 0 ? '+' : ''}{floatingPnl.toFixed(2)}</strong></div>
       </div>
       <div className="v2-pool-body">
         <div className="v2-pool-rail">

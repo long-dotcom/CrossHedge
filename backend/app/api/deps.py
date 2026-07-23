@@ -88,6 +88,7 @@ def _rows_with_leg_metadata(db: Session, rows: list[Any]) -> list[dict[str, Any]
     fallback = _leg_metadata(None)
     for data in data_rows:
         data.update(metadata.get(str(data.get("symbol") or "").upper(), fallback))
+        _add_cost_breakdown(data)
     return data_rows
 
 
@@ -95,7 +96,27 @@ def _row_with_leg_metadata(db: Session, row: Any) -> dict[str, Any]:
     """在 as_dict 基础上附加双腿元信息列。"""
     data = as_dict(row) if not isinstance(row, dict) else dict(row)
     data.update(_leg_metadata_for_symbol(db, str(data.get("symbol") or "")))
+    _add_cost_breakdown(data)
     return data
+
+
+def _add_cost_breakdown(data: dict[str, Any]) -> None:
+    """为价差/机会响应补充统一且不改变旧字段语义的成本拆分。"""
+    if "unit_cost" not in data and "spread_cost" not in data:
+        return
+    fee_unit = float(data.get("unit_cost") or 0.0)
+    spread_unit = float(data.get("spread_cost") or 0.0)
+    quantity = float(data.get("leg_a_quantity") or data.get("quantity") or 0.0)
+    fee_total = float(data.get("total_cost") or 0.0)
+    spread_total = spread_unit * quantity
+    data.update({
+        "unit_fee_cost": fee_unit,
+        "unit_spread_cost": spread_unit,
+        "unit_total_cost": fee_unit + spread_unit,
+        "total_fee_cost": fee_total,
+        "total_spread_cost": spread_total,
+        "complete_total_cost": fee_total + spread_total,
+    })
 
 
 # ---------------------------------------------------------------------------

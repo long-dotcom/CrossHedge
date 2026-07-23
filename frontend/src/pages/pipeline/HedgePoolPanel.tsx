@@ -26,7 +26,7 @@ function PoolItemCard({ item }: { item: HedgePoolItem }) {
         </div>
         <div className="pool-chip-pnl">
           <span>UPnL</span>
-          <strong>{fmtAdaptive(item.unrealized_pnl)}</strong>
+          <strong title="已按当前可成交平仓价并预扣预计平仓手续费">{fmtAdaptive(item.unrealized_pnl)}</strong>
         </div>
       </div>
     </Tooltip>
@@ -83,8 +83,12 @@ export function HedgePoolPanel({ data }: { data: PipelineDiagnostics }) {
             <strong>{fmtCompact(data.pool.items.reduce((sum, item) => sum + Number(item.notional || 0), 0), 2)}</strong>
           </div>
           <div className="pool-summary-line">
-            <span>浮动盈亏</span>
+            <span>可平仓净 PnL</span>
             <strong>{fmtAdaptive(data.pool.items.reduce((sum, item) => sum + Number(item.unrealized_pnl || 0), 0))}</strong>
+          </div>
+          <div className="pool-summary-line">
+            <span>预计待付平仓费</span>
+            <strong>{fmtAdaptive(data.pool.items.reduce((sum, item) => sum + Number(item.remaining_close_fee || 0), 0))}</strong>
           </div>
           <div className="pool-summary-line">
             <span>今日已平仓</span>

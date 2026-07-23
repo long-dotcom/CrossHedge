@@ -29,6 +29,21 @@ def test_pair_cost_counts_both_legs_open_and_close_fees_without_duplicate_spread
     assert cost.leg_a_spread == 0
     assert cost.leg_b_spread == 0
     assert cost.total == pytest.approx(1.6)
+    assert cost.open_fee == pytest.approx(0.65)
+    assert cost.close_fee == pytest.approx(0.95)
+
+
+def test_pair_cost_preserves_zero_open_fee() -> None:
+    cost = estimate_pair_cost(
+        notional=1000,
+        leg_a_open_fee_rate=0,
+        leg_a_close_fee_rate=0.001,
+        leg_b_open_fee_rate=0,
+        leg_b_close_fee_rate=0.002,
+    )
+
+    assert cost.open_fee == pytest.approx(0)
+    assert cost.close_fee == pytest.approx(3)
 
 
 def test_mt5_cost_source_is_automatic_zero_fee() -> None:

@@ -54,6 +54,7 @@ from app.strategy.live_costs import VenueCostUnavailable, venue_cost_inputs
 from app.strategy.position_sizing import PositionSizing, calculate_position_sizing
 from app.strategy.statistical_signal import evaluate_entry_signal, signal_stats_snapshot
 from app.execution.circuit_breaker import feed_spread as breaker_feed
+from app.execution.pnl import projected_pnl
 from app.execution.modes import MAKER_THEN_MARKET, close_order_type, execution_mode, maker_leg, open_order_type
 from app.strategy.spread_math import DIRECTIONS, LONG_LEG_A_SHORT_LEG_B, spreads_for_direction
 from app.adapters.venue import is_native_pair, mapping_leg
@@ -423,6 +424,8 @@ def run_scan(db: Session) -> int:
                         close_spread=spread_values.close_spread,
                         mid_spread=spread_values.mid_spread,
                         spread_cost=spread_values.spread_cost,
+                        estimated_open_fee=cost.open_fee,
+                        estimated_close_fee=cost.close_fee,
                         unit_cost=unit_cost, unit_net_profit=unit_net_profit,
                         total_cost=cost.total, net_profit=net_profit,
                         annualized_return=annualized_return,
@@ -513,10 +516,9 @@ def _projected_profit(
     quantity: float,
 ) -> tuple[float, float]:
     """按可成交入场/退出价差计算预计总利润和单位利润。"""
-    qty = max(float(quantity or 0.0), 0.0)
-    unit_cost = float(total_cost or 0.0) / qty if qty > 0 else float(total_cost or 0.0)
-    unit_profit = float(entry_spread or 0.0) - float(exit_spread or 0.0) - unit_cost
-    return unit_profit * qty, unit_profit
+    result = projected_pnl(entry_spread, exit_spread, quantity, total_cost)
+    unit_profit = result.net_pnl / result.quantity if result.quantity > 0 else result.net_pnl
+    return result.net_pnl, unit_profit
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +573,8 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snaps
         leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
         if cost_error:
             total_cost = 0.0
+            estimated_open_fee = 0.0
+            estimated_close_fee = 0.0
             unit_cost = 0.0
             unit_net_profit = 0.0
             net_profit = 0.0
@@ -600,6 +604,8 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snaps
                 cost.as_dict(),
             )
             total_cost = cost.total
+            estimated_open_fee = cost.open_fee
+            estimated_close_fee = cost.close_fee
             unit_cost = total_cost / sizing.leg_a_base_quantity if sizing.leg_a_base_quantity > 0 else total_cost
             exit_target = _effective_exit_target(mapping, 0.0)
             net_profit, unit_net_profit = _projected_profit(
@@ -621,6 +627,7 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snaps
             fx_rate_to_usd=sizing.fx_rate_to_usd, gross_spread=spreads.entry_spread,
             entry_spread=spreads.entry_spread, close_spread=spreads.close_spread, mid_spread=spreads.mid_spread,
             spread_cost=spreads.spread_cost, unit_cost=unit_cost,
+            estimated_open_fee=estimated_open_fee, estimated_close_fee=estimated_close_fee,
             unit_net_profit=unit_net_profit,
             total_cost=total_cost, net_profit=net_profit,
             annualized_return=(net_profit / notional) * (365 * 24 / holding_hours) if notional > 0 else 0.0,
@@ -844,6 +851,8 @@ def _current_payload(**values) -> dict:
     values.setdefault("leg_a_quantity", values.get("quantity", 0.0))
     values.setdefault("notional_currency", "USD")
     values.setdefault("fx_rate_to_usd", 1.0)
+    values.setdefault("estimated_open_fee", 0.0)
+    values.setdefault("estimated_close_fee", 0.0)
     values.setdefault("sampled_at", utc_now())
     return values
 
@@ -856,7 +865,8 @@ def _opportunity_payload(payload, *, notional, entry_threshold, exit_target, ove
         **{key: payload[key] for key in (
             "symbol", "direction", "leg_a_bid", "leg_a_ask", "leg_b_bid", "leg_b_ask",
             "quantity", "leg_b_quantity", "leg_a_quantity", "notional_currency", "fx_rate_to_usd",
-            "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
+            "gross_spread", "spread_cost", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
+            "estimated_open_fee", "estimated_close_fee",
             "annualized_return", "status"
         )},
         "notional": notional, "entry_threshold": entry_threshold, "exit_target": exit_target,
@@ -1149,6 +1159,9 @@ def _persist_opportunities(db: Session, opportunities: list[dict], ids_by_key: d
         current.trigger_leg_b_bid = payload["leg_b_bid"]
         current.trigger_leg_b_ask = payload["leg_b_ask"]
         current.unit_cost = payload["unit_cost"]
+        current.spread_cost = payload.get("spread_cost", 0.0)
+        current.estimated_open_fee = payload.get("estimated_open_fee", 0.0)
+        current.estimated_close_fee = payload.get("estimated_close_fee", 0.0)
         current.unit_net_profit = payload["unit_net_profit"]
         current.total_cost = payload["total_cost"]
         current.net_profit = payload["net_profit"]
@@ -1184,7 +1197,8 @@ def _persist_opportunities(db: Session, opportunities: list[dict], ids_by_key: d
 def _opportunity_signature(row: ArbitrageOpportunity) -> tuple:
     """机会签名，用于检测变更。"""
     return (
-        row.status, row.gross_spread, row.unit_cost, row.unit_net_profit,
+        row.status, row.gross_spread, row.spread_cost, row.unit_cost, row.unit_net_profit,
+        row.estimated_open_fee, row.estimated_close_fee,
         row.total_cost, row.net_profit, row.entry_threshold, row.exit_target,
         row.overheat_threshold, row.signal_sample_count, row.reject_reason,
     )

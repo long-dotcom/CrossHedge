@@ -27,6 +27,11 @@ class CostBreakdown:
     leg_a_fee_rate: float = 0.0
     leg_b_fee_rate: float = 0.0
     source: str = "static"
+    leg_a_open_fee: float = 0.0
+    leg_a_close_fee: float = 0.0
+    leg_b_open_fee: float = 0.0
+    leg_b_close_fee: float = 0.0
+    fees_explicit: bool = False
 
     @property
     def total(self) -> float:
@@ -37,6 +42,18 @@ class CostBreakdown:
     def leg_b_commission(self) -> float:
         """兼容旧字段名。"""
         return self.leg_b_fee
+
+    @property
+    def open_fee(self) -> float:
+        """预计双腿开仓手续费。"""
+        explicit = self.leg_a_open_fee + self.leg_b_open_fee
+        return explicit if self.fees_explicit else self.total / 2
+
+    @property
+    def close_fee(self) -> float:
+        """预计双腿平仓手续费。"""
+        explicit = self.leg_a_close_fee + self.leg_b_close_fee
+        return explicit if self.fees_explicit else self.total / 2
 
     @property
     def hyperliquid_fee(self) -> float:
@@ -61,6 +78,8 @@ class CostBreakdown:
             "leg_b_spread": self.leg_b_spread,
             "leg_b_fee": self.leg_b_fee,
             "total": self.total,
+            "open_fee": self.open_fee,
+            "close_fee": self.close_fee,
             "source": self.source,
         }
 
@@ -80,16 +99,23 @@ def estimate_pair_cost(
     中，因此这里不再重复增加点差成本。
     """
     value = max(float(notional or 0.0), 0.0)
-    leg_a_rate = float(leg_a_open_fee_rate or 0.0) + float(leg_a_close_fee_rate or 0.0)
-    leg_b_rate = float(leg_b_open_fee_rate or 0.0) + float(leg_b_close_fee_rate or 0.0)
+    leg_a_open = value * float(leg_a_open_fee_rate or 0.0)
+    leg_a_close = value * float(leg_a_close_fee_rate or 0.0)
+    leg_b_open = value * float(leg_b_open_fee_rate or 0.0)
+    leg_b_close = value * float(leg_b_close_fee_rate or 0.0)
     return CostBreakdown(
-        leg_a_fee=value * leg_a_rate,
+        leg_a_fee=leg_a_open + leg_a_close,
         leg_a_spread=0.0,
         leg_b_spread=0.0,
-        leg_b_fee=value * leg_b_rate,
+        leg_b_fee=leg_b_open + leg_b_close,
         leg_a_fee_rate=float(leg_a_open_fee_rate or 0.0),
         leg_b_fee_rate=float(leg_b_open_fee_rate or 0.0),
         source=source,
+        leg_a_open_fee=leg_a_open,
+        leg_a_close_fee=leg_a_close,
+        leg_b_open_fee=leg_b_open,
+        leg_b_close_fee=leg_b_close,
+        fees_explicit=True,
     )
 
 

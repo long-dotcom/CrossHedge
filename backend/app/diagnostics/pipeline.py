@@ -31,7 +31,7 @@ from app.core.logging import get_logger
 from app.core.time_utils import utc_now
 from app.db.models import ArbitrageOpportunity, HedgeGroup, SpreadCurrent, SymbolMapping
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
-from app.execution.pnl import pnl_from_close_spread
+from app.execution.pnl import liquidation_pnl_from_close_spread
 from app.market.hedge_spreads import hedge_group_spreads
 from app.market.mt5_sessions import mt5_session_state
 from app.market.quotes import quote_cache
@@ -534,6 +534,12 @@ def _group_payload(group: HedgeGroup | HedgeGroupSnapshot, now: datetime, mappin
         "exit_target": group.exit_target,
         "realized_pnl": group.realized_pnl,
         "unrealized_pnl": unrealized_pnl,
+        "accrued_fees": float(getattr(group, "fees", 0.0) or 0.0),
+        "remaining_close_fee": (
+            float(getattr(group, "estimated_close_fee", 0.0) or 0.0)
+            if group.status in {"open", "open_partial"} else 0.0
+        ),
+        "pnl_basis": "liquidation" if group.status in {"open", "open_partial"} else "realized",
         "close_reason": group.close_reason,
         "age_ms": _age_ms(now, updated_at),
     }
@@ -544,7 +550,7 @@ def _runtime_unrealized_pnl(group: HedgeGroup | HedgeGroupSnapshot, spreads: dic
     current_close_spread = spreads.get("current_close_spread")
     if group.status in {"open", "open_partial"} and current_close_spread is not None:
         try:
-            return pnl_from_close_spread(group, float(current_close_spread))
+            return liquidation_pnl_from_close_spread(group, float(current_close_spread))
         except (TypeError, ValueError):
             return float(group.unrealized_pnl or 0.0)
     return float(group.unrealized_pnl or 0.0)

@@ -17,10 +17,65 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlalchemy.orm import Session
 
 from app.core.type_utils import safe_float
 from app.db.models import ExecutionIntent, ExecutionLeg, Fill, HedgeGroup, Order, SymbolMapping, VenueOrder
+
+
+@dataclass(frozen=True)
+class PnlBreakdown:
+    """统一的价差盈亏拆分，所有金额均按策略 USD 口径。"""
+
+    entry_spread: float
+    close_spread: float
+    quantity: float
+    gross_pnl: float
+    accrued_fees: float
+    estimated_close_fee: float
+    net_pnl: float
+
+
+def projected_pnl(
+    entry_spread: float,
+    close_spread: float,
+    quantity: float,
+    total_fees: float,
+) -> PnlBreakdown:
+    """按统一公式计算预测/真实价差盈亏。"""
+    qty = max(safe_float(quantity), 0.0)
+    gross = (safe_float(entry_spread) - safe_float(close_spread)) * qty
+    fees = max(safe_float(total_fees), 0.0)
+    return PnlBreakdown(
+        safe_float(entry_spread), safe_float(close_spread), qty,
+        gross, fees, 0.0, gross - fees,
+    )
+
+
+def pnl_breakdown_from_close_spread(
+    group: HedgeGroup,
+    close_spread: float,
+    *,
+    include_estimated_close_fee: bool = False,
+    estimated_close_fee: float | None = None,
+) -> PnlBreakdown:
+    """计算对冲组当前/最终 PnL，并明确区分已发生与预计手续费。"""
+    quantity = safe_float(group.leg_a_quantity or group.quantity, 1.0)
+    entry_spread = safe_float(group.entry_spread or group.entry_threshold)
+    gross = (entry_spread - safe_float(close_spread)) * quantity
+    accrued = max(safe_float(group.fees), 0.0)
+    remaining = 0.0
+    if include_estimated_close_fee:
+        remaining = max(safe_float(
+            getattr(group, "estimated_close_fee", 0.0)
+            if estimated_close_fee is None else estimated_close_fee
+        ), 0.0)
+    return PnlBreakdown(
+        entry_spread, safe_float(close_spread), quantity, gross,
+        accrued, remaining, gross - accrued - remaining,
+    )
 
 
 def actual_entry_spread_from_fills(
@@ -80,10 +135,14 @@ def pnl_from_close_spread(group: HedgeGroup, close_spread: float) -> float:
 
     公式：(入场价差 - 平仓价差) × 数量 - 开平仓交易手续费
     """
-    quantity = safe_float(group.leg_a_quantity or group.quantity, 1.0)
-    entry_spread = safe_float(group.entry_spread or group.entry_threshold)
-    gross = (entry_spread - close_spread) * quantity
-    return gross - safe_float(group.fees)
+    return pnl_breakdown_from_close_spread(group, close_spread).net_pnl
+
+
+def liquidation_pnl_from_close_spread(group: HedgeGroup, close_spread: float) -> float:
+    """当前立即平仓后的预计净 PnL，包含尚未发生的预计平仓手续费。"""
+    return pnl_breakdown_from_close_spread(
+        group, close_spread, include_estimated_close_fee=True,
+    ).net_pnl
 
 
 def realized_pnl_from_fills(
