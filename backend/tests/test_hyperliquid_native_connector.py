@@ -54,6 +54,34 @@ class FakeExchange:
         }
 
 
+class RecordingHip3Info:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def __call__(self, _url, payload):
+        self.payloads.append(dict(payload))
+        if payload == {"type": "metaAndAssetCtxs"}:
+            return [
+                {"universe": [{"name": "BTC", "szDecimals": 5}]},
+                [{"markPx": "60000"}],
+            ]
+        if payload == {"type": "metaAndAssetCtxs", "dex": "xyz"}:
+            return [
+                {"universe": [
+                    {"name": "xyz:JPY", "szDecimals": 2},
+                    {"name": "xyz:JP225", "szDecimals": 1},
+                ]},
+                [{"markPx": "0.006"}, {"markPx": "40000"}],
+            ]
+        if payload == {"type": "metaAndAssetCtxs", "dex": "plain"}:
+            # 验证对不带 dex 前缀的 universe 返回值也能正确规范化。
+            return [
+                {"universe": [{"name": "TEST", "szDecimals": 3}]},
+                [{"markPx": "1"}],
+            ]
+        return [{"universe": []}, []]
+
+
 def test_hyperliquid_public_market_data_uses_bbo_subscription() -> None:
     assert _bbo_subscription("BTC") == {"type": "bbo", "coin": "BTC"}
 
@@ -89,6 +117,49 @@ def test_hyperliquid_native_account_instrument_and_order() -> None:
     assert instrument.maker_fee_rate == Decimal("0.0001")
     assert order.status == OrderStatus.ACCEPTED
     assert order.venue_order_id == "123"
+
+
+def test_hyperliquid_hip3_instrument_queries_its_dex_and_keeps_full_symbol() -> None:
+    transport = RecordingHip3Info()
+    connector = HyperliquidConnector(info_transport=transport)
+
+    instrument = connector.get_instrument("xyz:JPY", refresh=True)
+
+    assert instrument.symbol == "xyz:JPY"
+    assert instrument.base_asset == "JPY"
+    assert instrument.quantity_step == Decimal("0.01")
+    assert instrument.raw["dex"] == "xyz"
+    assert transport.payloads == [{"type": "metaAndAssetCtxs", "dex": "xyz"}]
+    transport.payloads.clear()
+    assert connector.get_instrument("xyz:JPY") == instrument
+    assert transport.payloads == []
+
+
+def test_hyperliquid_instrument_groups_default_and_hip3_metadata_requests() -> None:
+    transport = RecordingHip3Info()
+    connector = HyperliquidConnector(info_transport=transport)
+
+    instruments = connector.get_instruments(["BTC", "xyz:JP225", "plain:TEST"])
+
+    assert {instrument.symbol for instrument in instruments} == {"BTC", "xyz:JP225", "plain:TEST"}
+    assert {tuple(sorted(payload.items())) for payload in transport.payloads} == {
+        (("type", "metaAndAssetCtxs"),),
+        (("dex", "xyz"), ("type", "metaAndAssetCtxs")),
+        (("dex", "plain"), ("type", "metaAndAssetCtxs")),
+    }
+
+
+def test_hyperliquid_missing_hip3_instrument_does_not_fall_back_to_default_dex() -> None:
+    transport = RecordingHip3Info()
+    connector = HyperliquidConnector(info_transport=transport)
+
+    try:
+        connector.get_instrument("unknown:JPY", refresh=True)
+    except LookupError as exc:
+        assert "unknown:JPY" in str(exc)
+    else:
+        raise AssertionError("不存在的 HIP-3 品种应明确报错")
+    assert transport.payloads == [{"type": "metaAndAssetCtxs", "dex": "unknown"}]
 
 
 def test_hyperliquid_health_does_not_call_rest_api() -> None:

@@ -175,31 +175,47 @@ class HyperliquidConnector:
 
     def get_instruments(self, symbols: Sequence[str] | None = None) -> list[Instrument]:
         requested = set(symbols) if symbols else None
-        meta, contexts = self._info({"type": "metaAndAssetCtxs"})
+        # HIP-3 元数据必须按 perp dex 单独查询。行情和下单使用完整的
+        # ``dex:symbol``，但 info 接口还要求额外传入 ``dex`` 参数。
+        requested_by_dex: dict[str, set[str] | None] = {}
+        if requested is None:
+            requested_by_dex[""] = None
+        else:
+            for symbol in requested:
+                dex = symbol.split(":", 1)[0] if ":" in symbol else ""
+                requested_by_dex.setdefault(dex, set()).add(symbol)
         fees = self._user_fees()
         rows = []
-        for item, context in zip(meta.get("universe", []), contexts):
-            symbol = str(item.get("name") or "")
-            if requested is not None and symbol not in requested:
-                continue
-            decimals = max(int(item.get("szDecimals", 0) or 0), 0)
-            instrument = Instrument(
-                venue=self.venue,
-                symbol=symbol,
-                base_asset=symbol.split(":", 1)[-1],
-                quote_asset="USDC",
-                settlement_asset="USDC",
-                quantity_step=Decimal(1).scaleb(-decimals),
-                minimum_quantity=Decimal(1).scaleb(-decimals),
-                price_tick=Decimal("0"),
-                minimum_notional=self.default_min_notional,
-                maker_fee_rate=fees[0],
-                taker_fee_rate=fees[1],
-                trading_enabled=not bool(item.get("isDelisted", False)),
-                raw={"meta": item, "context": context},
-            )
-            self._instruments.set(symbol, instrument)
-            rows.append(instrument)
+        for dex, dex_requested in requested_by_dex.items():
+            payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+            if dex:
+                payload["dex"] = dex
+            meta, contexts = self._info(payload)
+            for item, context in zip(meta.get("universe", []), contexts):
+                raw_symbol = str(item.get("name") or "")
+                # 兼容个别环境返回不带 dex 前缀的 universe 名称。
+                symbol = raw_symbol if not dex or ":" in raw_symbol else f"{dex}:{raw_symbol}"
+                if dex_requested is not None and symbol not in dex_requested:
+                    continue
+                decimals = max(int(item.get("szDecimals", 0) or 0), 0)
+                instrument = Instrument(
+                    venue=self.venue,
+                    symbol=symbol,
+                    base_asset=symbol.split(":", 1)[-1],
+                    quote_asset="USDC",
+                    settlement_asset="USDC",
+                    quantity_step=Decimal(1).scaleb(-decimals),
+                    minimum_quantity=Decimal(1).scaleb(-decimals),
+                    price_tick=Decimal("0"),
+                    minimum_notional=self.default_min_notional,
+                    maker_fee_rate=fees[0],
+                    taker_fee_rate=fees[1],
+                    trading_enabled=not bool(item.get("isDelisted", False)),
+                    raw={"meta": item, "context": context, "dex": dex},
+                )
+                # 完整品种名作为缓存键，自然隔离默认市场及不同 HIP-3 dex。
+                self._instruments.set(symbol, instrument)
+                rows.append(instrument)
         return rows
 
     def get_instrument(self, symbol: str, *, refresh: bool = False) -> Instrument:
