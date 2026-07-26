@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.accounts.equity_history import record_portfolio_equity_snapshot
 from app.core.logging import get_logger
 from app.db.models import AccountSnapshot, ExchangeCredential
 from app.exchanges.credentials import (
@@ -43,6 +44,7 @@ def sync_account_snapshots(db: Session) -> list[AccountSnapshot]:
 
     for snapshot in snapshots:
         db.add(snapshot)
+    record_portfolio_equity_snapshot(db, snapshots)
     db.commit()
     return latest_account_snapshots(db)
 

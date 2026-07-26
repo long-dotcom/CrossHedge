@@ -16,6 +16,7 @@ from app.config.settings import INSECURE_DEFAULT_ADMIN_PASSWORD, get_settings, r
 from app.db.models import Base, RiskSetting, StrategySetting, SymbolMapping, SystemSetting, User
 from app.db.session import engine
 from app.accounts.sync import ensure_initial_account_snapshots
+from app.accounts.equity_history import backfill_portfolio_equity_history
 from app.market.symbols import seed_symbol_mappings_from_file
 
 
@@ -81,6 +82,8 @@ def seed_defaults(db: Session) -> None:
 
     # 5. 确保各平台有初始账户快照
     ensure_initial_account_snapshots(db)
+    # 首次升级时将旧账户快照回填为可长期查询的组合权益历史。
+    backfill_portfolio_equity_history(db)
 
     # 6. 品种映射种子数据（仅首次启动时从配置文件导入）
     #    后续增删改都以数据库为准，避免重启覆盖前端保存的映射
