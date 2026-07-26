@@ -8,7 +8,6 @@ const DashboardPage = lazy(() => import('./pages/DashboardPage').then((m) => ({ 
 const SpreadAnalyticsPage = lazy(() => import('./pages/SpreadAnalyticsPage').then((m) => ({ default: m.SpreadAnalyticsPage })));
 const VenueSpreadsPage = lazy(() => import('./pages/VenueSpreadsPage').then((m) => ({ default: m.VenueSpreadsPage })));
 const FundingAnalyticsPage = lazy(() => import('./pages/FundingAnalyticsPage').then((m) => ({ default: m.FundingAnalyticsPage })));
-const LeadLagPage = lazy(() => import('./pages/LeadLagPage').then((m) => ({ default: m.LeadLagPage })));
 const PipelinePage = lazy(() => import('./pages/PipelinePage').then((m) => ({ default: m.PipelinePage })));
 const HedgeGroupsPage = lazy(() => import('./pages/HedgeGroupsPage').then((m) => ({ default: m.HedgeGroupsPage })));
 const ExecutionPage = lazy(() => import('./pages/ExecutionPage').then((m) => ({ default: m.ExecutionPage })));
@@ -34,7 +33,6 @@ export default function App() {
           <Route path="/analytics" element={<SpreadAnalyticsPage />} />
           <Route path="/venue-spreads" element={<VenueSpreadsPage />} />
           <Route path="/funding" element={<FundingAnalyticsPage />} />
-          <Route path="/lead-lag" element={<LeadLagPage />} />
           <Route path="/pipeline" element={<PipelinePage />} />
           <Route path="/hedge-groups" element={<HedgeGroupsPage />} />
           <Route path="/execution" element={<ExecutionPage />} />

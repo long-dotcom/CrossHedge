@@ -12,7 +12,6 @@ type StreamSnapshot = {
   alerts?: { total: number; page: number; page_size: number; items: any[] };
   risk_status?: any;
   risk_events?: { total: number; page: number; page_size: number; items: any[] };
-  lead_lag?: any;
   dashboard_summary?: any;
   equity_curve?: any[];
   hedge_groups?: { total: number; page: number; page_size: number; items: any[] };
@@ -34,7 +33,7 @@ export type StreamStatus = {
   latencySeconds: number | null;
 };
 
-type PageStreamChannel = 'pipeline' | 'hedge-groups' | 'positions' | 'accounts' | 'execution' | 'dashboard' | 'logs' | 'risk' | 'lead-lag';
+type PageStreamChannel = 'pipeline' | 'hedge-groups' | 'positions' | 'accounts' | 'execution' | 'dashboard' | 'logs' | 'risk';
 
 type PageStreamOptions = {
   page?: number;
@@ -87,9 +86,6 @@ function applySnapshot(
   }
   if (data.risk_events) {
     queryClient.setQueryData(['risk-events', data.risk_events.page || page], data.risk_events);
-  }
-  if (data.lead_lag && cacheKey) {
-    queryClient.setQueryData(cacheKey, data.lead_lag);
   }
   if (data.hedge_groups) {
     queryClient.setQueryData(cacheKey || ['hedge-groups', data.hedge_groups.page || page], data.hedge_groups);

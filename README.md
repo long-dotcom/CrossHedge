@@ -53,6 +53,7 @@ MT5 Gateway 会把账户、持仓、行情和品种合约规格定时写入 Redi
 在 Coolify 中应把这些值配置为运行时 Secret，并在重新部署时继续使用原值。
 
 默认访问地址为 `http://localhost:8080`。完整键名、启动顺序、幂等约束和故障处理见 [MT5 Gateway 架构](docs/MT5_GATEWAY_ARCHITECTURE.md)。
+研究模块保留价差研究、点差监控和资金费研究；已移除基于报价跳动频率的“报价时差”分析。交易扫描与执行前的双腿报价年龄、同步阈值校验保持不变。
 行情管道当前延迟指标的口径、潜在瓶颈和后续采样顺序见 [行情管道高延迟调查](docs/PIPELINE_LATENCY_INVESTIGATION.md)。
 扫描慢阶段默认以 `SCANNER_SLOW_PHASE_MS=50` 为阈值输出结构化日志，可通过同名环境变量调整。
 统计信号默认每 `SIGNAL_STATS_REFRESH_INTERVAL_MS=10000` 毫秒后台刷新，Redis 缓存以 `SIGNAL_STATS_CACHE_TTL_MS=60000` 毫秒保留旧结果；缓存有效期必须长于刷新间隔，避免扫描线程在刷新空窗同步查询历史价差。
