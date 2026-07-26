@@ -138,11 +138,15 @@ def _generic_live_venue_checks(db: Session, venues: set[str]) -> list[ReadinessC
             ExchangeCredential.venue == venue,
             ExchangeCredential.enabled.is_(True),
         ).first()
-        ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        configured = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        tested = bool(configured and credential.last_test_status == "ok" and credential.last_tested_at)
         checks.append(ReadinessCheck(
             f"{venue}_live_credentials",
-            "ok" if ready else "block",
-            f"{venue} 实盘凭证已启用且允许交易" if ready else f"{venue} 需要启用交易所配置、填写凭证并关闭只读模式",
+            "ok" if tested else "block",
+            f"{venue} 实盘凭证检查通过" if tested else (
+                f"{venue} 请先在交易所配置中完成凭证检查"
+                if configured else f"{venue} 需要启用交易所配置、填写凭证并关闭只读模式"
+            ),
         ))
     return checks
 
@@ -247,12 +251,16 @@ def _generic_paper_live_probe_checks(db: Session, mappings: list[SymbolMapping],
         )
     for venue in sorted((mapped_venues & PROBE_SUPPORTED_VENUES) - {"hyperliquid"}):
         credential = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue, ExchangeCredential.enabled.is_(True)).first()
-        ready = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        configured = bool(credential and not credential.read_only and credential.encrypted_credentials)
+        ready = bool(configured and credential.last_test_status == "ok" and credential.last_tested_at)
         checks.append(
             ReadinessCheck(
                 f"{venue}_paper_live_probe_credentials",
                 "ok" if ready else "block",
-                f"{venue} paper-live 探针凭证已启用且允许交易" if ready else f"{venue} paper-live 探针需要启用交易所配置、填写凭证并关闭只读模式",
+                f"{venue} paper-live 探针凭证检查通过" if ready else (
+                    f"{venue} paper-live 探针请先完成交易所凭证检查"
+                    if configured else f"{venue} paper-live 探针需要启用交易所配置、填写凭证并关闭只读模式"
+                ),
             )
         )
     return checks
@@ -342,32 +350,28 @@ def _position_matches_group(db: Session, position: Position, group: HedgeGroup) 
             symbols[leg_b_venue].add(mapping.mt5_symbol)
     if position.symbol not in symbols.get(position.platform, set()):
         return False
-    if _position_side(position.side) != _expected_position_side(group.direction, position.platform):
+    leg = "a" if position.platform == leg_a_venue else "b"
+    if _position_side(position.side) != _expected_position_side(group.direction, leg):
         return False
     if group.status == "closed":
         return True
-    expected_quantity = _expected_position_quantity(group, position.platform)
+    expected_quantity = _expected_position_quantity(group, leg)
     if expected_quantity <= 0:
         return False
     tolerance = max(expected_quantity * 0.000001, 0.00000001)
     return abs(abs(position.quantity) - expected_quantity) <= tolerance
 
 
-def _expected_position_side(direction: str, platform: str) -> str:
-    """根据对冲组方向推断指定平台上的预期仓位方向。"""
+def _expected_position_side(direction: str, leg: str) -> str:
+    """根据对冲组方向推断指定腿的预期仓位方向。"""
     if direction == "long_leg_a_short_leg_b":
-        if platform == "hyperliquid":
-            return "long"
-        return "short"
-    return "short" if platform == "hyperliquid" else "long"
+        return "long" if leg == "a" else "short"
+    return "short" if leg == "a" else "long"
 
 
-def _expected_position_quantity(group: HedgeGroup, platform: str) -> float:
-    """根据对冲组方向推断指定平台上的预期仓位数量。"""
-    if platform == "hyperliquid":
-        value = group.leg_a_quantity
-    else:
-        value = group.leg_b_quantity
+def _expected_position_quantity(group: HedgeGroup, leg: str) -> float:
+    """根据腿标识读取预期仓位数量。"""
+    value = group.leg_a_quantity if leg == "a" else group.leg_b_quantity
     return float(group.quantity if value is None else value)
 
 
