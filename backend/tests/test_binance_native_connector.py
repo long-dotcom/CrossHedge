@@ -32,6 +32,137 @@ def test_native_rest_signs_request() -> None:
     assert calls[0][3]["X-MBX-APIKEY"] == "key"
 
 
+def test_native_rest_reads_futures_config_and_api_key_permissions() -> None:
+    calls = []
+
+    def transport(method, url, params, headers, timeout):
+        calls.append((method, url, params, headers))
+        if url.endswith("/fapi/v1/accountConfig"):
+            return BinanceResponse({"canTrade": True, "dualSidePosition": True}, 200, {})
+        if url.endswith("/sapi/v1/account/apiRestrictions"):
+            return BinanceResponse({"enableFutures": True}, 200, {})
+        raise AssertionError(url)
+
+    client = BinanceFuturesRestClient(api_key="key", api_secret="secret", transport=transport)
+
+    assert client.account_config()["dualSidePosition"] is True
+    assert client.api_key_permissions()["enableFutures"] is True
+    assert calls[0][1] == "https://fapi.binance.com/fapi/v1/accountConfig"
+    assert calls[1][1] == "https://api.binance.com/sapi/v1/account/apiRestrictions"
+    assert all(call[2].get("signature") for call in calls)
+
+
+def test_writable_credential_validation_checks_account_and_key_permissions() -> None:
+    class CredentialRest:
+        api_key = "key"
+        api_secret = "secret"
+
+        def synchronize_clock(self):
+            return 6
+
+        def account(self):
+            return {"accountAlias": "sub-account"}
+
+        def account_config(self):
+            return {"canTrade": True, "dualSidePosition": True}
+
+        def api_key_permissions(self):
+            return {"enableFutures": True}
+
+    result = BinanceFuturesConnector(rest_client=CredentialRest(), read_only=False).validate_credentials()
+
+    assert result.valid is True
+    assert result.can_read is True
+    assert result.can_trade is True
+    assert {item.name: item.ok for item in result.items} == {
+        "clock": True,
+        "account": True,
+        "account_trading": True,
+        "trade_permission": True,
+        "position_mode": True,
+    }
+
+
+def test_read_only_credential_validation_does_not_require_trade_permission() -> None:
+    class ReadOnlyRest:
+        api_key = "key"
+        api_secret = "secret"
+
+        def synchronize_clock(self):
+            return 0
+
+        def account(self):
+            return {}
+
+        def account_config(self):
+            return {"canTrade": False, "dualSidePosition": False}
+
+        def api_key_permissions(self):
+            raise AssertionError("只读检查不应查询交易权限")
+
+    result = BinanceFuturesConnector(rest_client=ReadOnlyRest(), read_only=True).validate_credentials()
+
+    assert result.valid is True
+    assert result.can_read is True
+    assert result.can_trade is False
+    assert next(item for item in result.items if item.name == "trade_permission").ok is True
+
+
+def test_writable_credential_validation_rejects_key_without_futures_permission() -> None:
+    class CredentialRest:
+        api_key = "key"
+        api_secret = "secret"
+
+        def synchronize_clock(self):
+            return 0
+
+        def account(self):
+            return {}
+
+        def account_config(self):
+            return {"canTrade": True, "dualSidePosition": True}
+
+        def api_key_permissions(self):
+            return {"enableFutures": False}
+
+    result = BinanceFuturesConnector(rest_client=CredentialRest(), read_only=False).validate_credentials()
+
+    assert result.valid is False
+    assert result.can_read is True
+    assert result.can_trade is False
+    permission = next(item for item in result.items if item.name == "trade_permission")
+    assert permission.ok is False
+    assert permission.blocking is True
+
+
+def test_credential_validation_reports_permission_query_failure_separately() -> None:
+    class CredentialRest:
+        api_key = "key"
+        api_secret = "secret"
+
+        def synchronize_clock(self):
+            return 0
+
+        def account(self):
+            return {}
+
+        def account_config(self):
+            return {"canTrade": True, "dualSidePosition": True}
+
+        def api_key_permissions(self):
+            raise RuntimeError("denied")
+
+    result = BinanceFuturesConnector(rest_client=CredentialRest(), read_only=False).validate_credentials()
+
+    assert result.valid is False
+    assert result.can_read is True
+    assert result.can_trade is False
+    assert [item.name for item in result.items].count("account") == 1
+    permission = next(item for item in result.items if item.name == "trade_permission")
+    assert permission.ok is False
+    assert "权限查询失败" in permission.message
+
+
 def test_order_transport_failure_is_unknown_and_must_not_be_retried() -> None:
     def transport(*_args):
         raise OSError("timeout")

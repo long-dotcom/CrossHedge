@@ -92,14 +92,21 @@ def upsert_exchange_credential(db: Session, payload: dict[str, Any]) -> Exchange
     row = db.query(ExchangeCredential).filter(ExchangeCredential.venue == venue).first()
     if row is None:
         row = ExchangeCredential(venue=venue)
+    previous_connection = (
+        normalize_connection_environment(row.environment),
+        bool(row.enabled),
+        bool(row.read_only),
+    )
     row.display_name = str(payload.get("display_name") or venue.upper()).strip()
     row.environment = normalize_connection_environment(payload.get("environment") or "live")
     row.enabled = bool(payload.get("enabled", False))
     row.read_only = bool(payload.get("read_only", True))
     credentials = _clean_credentials(payload.get("credentials"))
+    connection_changed = previous_connection != (row.environment, row.enabled, row.read_only)
     if credentials:
         row.encrypted_credentials = encrypt_credentials(credentials)
         row.credentials_fingerprint = credential_fingerprint(credentials)
+    if credentials or connection_changed:
         row.last_test_status = "untested"
         row.last_test_message = ""
         row.last_tested_at = None

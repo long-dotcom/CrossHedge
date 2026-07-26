@@ -122,6 +122,10 @@ Instrument 的执行必需信息至少包含：数量步进、最小数量、价
 
 禁止通过真实下单测试普通凭据。交易权限校验使用官方只读端点、签名校验或最小风险的权限查询；真实 Probe 必须由用户显式确认。
 
+Binance USDⓈ-M Futures 的检查流程固定为：校准服务器时间、读取 Futures Account V3 验证账户可读、读取 Account Configuration 验证账户交易状态与 Hedge Mode；实盘非只读配置再通过 Wallet API Key Permission 的 `enableFutures` 验证当前 Key 的 Futures 权限。只读配置不要求交易权限，也不会触发任何下单请求；测试环境没有独立的 Wallet 权限端点，以账户配置中的交易状态作为可用的最强只读校验。
+
+凭据、连接环境、启用状态或只读状态变化后，最近一次检查结果必须失效。Binance 等数据库管理的交易所只有在最新凭据检查成功后，才允许通过 Live 和 Paper 真实探针的执行就绪门禁。
+
 ## 9. 进程与故障边界
 
 - API 进程：公共行情、扫描、配置和查询。

@@ -348,31 +348,71 @@ class BinanceFuturesConnector:
             return CredentialCheck(self.venue, self.environment, account_id, False, False, False, tuple(items))
         try:
             account = self.rest.account()
-            account_id = str(account.get("accountAlias") or "binance-futures")
-            can_read = True
-            api_can_trade = bool(account.get("canTrade"))
-            can_trade = api_can_trade and not self.read_only
-            items.append(CredentialCheckItem("account", True, "USDⓈ-M Futures 账户可读"))
-            items.append(
-                CredentialCheckItem(
-                    "trade_permission",
-                    api_can_trade,
-                    "API 具有 Futures 交易权限" if api_can_trade else "API 没有 Futures 交易权限",
-                    blocking=not self.read_only,
-                )
-            )
-            mode = self.rest.position_mode()
-            hedge_mode = bool(mode.get("dualSidePosition"))
-            items.append(
-                CredentialCheckItem(
-                    "position_mode",
-                    hedge_mode,
-                    "账户为 Hedge Mode" if hedge_mode else "账户为 One-way Mode",
-                    blocking=False,
-                )
-            )
         except Exception as exc:
-            items.append(CredentialCheckItem("account", False, f"账户验证失败: {exc}"))
+            items.append(CredentialCheckItem("account", False, f"Futures 账户读取失败: {exc}"))
+            return CredentialCheck(self.venue, self.environment, account_id, False, False, False, tuple(items))
+        account_id = str(account.get("accountAlias") or "binance-futures")
+        can_read = True
+        items.append(CredentialCheckItem("account", True, "USDⓈ-M Futures 账户可读"))
+
+        try:
+            config = self.rest.account_config()
+        except Exception as exc:
+            items.append(CredentialCheckItem("account_config", False, f"Futures 账户配置读取失败: {exc}"))
+            return CredentialCheck(self.venue, self.environment, account_id, False, can_read, False, tuple(items))
+        account_can_trade = bool(config.get("canTrade"))
+        items.append(
+            CredentialCheckItem(
+                "account_trading",
+                account_can_trade or self.read_only,
+                "Futures 账户允许交易" if account_can_trade else "只读配置，不要求 Futures 账户处于可交易状态",
+                blocking=not self.read_only,
+            )
+        )
+        if self.read_only:
+            key_can_trade = False
+            items.append(CredentialCheckItem(
+                "trade_permission",
+                True,
+                "只读配置，不要求 API Key Futures 交易权限",
+                blocking=False,
+            ))
+        elif self.environment == "live":
+            try:
+                permissions = self.rest.api_key_permissions()
+                key_can_trade = bool(permissions.get("enableFutures"))
+                items.append(CredentialCheckItem(
+                    "trade_permission",
+                    key_can_trade,
+                    "API Key 已启用 Futures 交易权限" if key_can_trade else "API Key 未启用 Futures 交易权限",
+                ))
+            except Exception as exc:
+                key_can_trade = False
+                items.append(CredentialCheckItem(
+                    "trade_permission",
+                    False,
+                    f"API Key 权限查询失败: {exc}",
+                ))
+        else:
+            # Binance 测试环境没有 Wallet apiRestrictions；账户配置是可用的最强只读证明。
+            key_can_trade = account_can_trade
+            items.append(CredentialCheckItem(
+                "trade_permission",
+                key_can_trade,
+                "测试环境 Futures 账户允许交易（无独立 Key 权限查询端点）"
+                if key_can_trade else "测试环境 Futures 账户当前禁止交易",
+            ))
+        can_trade = account_can_trade and key_can_trade and not self.read_only
+
+        hedge_mode = bool(config.get("dualSidePosition"))
+        items.append(
+            CredentialCheckItem(
+                "position_mode",
+                hedge_mode,
+                "账户为 Hedge Mode" if hedge_mode else "账户为 One-way Mode",
+                blocking=not self.read_only,
+            )
+        )
         valid = all(item.ok or not item.blocking for item in items)
         return CredentialCheck(self.venue, self.environment, account_id, valid, can_read, can_trade, tuple(items))
 

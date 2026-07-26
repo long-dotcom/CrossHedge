@@ -22,6 +22,7 @@ BINANCE_FUTURES_URLS = {
     "testnet": "https://testnet.binancefuture.com",
     "demo": "https://demo-fapi.binance.com",
 }
+BINANCE_WALLET_URL = "https://api.binance.com"
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,20 @@ class BinanceFuturesRestClient:
     def account(self) -> dict[str, Any]:
         return self.signed("GET", "/fapi/v3/account")
 
+    def account_config(self) -> dict[str, Any]:
+        """读取 Futures 账户级交易状态和持仓模式。"""
+        return self.signed("GET", "/fapi/v1/accountConfig")
+
+    def api_key_permissions(self) -> dict[str, Any]:
+        """读取当前 API Key 的权限；该 Wallet 端点仅用于 Binance 实盘环境。"""
+        if self.environment != "live":
+            raise BinanceApiError("Binance testnet/demo 不提供 API Key 权限查询")
+        return self.signed(
+            "GET",
+            "/sapi/v1/account/apiRestrictions",
+            base_url=BINANCE_WALLET_URL,
+        )
+
     def position_risk(self, symbol: str | None = None) -> list[dict[str, Any]]:
         params = {"symbol": normalize_symbol(symbol)} if symbol else {}
         payload = self.signed("GET", "/fapi/v3/positionRisk", params)
@@ -186,6 +201,7 @@ class BinanceFuturesRestClient:
         params: dict[str, Any] | None = None,
         *,
         order_operation: bool = False,
+        base_url: str | None = None,
     ) -> Any:
         self._require_api_key()
         if not self.api_secret:
@@ -196,7 +212,7 @@ class BinanceFuturesRestClient:
         query = encode_query(values)
         values["signature"] = hmac.new(self.api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         try:
-            return self._request(method, path, values, signed=True, api_key=True).data
+            return self._request(method, path, values, signed=True, api_key=True, base_url=base_url).data
         except BinanceApiError as exc:
             if exc.code == -1021:
                 self.synchronize_clock()
@@ -205,7 +221,7 @@ class BinanceFuturesRestClient:
                 values["signature"] = hmac.new(
                     self.api_secret.encode(), encode_query(unsigned).encode(), hashlib.sha256
                 ).hexdigest()
-                return self._request(method, path, values, signed=True, api_key=True).data
+                return self._request(method, path, values, signed=True, api_key=True, base_url=base_url).data
             if order_operation and (exc.status is None or exc.status >= 500):
                 raise BinanceApiError(
                     str(exc), code=exc.code, status=exc.status, retry_after=exc.retry_after, outcome_unknown=True
@@ -220,12 +236,13 @@ class BinanceFuturesRestClient:
         *,
         signed: bool,
         api_key: bool,
+        base_url: str | None = None,
     ) -> BinanceResponse:
         headers = {"Accept": "application/json", "User-Agent": "CrossHedge/1"}
         if api_key:
             headers["X-MBX-APIKEY"] = self.api_key
         try:
-            return self._transport(method.upper(), self.base_url + path, params, headers, self.timeout)
+            return self._transport(method.upper(), (base_url or self.base_url) + path, params, headers, self.timeout)
         except BinanceApiError:
             raise
         except Exception as exc:
