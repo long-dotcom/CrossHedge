@@ -49,6 +49,7 @@ class HedgeGroupSnapshot:
     source: str
     estimated_open_fee: float = 0.0
     estimated_close_fee: float = 0.0
+    updated_at: datetime | None = None
 
     @classmethod
     def from_row(cls, row: HedgeGroup) -> "HedgeGroupSnapshot":
@@ -67,6 +68,7 @@ class HedgeGroupSnapshot:
             entry_threshold=float(row.entry_threshold or 0.0), exit_target=float(row.exit_target or 0.0),
             overheat_threshold=float(row.overheat_threshold or 0.0), close_reason=str(row.close_reason or ""),
             opened_at=row.opened_at, closed_at=row.closed_at, source=str(row.source or ""),
+            updated_at=row.updated_at,
         )
 
     def with_updates(self, **kwargs) -> "HedgeGroupSnapshot":
@@ -80,21 +82,20 @@ class HedgePoolStore:
         self._key = key or redis_key("cache", "hedge-pool")
 
     def load_from_db(self, db: Session) -> int:
+        """按版本合并数据库快照，避免全量删除覆盖并发执行状态。"""
+        load_started_at = utc_now()
         rows = db.query(HedgeGroup).filter(HedgeGroup.status.in_(POOL_GROUP_STATUSES)).all()
-        current = {item.id: item for item in self.snapshot_groups()}
-        snapshots: dict[int, HedgeGroupSnapshot] = {}
+        active_ids: set[int] = set()
         for row in rows:
             snapshot = HedgeGroupSnapshot.from_row(row)
-            existing = current.get(snapshot.id)
-            if existing and snapshot.status in AUTO_CLOSE_STATUSES and existing.status in AUTO_CLOSE_STATUSES:
-                snapshot = snapshot.with_updates(unrealized_pnl=existing.unrealized_pnl)
-            snapshots[snapshot.id] = snapshot
-        pipe = redis_client().pipeline(transaction=True)
-        pipe.delete(self._key)
-        if snapshots:
-            pipe.hset(self._key, mapping={str(key): _snapshot_json(value) for key, value in snapshots.items()})
-        pipe.execute()
-        return len(snapshots)
+            active_ids.add(snapshot.id)
+            self._merge_database_snapshot(snapshot)
+
+        # 只清理由本轮数据库读取开始前已存在的陈旧投影；并发创建的新组不删除。
+        for current in self.snapshot_groups():
+            if current.id not in active_ids and _not_newer_than(current.updated_at, load_started_at):
+                self._remove_if_not_newer(current.id, load_started_at)
+        return len(active_ids)
 
     def snapshot_groups(self) -> list[HedgeGroupSnapshot]:
         rows = [_snapshot_from_json(raw) for raw in redis_client().hvals(self._key)]
@@ -121,17 +122,23 @@ class HedgePoolStore:
         return snapshot
 
     def try_mark_closing(self, group_id: int, reason: str = "", estimated_pnl: float | None = None) -> HedgeGroupSnapshot | None:
+        """仅更新缓存投影；业务关闭权必须由数据库事务中的 Coordinator 获取。"""
         def update(current: HedgeGroupSnapshot | None) -> HedgeGroupSnapshot | None:
             if not current or current.status not in AUTO_CLOSE_STATUSES:
                 return None
             return current.with_updates(
                 status="closing", close_reason=reason or current.close_reason,
                 unrealized_pnl=current.unrealized_pnl if estimated_pnl is None else float(estimated_pnl),
+                updated_at=utc_now(),
             )
         return self._atomic_update(group_id, update)
 
     def restore_status(self, snapshot: HedgeGroupSnapshot, status: str | None = None, reason: str = "") -> HedgeGroupSnapshot:
-        return self.upsert_group(snapshot.with_updates(status=status or snapshot.status, close_reason=reason or snapshot.close_reason))
+        return self.upsert_group(snapshot.with_updates(
+            status=status or snapshot.status,
+            close_reason=reason or snapshot.close_reason,
+            updated_at=utc_now(),
+        ))
 
     def mark_closed(
         self, group_id: int, *, realized_pnl: float | None = None, fees_delta: float = 0.0,
@@ -145,6 +152,7 @@ class HedgePoolStore:
                 realized_pnl=current.realized_pnl if realized_pnl is None else float(realized_pnl),
                 unrealized_pnl=0.0 if status == "closed" else current.unrealized_pnl,
                 fees=current.fees + float(fees_delta or 0.0), close_reason=reason or current.close_reason,
+                updated_at=utc_now(),
             )
         return self._atomic_update(group_id, update)
 
@@ -152,8 +160,43 @@ class HedgePoolStore:
         def update(current: HedgeGroupSnapshot | None) -> HedgeGroupSnapshot | None:
             if not current:
                 return None
-            return current.with_updates(status="manual_intervention", close_reason=reason or current.close_reason)
+            return current.with_updates(
+                status="manual_intervention",
+                close_reason=reason or current.close_reason,
+                updated_at=utc_now(),
+            )
         return self._atomic_update(group_id, update)
+
+    def _merge_database_snapshot(self, incoming: HedgeGroupSnapshot) -> HedgeGroupSnapshot | None:
+        """仅允许不旧于当前 Redis 投影的数据库版本覆盖缓存。"""
+        def update(current: HedgeGroupSnapshot | None) -> HedgeGroupSnapshot | None:
+            if current and not _not_newer_than(current.updated_at, incoming.updated_at):
+                return current
+            if current and incoming.status in AUTO_CLOSE_STATUSES and current.status in AUTO_CLOSE_STATUSES:
+                return incoming.with_updates(unrealized_pnl=current.unrealized_pnl)
+            return incoming
+        return self._atomic_update(incoming.id, update)
+
+    def _remove_if_not_newer(self, group_id: int, cutoff: datetime) -> None:
+        """在 WATCH 保护下删除已不属于活动池的旧投影。"""
+        client = redis_client()
+        field = str(int(group_id))
+        for _ in range(5):
+            with client.pipeline() as pipe:
+                try:
+                    pipe.watch(self._key)
+                    raw = pipe.hget(self._key, field)
+                    current = _snapshot_from_json(raw) if raw else None
+                    if current is None or not _not_newer_than(current.updated_at, cutoff):
+                        pipe.unwatch()
+                        return
+                    pipe.multi()
+                    pipe.hdel(self._key, field)
+                    pipe.execute()
+                    return
+                except WatchError:
+                    continue
+        raise RuntimeError(f"对冲组 Redis 清理竞争过于频繁: {group_id}")
 
     def remove_closed(self, group_id: int) -> None:
         current = self.get(group_id)
@@ -189,17 +232,27 @@ class HedgePoolStore:
 
 def _snapshot_json(snapshot: HedgeGroupSnapshot) -> str:
     data = asdict(snapshot)
-    for field in ("opened_at", "closed_at"):
+    for field in ("opened_at", "closed_at", "updated_at"):
         data[field] = data[field].isoformat() if data[field] else None
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def _snapshot_from_json(raw: str) -> HedgeGroupSnapshot:
     data = json.loads(raw)
-    for field in ("opened_at", "closed_at"):
+    for field in ("opened_at", "closed_at", "updated_at"):
         if data.get(field):
             data[field] = datetime.fromisoformat(data[field])
+    data.setdefault("updated_at", None)
     return HedgeGroupSnapshot(**data)
+
+
+def _not_newer_than(value: datetime | None, reference: datetime | None) -> bool:
+    """兼容旧缓存无版本字段；无版本快照视为较旧。"""
+    if value is None:
+        return True
+    if reference is None:
+        return False
+    return value <= reference
 
 
 hedge_pool = HedgePoolStore()

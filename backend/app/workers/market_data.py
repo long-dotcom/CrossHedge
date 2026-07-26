@@ -86,6 +86,7 @@ class MarketDataManager:
             self._stop.wait(interval)
 
     def _refresh(self, mappings, *, paper: bool) -> None:
+        settings = get_settings()
         symbols_by_venue: dict[str, set[str]] = defaultdict(set)
         for mapping in mappings:
             for index in ("a", "b"):
@@ -113,6 +114,12 @@ class MarketDataManager:
                     continue
                 try:
                     ticker = connector.get_ticker(venue_symbol)
+                    # 事件驱动 BBO 在安静市场不会变化。缓存接近过期时做一次权威
+                    # 快照，避免把“价格没变”误判成连接断开或行情失效。
+                    if not paper and _ticker_age_ms(ticker) >= settings.quote.stale_ms * 0.75:
+                        refresh_ticker = getattr(connector, "refresh_ticker", None)
+                        if callable(refresh_ticker):
+                            ticker = refresh_ticker(venue_symbol)
                     bid_depth_notional = ticker.bid * ticker.bid_quantity
                     ask_depth_notional = ticker.ask * ticker.ask_quantity
                     depth_notional = min(bid_depth_notional, ask_depth_notional)
@@ -204,6 +211,15 @@ def _mapping_quotes_seeded(mapping) -> bool:
     leg_a_venue, _ = mapping_leg(mapping, "a")
     leg_b_venue, _ = mapping_leg(mapping, "b")
     return bool(quote_cache.latest(leg_a_venue, mapping.symbol) and quote_cache.latest(leg_b_venue, mapping.symbol))
+
+
+def _ticker_age_ms(ticker) -> float:
+    """计算 Connector ticker 的本地接收年龄，兼容 naive/aware UTC。"""
+    received_at = getattr(ticker, "received_at", None)
+    if not isinstance(received_at, datetime):
+        return float("inf")
+    now = datetime.now(received_at.tzinfo) if received_at.tzinfo else datetime.now(timezone.utc).replace(tzinfo=None)
+    return max((now - received_at).total_seconds() * 1000, 0.0)
 
 
 market_data_manager = MarketDataManager()

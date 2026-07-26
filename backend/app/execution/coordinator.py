@@ -125,7 +125,13 @@ def create_open_intent(
             record_risk_event(db, "execution_quote_recheck", refresh_reason, opportunity.symbol)
             raise ValueError(refresh_reason)
         use_live_account_risk = mode == "live" or (mode == "paper" and strategy.paper_use_live_account_risk)
-        slippage_bps = settings.cost.default_slippage_bps if refreshed else synced.time_diff_ms / 10
+        # 两腿报价接收时间差只反映数据对齐质量，不能换算为价格滑点。
+        # 风控滑点使用机会触发价到执行前 BBO 的实际不利价格移动。
+        slippage_bps = _observed_entry_slippage_bps(
+            opportunity,
+            synced,
+            fallback_bps=settings.cost.default_slippage_bps,
+        )
         decision = pre_trade_check(
             db,
             opportunity.symbol,
@@ -305,7 +311,7 @@ def create_close_intent(
             raise ValueError("Idempotency-Key 已被其他执行请求使用")
         return IntentCreationResult(existing, False)
 
-    group = db.get(HedgeGroup, group_id)
+    group = _locked_hedge_group(db, group_id)
     if group is None:
         raise ValueError("对冲组不存在")
     _require_hybrid_paper_group(group)
@@ -368,6 +374,42 @@ def create_close_intent(
     return result
 
 
+def _observed_entry_slippage_bps(opportunity, synced, *, fallback_bps: float = 0.0) -> float:
+    """计算信号触发到执行前报价之间最不利单腿价格移动。"""
+    if opportunity.direction == "long_leg_a_short_leg_b":
+        comparisons = (
+            (opportunity.trigger_leg_a_ask, synced.leg_a.ask, "buy"),
+            (opportunity.trigger_leg_b_bid, synced.leg_b.bid, "sell"),
+        )
+    elif opportunity.direction == "long_leg_b_short_leg_a":
+        comparisons = (
+            (opportunity.trigger_leg_a_bid, synced.leg_a.bid, "sell"),
+            (opportunity.trigger_leg_b_ask, synced.leg_b.ask, "buy"),
+        )
+    else:
+        return max(float(fallback_bps or 0.0), 0.0)
+
+    adverse_moves: list[float] = []
+    for trigger_price, current_price, side in comparisons:
+        reference = float(trigger_price or 0.0)
+        current = float(current_price or 0.0)
+        if reference <= 0 or current <= 0:
+            return max(float(fallback_bps or 0.0), 0.0)
+        move = (current - reference) / reference if side == "buy" else (reference - current) / reference
+        adverse_moves.append(max(move * 10_000, 0.0))
+    return max(adverse_moves, default=max(float(fallback_bps or 0.0), 0.0))
+
+
+def _locked_hedge_group(db: Session, group_id: int) -> HedgeGroup | None:
+    """锁定对冲组状态行，使并发关闭/恢复请求由数据库串行裁决。"""
+    return (
+        db.query(HedgeGroup)
+        .filter(HedgeGroup.id == group_id)
+        .with_for_update()
+        .one_or_none()
+    )
+
+
 def create_recovery_intent(
     db: Session,
     *,
@@ -392,7 +434,7 @@ def create_recovery_intent(
             raise ValueError("Idempotency-Key 已被其他执行请求使用")
         return IntentCreationResult(existing, False)
 
-    group = db.get(HedgeGroup, group_id)
+    group = _locked_hedge_group(db, group_id)
     if group is None:
         raise ValueError("对冲组不存在")
     _require_hybrid_paper_group(group)

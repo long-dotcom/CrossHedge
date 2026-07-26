@@ -17,7 +17,10 @@ def test_execution_refresh_uses_configured_venues_without_orderbook(monkeypatch)
             self.venue = venue
 
         def get_ticker(self, symbol: str) -> Ticker:
-            calls.append((self.venue, "ticker", symbol))
+            raise AssertionError("执行前刷新不能复用 Connector 行情缓存")
+
+        def refresh_ticker(self, symbol: str) -> Ticker:
+            calls.append((self.venue, "refresh_ticker", symbol))
             return Ticker(self.venue, symbol, 100, 101, 2, 3, received_at=received_at)
 
         def get_order_book(self, symbol: str, depth: int = 20):
@@ -45,8 +48,8 @@ def test_execution_refresh_uses_configured_venues_without_orderbook(monkeypatch)
 
     assert refreshed == ["leg_a", "leg_b"]
     assert calls == [
-        ("binance", "ticker", "XAUUSDT"),
-        ("mt5", "ticker", "XAUUSD"),
+        ("binance", "refresh_ticker", "XAUUSDT"),
+        ("mt5", "refresh_ticker", "XAUUSD"),
     ]
     assert [row[0][0] for row in writes] == ["binance", "mt5"]
     assert all(row[1]["local_recv_ts"] == received_at for row in writes)

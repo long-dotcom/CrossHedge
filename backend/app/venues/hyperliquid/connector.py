@@ -231,7 +231,19 @@ class HyperliquidConnector:
         cached = self._ws.ticker(symbol)
         if cached:
             return cached
-        book = self.get_order_book(symbol, 1)
+        return self.refresh_ticker(symbol)
+
+    def refresh_ticker(self, symbol: str) -> Ticker:
+        """绕过 WS 缓存，通过 info API 获取一次权威 BBO 快照。"""
+        data = self._info({"type": "l2Book", "coin": symbol})
+        levels = data.get("levels") or [[], []]
+        book = OrderBookSnapshot(
+            self.venue,
+            symbol,
+            tuple((_decimal(item.get("px")), _decimal(item.get("sz"))) for item in levels[0][:1]),
+            tuple((_decimal(item.get("px")), _decimal(item.get("sz"))) for item in levels[1][:1]),
+            exchange_time=_millis_datetime(data.get("time")),
+        )
         if not book.bids or not book.asks:
             raise RuntimeError(f"Hyperliquid 订单簿为空: {symbol}")
         return Ticker(

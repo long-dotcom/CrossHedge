@@ -127,6 +127,10 @@ class PaperConnector:
         spread = base * Decimal("0.0004")
         return Ticker(self.venue, symbol, base - spread / 2, base + spread / 2)
 
+    def refresh_ticker(self, symbol: str) -> Ticker:
+        """Paper 行情由提供器即时生成，读取即为刷新。"""
+        return self.get_ticker(symbol)
+
     def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
         if self._book_provider is not None:
             return self._book_provider(symbol, depth)

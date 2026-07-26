@@ -1,6 +1,6 @@
 # CrossHedge 原生交易模块规范
 
-更新时间：2026-07-18
+更新时间：2026-07-26
 
 ## 1. 目标与范围
 
@@ -76,6 +76,8 @@ CREATED -> SUBMITTING -> SUBMITTED -> ACCEPTED
 - 订单事件用交易所 event/trade ID 幂等；没有 ID 时使用规范化载荷哈希。
 - 部分成交的累计量、均价和佣金只能单调前进。
 - 撤单请求成功不等于撤单终态，市价兜底必须等待 CANCELED 或其他明确终态。
+- 对冲组关闭与恢复必须先锁定数据库状态行；PostgreSQL 是业务状态真相源，Redis 对冲池仅保存带 `updated_at` 版本的只读投影，数据库回灌不得全量删除或覆盖更新版本。
+- 仓位对账必须通过 `SymbolMapping` 确定仓位属于 leg A 或 leg B，再判断方向与数量；禁止以交易所名称推断腿归属。
 
 ## 5. 低延迟确认策略
 
@@ -85,7 +87,7 @@ CREATED -> SUBMITTING -> SUBMITTED -> ACCEPTED
 
 ### Hyperliquid
 
-`orderUpdates` 与 `userFills` 是主路径。cloid 让重启后的订单仍可定位；重复 Fill 按 tid 去重。
+`orderUpdates` 与 `userFills` 是主路径。cloid 让重启后的订单仍可定位；重复 Fill 按 tid 去重。公共与私有连接启用协议级 ping/pong 超时检测；运行期品种变化必须立即发送 subscribe/unsubscribe，不得等待下一次断线重连。
 
 ### MT5
 
@@ -94,6 +96,8 @@ MT5 Python 与 Terminal 只运行在 Windows Gateway。业务后端通过 Redis 
 ## 6. 行情边界
 
 扫描链路仅维护两腿 BBO：Hyperliquid 使用 bbo WS，Binance 使用 bookTicker WS，MT5 使用 symbol tick。扫描器不订阅增量深度、不轮询 terminal market book，也不把完整订单簿写入 Redis。连接器仍可为真实执行探针等明确的单次操作按需查询订单簿，但该查询不得进入周期行情和扫描循环。
+
+事件驱动 BBO 长时间不变化不等同于连接断开。系统分别维护连接心跳与报价接收时间；当缓存接近过期时，通过 Connector 的 `refresh_ticker()` 获取一次绕过缓存的权威 BBO。执行前刷新必须调用该接口，不能把旧 WS 缓存重新写入 Redis。两腿接收时间差只用于数据对齐判断，不得换算成滑点；开仓滑点使用触发价到执行前 BBO 的实际不利价格移动。
 
 ## 7. 品种与成本刷新
 
@@ -124,6 +128,7 @@ Instrument 的执行必需信息至少包含：数量步进、最小数量、价
 - 执行 Worker：Outbox、Live 下单、私有事件和订单恢复。
 - WS 回调只复制不可变事件并写入无阻塞队列，不做数据库 I/O。
 - Worker 以 50ms 周期处理队列和 Outbox；事件到达会在下一周期投影。
+- Worker 启动恢复完成前不得处理新的 Outbox 命令；恢复失败时以 1～30 秒指数退避持续重试并维持 `recovering` 心跳，不依赖 WS 再次断线才触发。
 - `/health` 暴露每个连接器环境、只读状态、公共/私有连接和订单簿同步状态。
 
 ## 10. 新交易所接入清单

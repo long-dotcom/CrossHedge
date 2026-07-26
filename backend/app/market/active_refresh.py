@@ -47,7 +47,10 @@ def _refresh_leg_quote(mapping, leg: str) -> bool:
     venue, venue_symbol = mapping_leg(mapping, leg)
     try:
         connector = native_venue_manager.connector_for(venue, "live")
-        ticker = connector.get_ticker(venue_symbol)
+        refresh_ticker = getattr(connector, "refresh_ticker", None)
+        if not callable(refresh_ticker):
+            raise RuntimeError(f"{venue} Connector 不支持权威 BBO 刷新")
+        ticker = refresh_ticker(venue_symbol)
         bid_depth_notional = float(ticker.bid * ticker.bid_quantity)
         ask_depth_notional = float(ticker.ask * ticker.ask_quantity)
         depth_notional = min(bid_depth_notional, ask_depth_notional)

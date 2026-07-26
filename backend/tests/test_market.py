@@ -150,6 +150,46 @@ def test_market_data_isolates_one_venue_connector_failure(monkeypatch) -> None:
     assert ("mt5", "ticker") in calls
     assert not any(operation == "orderbook" for _, operation in calls)
 
+
+def test_live_market_data_authoritatively_refreshes_unchanged_stale_bbo(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+    stale_at = utc_now() - timedelta(minutes=5)
+
+    class Connector:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+        def start(self) -> None:
+            pass
+
+        def subscribe_market_data(self, _symbols) -> None:
+            pass
+
+        def get_ticker(self, symbol: str) -> Ticker:
+            return Ticker(self.venue, symbol, 100, 101, 2, 3, received_at=stale_at)
+
+        def refresh_ticker(self, symbol: str) -> Ticker:
+            calls.append((self.venue, symbol))
+            return Ticker(self.venue, symbol, 100, 101, 2, 3, received_at=utc_now())
+
+    class Sink:
+        def put(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "app.workers.market_data.native_venue_manager.connector_for",
+        lambda venue, _mode: Connector(venue),
+    )
+    monkeypatch.setattr("app.workers.market_data.quote_cache", Sink())
+    mapping = SimpleNamespace(
+        symbol="BTC", leg_a_venue="hyperliquid", leg_a_symbol="BTC",
+        leg_b_venue="mt5", leg_b_symbol="BTCUSD",
+    )
+
+    MarketDataManager()._refresh([mapping], paper=False)
+
+    assert calls == [("hyperliquid", "BTC"), ("mt5", "BTCUSD")]
+
 def test_symbol_spread_limits_tighten_statistical_thresholds() -> None:
     mapping = SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=150, max_close_spread=12)
 

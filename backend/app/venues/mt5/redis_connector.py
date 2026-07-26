@@ -101,6 +101,10 @@ class MT5RedisConnector:
         data = codec.loads(raw) if raw else self._rpc("get_ticker", {"symbol": symbol})
         return codec.ticker(data)
 
+    def refresh_ticker(self, symbol: str) -> Ticker:
+        """绕过 Redis 行情缓存，要求 Gateway 读取一次当前 tick。"""
+        return codec.ticker(self._rpc("get_ticker", {"symbol": symbol}))
+
     def get_order_book(self, symbol: str, depth: int = 20) -> OrderBookSnapshot:
         raw = self._redis.get(redis_key("mt5", "orderbook", symbol))
         data = codec.loads(raw) if raw else self._rpc("get_order_book", {"symbol": symbol, "depth": depth})

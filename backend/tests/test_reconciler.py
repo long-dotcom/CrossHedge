@@ -14,6 +14,7 @@ from app.db.models import (
     HedgeGroupEvent,
     Order,
     Position,
+    SymbolMapping,
 )
 from app.execution.reconciler import (
     reconcile_hedge_group,
@@ -165,3 +166,30 @@ def test_unmanaged_native_position_creates_single_idempotent_alert() -> None:
     db.flush()
     assert reconcile_orphan_positions(db) == 0
     assert db.query(Alert).filter(Alert.title == "外部孤儿仓位").count() == 1
+
+
+def test_binance_leg_a_position_matches_group_without_venue_assumptions() -> None:
+    """对账必须按映射腿归属判断方向和数量，不能把 Binance 当成 leg B。"""
+    db = _db()
+    db.add(SymbolMapping(
+        symbol="GOLD",
+        leg_a_venue="binance",
+        leg_a_venue_symbol="XAUUSDT",
+        leg_a_symbol="XAUUSDT",
+        leg_b_venue="mt5",
+        leg_b_symbol="XAUUSD",
+        mt5_symbol="XAUUSD",
+    ))
+    db.add(HedgeGroup(
+        symbol="GOLD", direction="long_leg_a_short_leg_b", status="open",
+        execution_mode="live", notional=4000, quantity=1.0,
+        leg_a_quantity=0.002, leg_b_quantity=0.03,
+    ))
+    db.add(Position(
+        platform="binance", symbol="XAUUSDT", side="long", quantity=0.002,
+        entry_price=4000, mark_price=4001,
+    ))
+    db.commit()
+
+    assert reconcile_orphan_positions(db) == 0
+    assert db.query(Alert).filter(Alert.title == "外部孤儿仓位").count() == 0

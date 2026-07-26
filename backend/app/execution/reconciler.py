@@ -501,32 +501,28 @@ def _position_matches_group(db: Session, position: Position, group: HedgeGroup) 
             symbols[leg_b_venue].add(mapping.mt5_symbol)
     if position.symbol not in symbols.get(position.platform, set()):
         return False
-    if _position_side(position.side) != _expected_position_side(group.direction, position.platform):
+    leg = "a" if position.platform == leg_a_venue else "b"
+    if _position_side(position.side) != _expected_position_side(group.direction, leg):
         return False
     if group.status == "closed":
         return True
-    expected_quantity = _expected_position_quantity(group, position.platform)
+    expected_quantity = _expected_position_quantity(group, leg)
     if expected_quantity <= 0:
         return False
     tolerance = max(expected_quantity * 0.000001, 0.00000001)
     return abs(abs(position.quantity) - expected_quantity) <= tolerance
 
 
-def _expected_position_side(direction: str, platform: str) -> str:
-    """根据方向推断指定平台的预期仓位方向。"""
+def _expected_position_side(direction: str, leg: str) -> str:
+    """根据方向推断指定腿的预期仓位方向，不依赖具体交易所名称。"""
     if direction == "long_leg_a_short_leg_b":
-        if platform == "hyperliquid":
-            return "long"
-        return "short"
-    return "short" if platform == "hyperliquid" else "long"
+        return "long" if leg == "a" else "short"
+    return "short" if leg == "a" else "long"
 
 
-def _expected_position_quantity(group: HedgeGroup, platform: str) -> float:
-    """根据方向推断指定平台的预期仓位数量。"""
-    if platform == "hyperliquid":
-        value = group.leg_a_quantity
-    else:
-        value = group.leg_b_quantity
+def _expected_position_quantity(group: HedgeGroup, leg: str) -> float:
+    """根据腿标识读取预期仓位数量，不依赖具体交易所名称。"""
+    value = group.leg_a_quantity if leg == "a" else group.leg_b_quantity
     # 优先使用腿数量，若为空则回退到组合数量
     result = value if value is not None else group.quantity
     return float(result) if result is not None else 0.0

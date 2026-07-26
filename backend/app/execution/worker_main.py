@@ -26,6 +26,7 @@ from app.venues.manager import native_venue_manager
 logger = get_logger(__name__)
 HEALTH_KEY = redis_key("health", "execution-worker")
 _running = True
+RECOVERY_MAX_BACKOFF_SECONDS = 30.0
 
 
 def _request_stop(*_args) -> None:
@@ -51,6 +52,16 @@ def _write_health(*, status: str, error: str = "", processed: int = 0) -> bool:
         return False
 
 
+def _recover_execution_state() -> None:
+    """恢复持仓、未决订单和 Probe；任一步失败均由主循环退避重试。"""
+    with SessionLocal() as db:
+        # Binance 用户流没有初始账户快照；恢复时拉取一次，之后由 WS 增量维护。
+        sync_live_positions(db, allow_remote_crypto=True)
+        db.commit()
+    reconcile_execution_orders_once()
+    reconcile_probe_runs_once()
+
+
 def main() -> None:
     settings = get_settings()
     setup_logging(settings.environment)
@@ -65,19 +76,38 @@ def main() -> None:
         except Exception as exc:
             logger.exception("执行 Worker 的原生连接器预热失败，继续提供 Paper/可用 venue 服务: {}", exc)
             _write_health(status="degraded", error=str(exc))
-        # 进程启动只执行一次恢复快照；正常运行完全由账户私有 WS 推进。
-        try:
-            with SessionLocal() as db:
-                # Binance 用户流没有初始账户快照；启动时仅拉取一次，之后由 WS 增量维护。
-                sync_live_positions(db, allow_remote_crypto=True)
-                db.commit()
-            reconcile_execution_orders_once()
-            reconcile_probe_runs_once()
-        except Exception as exc:
-            logger.exception("执行 Worker 启动恢复对账失败，等待私有 WS 重连后重试: {}", exc)
+        recovery_pending = True
+        recovery_error = ""
+        recovery_backoff = 1.0
+        next_recovery_at = 0.0
         next_health_at = 0.0
         while _running:
             try:
+                now = time.monotonic()
+                if recovery_pending:
+                    if now < next_recovery_at:
+                        if now >= next_health_at:
+                            _write_health(status="recovering", error=recovery_error)
+                            next_health_at = now + 2.0
+                        time.sleep(0.05)
+                        continue
+                    try:
+                        _recover_execution_state()
+                    except Exception as exc:
+                        recovery_error = str(exc)
+                        logger.exception(
+                            "执行 Worker 恢复对账失败，{:.1f}s 后重试: {}",
+                            recovery_backoff,
+                            exc,
+                        )
+                        _write_health(status="recovering", error=recovery_error)
+                        next_recovery_at = time.monotonic() + recovery_backoff
+                        recovery_backoff = min(recovery_backoff * 2, RECOVERY_MAX_BACKOFF_SECONDS)
+                        continue
+                    recovery_pending = False
+                    recovery_error = ""
+                    logger.info("执行 Worker 恢复对账完成，开始处理新 Outbox 命令")
+
                 processed = run_execution_outbox_once()
                 now = time.monotonic()
                 if now >= next_health_at:

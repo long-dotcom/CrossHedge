@@ -1,6 +1,7 @@
 """Hyperliquid 原生 Connector 和用户事件测试。"""
 
 from decimal import Decimal
+import json
 
 from app.venues.domain.events import VenueEventType
 from app.venues.domain.models import OrderRequest, OrderStatus, OrderType, Side
@@ -84,6 +85,49 @@ class RecordingHip3Info:
 
 def test_hyperliquid_public_market_data_uses_bbo_subscription() -> None:
     assert _bbo_subscription("BTC") == {"type": "bbo", "coin": "BTC"}
+
+
+def test_hyperliquid_refresh_ticker_bypasses_ws_cache() -> None:
+    connector = HyperliquidConnector(info_transport=FakeHyperInfo())
+    connector._ws._tickers["BTC"] = connector.get_ticker("BTC")
+    connector._ws._tickers["BTC"] = connector._ws._tickers["BTC"].__class__(
+        "hyperliquid", "BTC", Decimal("1"), Decimal("2"), Decimal("1"), Decimal("1"),
+    )
+
+    refreshed = connector.refresh_ticker("BTC")
+
+    assert refreshed.bid == Decimal("60499")
+    assert refreshed.ask == Decimal("60501")
+
+
+def test_hyperliquid_runtime_emits_dynamic_symbol_updates(monkeypatch) -> None:
+    runtime = HyperliquidWebSocketRuntime(ws_url="wss://example")
+    updates: list[tuple[str, set[str]]] = []
+    monkeypatch.setattr(runtime, "start", lambda: None)
+    monkeypatch.setattr(runtime, "_queue_symbol_updates", lambda action, symbols: updates.append((action, set(symbols))))
+
+    runtime.add_symbols(["BTC", "ETH"])
+    runtime.remove_symbols(["ETH"])
+
+    assert updates == [("subscribe", {"BTC", "ETH"}), ("unsubscribe", {"ETH"})]
+
+
+def test_hyperliquid_dynamic_subscription_payload() -> None:
+    class Socket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        async def send(self, raw: str) -> None:
+            self.sent.append(json.loads(raw))
+
+    import asyncio
+    runtime = HyperliquidWebSocketRuntime(ws_url="wss://example")
+    socket = Socket()
+    runtime._active_ws = socket
+
+    asyncio.run(runtime._send_symbol_updates("subscribe", {"ETH"}))
+
+    assert socket.sent == [{"method": "subscribe", "subscription": {"type": "bbo", "coin": "ETH"}}]
 
 
 def test_hyperliquid_native_account_instrument_and_order() -> None:

@@ -213,6 +213,10 @@ class BinanceFuturesConnector:
         cached = self._ticker_cache.get(normalize_symbol(symbol))
         if cached is not None:
             return cached
+        return self.refresh_ticker(symbol)
+
+    def refresh_ticker(self, symbol: str) -> Ticker:
+        """绕过短期缓存，通过 REST bookTicker 获取权威 BBO。"""
         data = self.rest.book_ticker(symbol)
         return Ticker(
             self.venue,

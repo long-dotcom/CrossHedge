@@ -90,6 +90,9 @@ class HybridPaperProbeConnector:
     def get_ticker(self, symbol: str):
         return self.live.get_ticker(symbol)
 
+    def refresh_ticker(self, symbol: str):
+        return self.live.refresh_ticker(symbol)
+
     def get_order_book(self, symbol: str, depth: int = 20):
         return self.live.get_order_book(symbol, depth)
 

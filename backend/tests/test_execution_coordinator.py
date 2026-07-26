@@ -10,7 +10,12 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
 from app.db.models import ArbitrageOpportunity, Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, Order, StrategySetting, SymbolMapping
-from app.execution.coordinator import create_close_intent, create_open_intent, create_recovery_intent
+from app.execution.coordinator import (
+    _observed_entry_slippage_bps,
+    create_close_intent,
+    create_open_intent,
+    create_recovery_intent,
+)
 from app.execution.outbox_worker import run_execution_outbox_once
 from app.execution.pnl import actual_entry_spread_from_fills
 from app.execution.preflight import refreshed_opportunity_still_executable
@@ -434,3 +439,32 @@ def test_execution_recheck_uses_exit_target_and_round_trip_fees() -> None:
 
     assert allowed is False
     assert "净利润不足" in reason
+
+
+def test_observed_slippage_uses_price_move_not_quote_timestamp_gap() -> None:
+    opportunity = SimpleNamespace(
+        direction="long_leg_a_short_leg_b",
+        trigger_leg_a_ask=100.0,
+        trigger_leg_b_bid=200.0,
+    )
+    synced = SimpleNamespace(
+        time_diff_ms=120_000,
+        leg_a=SimpleNamespace(ask=100.02),
+        leg_b=SimpleNamespace(bid=199.98),
+    )
+
+    assert _observed_entry_slippage_bps(opportunity, synced, fallback_bps=8.0) == pytest.approx(2.0)
+
+
+def test_observed_slippage_falls_back_when_trigger_price_is_missing() -> None:
+    opportunity = SimpleNamespace(
+        direction="long_leg_b_short_leg_a",
+        trigger_leg_a_bid=0.0,
+        trigger_leg_b_ask=0.0,
+    )
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=100.0),
+        leg_b=SimpleNamespace(ask=200.0),
+    )
+
+    assert _observed_entry_slippage_bps(opportunity, synced, fallback_bps=3.5) == 3.5

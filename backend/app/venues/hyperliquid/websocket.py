@@ -62,6 +62,7 @@ class HyperliquidWebSocketRuntime:
         self._private_connected = False
         self._ever_connected = False
         self._last_message_at = 0.0
+        self._active_ws = None
 
     def register_client_order_id(self, venue_cloid: str, client_order_id: str) -> None:
         self._cloid_to_client[venue_cloid.lower()] = client_order_id
@@ -71,12 +72,20 @@ class HyperliquidWebSocketRuntime:
         return not self._private_enabled or self._private_connected
 
     def add_symbols(self, symbols: Sequence[str]) -> None:
-        self._symbols.update(str(symbol) for symbol in symbols)
+        requested = {str(symbol) for symbol in symbols if symbol}
+        added = requested - self._symbols
+        self._symbols.update(added)
         self.start()
+        self._queue_symbol_updates("subscribe", added)
 
     def remove_symbols(self, symbols: Sequence[str]) -> None:
-        for symbol in symbols:
-            self._symbols.discard(str(symbol))
+        requested = {str(symbol) for symbol in symbols if symbol}
+        removed = requested & self._symbols
+        self._symbols.difference_update(removed)
+        for symbol in removed:
+            self._books.pop(symbol, None)
+            self._tickers.pop(symbol, None)
+        self._queue_symbol_updates("unsubscribe", removed)
 
     def add_event_handler(self, handler: EventHandler, *, private: bool = False) -> None:
         if handler not in self._handlers:
@@ -103,6 +112,7 @@ class HyperliquidWebSocketRuntime:
             "ws_running": bool(self._thread and self._thread.is_alive()),
             "ws_connected": self._connected,
             "private_ws_connected": self._private_connected,
+            "transport_heartbeat_ok": self._connected,
             "message_age_seconds": time.monotonic() - self._last_message_at if self._last_message_at else None,
             "symbols": sorted(self._symbols),
         }
@@ -368,9 +378,24 @@ class HyperliquidWebSocketRuntime:
                 await asyncio.sleep(0.25)
                 continue
             try:
-                async with websockets.connect(self.ws_url, ping_interval=None, open_timeout=10) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    open_timeout=10,
+                ) as ws:
+                    self._active_ws = ws
                     for subscription in subscriptions:
                         await ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+                    # 连接建立期间配置可能发生变化，立即补齐新增/移除的公共订阅。
+                    initial_symbols = {
+                        str(item["coin"])
+                        for item in subscriptions
+                        if item.get("type") == "bbo" and item.get("coin")
+                    }
+                    await self._send_symbol_updates("subscribe", self._symbols - initial_symbols)
+                    await self._send_symbol_updates("unsubscribe", initial_symbols - self._symbols)
                     self._connected = True
                     self._private_connected = bool(self.account_address and self._private_enabled)
                     self._emit_stream_event(VenueEventType.STREAM_CONNECTED)
@@ -391,12 +416,40 @@ class HyperliquidWebSocketRuntime:
             except Exception as exc:
                 logger.warning("Hyperliquid 原生 WS 断开: {}", exc)
             finally:
+                self._active_ws = None
                 if self._connected:
                     self._emit_stream_event(VenueEventType.STREAM_DISCONNECTED)
                 self._connected = False
                 self._private_connected = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
+
+    def _queue_symbol_updates(self, action: str, symbols: set[str]) -> None:
+        """把运行期订阅变化投递到 WS 所属事件循环。"""
+        if not symbols or self._active_ws is None:
+            return
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        future = asyncio.run_coroutine_threadsafe(self._send_symbol_updates(action, symbols), loop)
+
+        def log_failure(done) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                logger.warning("Hyperliquid 动态订阅更新失败，等待重连恢复: action={}, error={}", action, exc)
+
+        future.add_done_callback(log_failure)
+
+    async def _send_symbol_updates(self, action: str, symbols: set[str]) -> None:
+        ws = self._active_ws
+        if ws is None:
+            return
+        for symbol in sorted(symbols):
+            await ws.send(json.dumps({
+                "method": action,
+                "subscription": _bbo_subscription(symbol),
+            }))
 
     def _emit_stream_event(self, event_type: VenueEventType, *, reconciliation: bool = False) -> None:
         now = utc_now()
