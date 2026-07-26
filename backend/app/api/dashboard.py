@@ -3,24 +3,24 @@
 ==========
 
 - GET /dashboard/summary      —— 总览（权益、PnL、风控模式等）
-- GET /dashboard/equity-curve —— 权益曲线（最近 100 个时间点）
+- GET /dashboard/equity-curve —— 按范围和时间粒度查询持久化权益曲线
 - GET /dashboard/risk-summary —— 风控设置 + 最近 5 条风控事件
 """
 
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 
 from app.accounts.sync import latest_account_snapshots
+from app.accounts.equity_history import equity_curve_points
 from app.api.deps import as_dict
 from app.auth.dependencies import get_current_user
 from app.db.models import (
-    AccountSnapshot,
     Alert,
     HedgeGroup,
     RiskEvent,
@@ -128,35 +128,8 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _equity_curve_payload(db: Session) -> list[dict[str, Any]]:
-    """组装权益曲线数据（最近 100 个时间点）。"""
-    rows = db.query(AccountSnapshot).order_by(
-        desc(AccountSnapshot.created_at), desc(AccountSnapshot.id)
-    ).limit(240).all()
-    rows = list(reversed(rows))
-    latest_by_platform: dict[str, AccountSnapshot] = {}
-    points: list[dict[str, Any]] = []
-    batch: list[AccountSnapshot] = []
-
-    def flush_batch() -> None:
-        if not batch:
-            return
-        for snapshot in batch:
-            latest_by_platform[snapshot.platform] = snapshot
-        point_time = max(s.created_at for s in batch)
-        points.append({
-            "time": point_time.isoformat(),
-            "equity": sum(s.equity for s in latest_by_platform.values()),
-            "platform": "total",
-            "platforms": {p: s.equity for p, s in latest_by_platform.items()},
-        })
-
-    for row in rows:
-        if batch and (row.created_at - batch[-1].created_at).total_seconds() > 2:
-            flush_batch()
-            batch = []
-        batch.append(row)
-    flush_batch()
-    return points[-100:]
+    """兼容 SSE 内部调用的默认 24 小时权益曲线。"""
+    return equity_curve_points(db, "24h")
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +147,12 @@ def dashboard_summary(
 
 @router.get("/equity-curve")
 def equity_curve(
+    time_range: Literal["24h", "7d", "30d", "all"] = Query("24h", alias="range"),
     _: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    """权益曲线。"""
-    return _equity_curve_payload(db)
+    """按时间范围和对应粒度返回持久化权益曲线。"""
+    return equity_curve_points(db, time_range)
 
 
 @router.get("/risk-summary")

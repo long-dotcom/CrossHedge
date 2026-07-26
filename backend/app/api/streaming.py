@@ -193,7 +193,8 @@ def _stream_snapshot(
     if channel == "execution":
         return {"orders": _orders_payload(db, page=page, page_size=page_size), "fills": _fills_payload(db, page=fill_page, page_size=page_size)}
     if channel == "dashboard":
-        return {"dashboard_summary": _dashboard_summary_payload(db), "equity_curve": _equity_curve_payload(db)}
+        # 权益历史独立按分钟刷新，避免每秒 SSE 重复扫描长时间序列。
+        return {"dashboard_summary": _dashboard_summary_payload(db)}
     if channel == "logs":
         return {"logs": _logs_payload(db, page=page, page_size=page_size), "alerts": _alerts_payload(db, page=alert_page, page_size=page_size)}
     if channel == "risk":

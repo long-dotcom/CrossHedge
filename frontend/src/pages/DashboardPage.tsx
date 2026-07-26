@@ -1,6 +1,7 @@
+import { useState } from 'react';
 import ReactECharts from 'echarts-for-react';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Card, Col, Row, Space } from 'antd';
+import { Alert, Card, Col, Row, Segmented, Space } from 'antd';
 import { api } from '../api/client';
 import { AccountTable } from '../components/AccountTable';
 import { DataCard } from '../components/DataCard';
@@ -10,13 +11,20 @@ import { fmtChartDateTime, fmtMoney, fmtPnlColor, fmtPnlSigned } from '../utils/
 import { QueryErrorAlert } from '../components/QueryErrorAlert';
 
 export function DashboardPage() {
+  const [equityRange, setEquityRange] = useState<'24h' | '7d' | '30d' | 'all'>('24h');
   const streamStatus = usePageStream('dashboard');
   useHeaderStreamStatus(streamStatus);
   const summary = useQuery({ queryKey: ['dashboard-summary'], queryFn: async () => (await api.get('/dashboard/summary')).data });
-  const curve = useQuery({ queryKey: ['equity-curve'], queryFn: async () => (await api.get('/dashboard/equity-curve')).data });
+  const curve = useQuery({
+    queryKey: ['equity-curve', equityRange],
+    queryFn: async () => (await api.get('/dashboard/equity-curve', { params: { range: equityRange } })).data,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: async () => (await api.get('/accounts')).data });
   const data = summary.data || {};
   const curveData = curve.data || [];
+  const curveHasDegradedData = curveData.some((item: any) => item.quality !== 'complete');
 
   return (
     <Space direction="vertical" size={16} className="full-width">
@@ -31,14 +39,46 @@ export function DashboardPage() {
         <Col xs={24} md={8} xl={4}><DataCard title="持仓对冲组" value={data.open_hedge_groups ?? 0} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="未读告警" value={data.unread_alerts ?? 0} /></Col>
       </Row>
-      <Card title="权益曲线 (USD)" className="chart-card">
+      <Card
+        title="权益曲线 (USD)"
+        className="chart-card"
+        extra={(
+          <Segmented
+            size="small"
+            value={equityRange}
+            onChange={(value) => setEquityRange(value as '24h' | '7d' | '30d' | 'all')}
+            options={[
+              { label: '24小时', value: '24h' },
+              { label: '7天', value: '7d' },
+              { label: '30天', value: '30d' },
+              { label: '全部', value: 'all' },
+            ]}
+          />
+        )}
+      >
+        {curveHasDegradedData && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="所选范围包含交易所读取失败时的回退点或数据缺口"
+          />
+        )}
         <ReactECharts
           style={{ height: 320 }}
           option={{
             tooltip: { trigger: 'axis' },
             xAxis: { type: 'category', data: curveData.map((item: any) => fmtChartDateTime(item.time)) },
             yAxis: { type: 'value', scale: true, axisLabel: { formatter: (v: number) => fmtMoney(v) } },
-            series: [{ type: 'line', smooth: true, data: curveData.map((item: any) => item.equity), areaStyle: { opacity: 0.08 } }]
+            dataZoom: curveData.length > 300 ? [{ type: 'inside' }, { type: 'slider', height: 18 }] : undefined,
+            series: [{
+              type: 'line',
+              smooth: true,
+              showSymbol: curveData.length < 120,
+              connectNulls: false,
+              data: curveData.map((item: any) => item.equity),
+              areaStyle: { opacity: 0.08 },
+            }]
           }}
         />
       </Card>

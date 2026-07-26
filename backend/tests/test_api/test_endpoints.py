@@ -51,7 +51,7 @@ def test_pipeline_pool_payload_calculates_runtime_unrealized_pnl() -> None:
     assert item["current_close_spread"] == 16
     assert item["unrealized_pnl"] == 7.5
 
-def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
+def test_dashboard_stream_channel_returns_lightweight_summary() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -61,9 +61,8 @@ def test_dashboard_stream_channel_returns_summary_and_curve() -> None:
 
     event = streaming_api._stream_snapshot(db, channel="dashboard")
 
-    assert set(event) == {"dashboard_summary", "equity_curve"}
+    assert set(event) == {"dashboard_summary"}
     assert event["dashboard_summary"]["equity"] == 200
-    assert len(event["equity_curve"]) == 1
 
 def test_hedge_groups_stream_channel_returns_only_current_page() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
@@ -379,7 +378,7 @@ def test_spread_and_opportunity_apis_prefer_shared_scan_state() -> None:
     assert spreads_payload["items"][0]["symbol"] == "BTC"
     assert opportunities_payload["items"][0]["symbol"] == "ETH"
 
-def test_equity_curve_aggregates_platform_snapshots_by_sync_batch() -> None:
+def test_equity_curve_uses_backfilled_portfolio_history() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -395,8 +394,10 @@ def test_equity_curve_aggregates_platform_snapshots_by_sync_batch() -> None:
         ]
     )
     db.commit()
+    from app.accounts.equity_history import backfill_portfolio_equity_history, equity_curve_points
 
-    curve = streaming_api._equity_curve_payload(db)
+    assert backfill_portfolio_equity_history(db) == 2
+    curve = equity_curve_points(db, "all")
 
     assert [point["platform"] for point in curve] == ["total", "total"]
     assert [point["equity"] for point in curve] == [50000, 50000]

@@ -8,7 +8,7 @@
 - 策略参数（StrategySetting）
 - 风控参数（RiskSetting）
 - 品种映射（SymbolMapping）
-- 账户快照（AccountSnapshot）
+- 账户快照与组合权益历史（AccountSnapshot / PortfolioEquitySnapshot）
 - 持仓（Position）
 - 行情快照（MarketSnapshot）
 - 价差数据（SpreadCurrent / SpreadDirectionCurrent / SpreadBucket / SpreadSnapshot）
@@ -381,6 +381,21 @@ class AccountSnapshot(Base, TimestampMixin):
     withdrawable: Mapped[float] = mapped_column(Float, default=0.0)
     free_collateral: Mapped[float] = mapped_column(Float, default=0.0)
     data_source: Mapped[str] = mapped_column(String(64), default="")
+
+
+class PortfolioEquitySnapshot(Base, TimestampMixin):
+    """跨交易所组合权益历史。
+
+    每轮账户同步只写入一个组合级时间点。平台明细和缺失平台使用 JSON 文本保存，
+    兼容 PostgreSQL 与本地 SQLite；``data_quality`` 用于区分完整、回退和无效点。
+    """
+    __tablename__ = "portfolio_equity_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    total_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    platform_equities: Mapped[str] = mapped_column(Text, default="{}")
+    data_quality: Mapped[str] = mapped_column(String(16), default="complete", index=True)
+    missing_platforms: Mapped[str] = mapped_column(Text, default="[]")
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1098,7 @@ Index("ix_orders_created_id", Order.created_at, Order.id)
 Index("ix_fills_created_id", Fill.created_at, Fill.id)
 Index("ix_alerts_created_id", Alert.created_at, Alert.id)
 Index("ix_account_snapshots_platform_created", AccountSnapshot.platform, AccountSnapshot.created_at, AccountSnapshot.id)
+Index("ix_portfolio_equity_created", PortfolioEquitySnapshot.created_at, PortfolioEquitySnapshot.id)
 Index("ix_arbitrage_opps_status_profit", ArbitrageOpportunity.status, ArbitrageOpportunity.net_profit)
 Index("ix_arbitrage_opps_status_updated", ArbitrageOpportunity.status, ArbitrageOpportunity.updated_at)
 Index("ix_worker_runs_name_created", WorkerRun.worker_name, WorkerRun.created_at)
