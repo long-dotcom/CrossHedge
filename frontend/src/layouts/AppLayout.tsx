@@ -5,7 +5,6 @@ import {
   DatabaseOutlined,
   ExperimentOutlined,
   LineChartOutlined,
-  NodeIndexOutlined,
   PartitionOutlined,
   HistoryOutlined,
   OrderedListOutlined,
@@ -29,8 +28,7 @@ const items = [
   { key: 'research', label: '研究', children: [
     { key: '/analytics', icon: <ExperimentOutlined />, label: '价差研究' },
     { key: '/venue-spreads', icon: <BarChartOutlined />, label: '点差监控' },
-    { key: '/funding', icon: <LineChartOutlined />, label: '资金费研究' },
-    { key: '/lead-lag', icon: <NodeIndexOutlined />, label: '报价时差' }
+    { key: '/funding', icon: <LineChartOutlined />, label: '资金费研究' }
   ] },
   { key: 'trading', label: '交易', children: [
     { key: '/hedge-groups', icon: <HistoryOutlined />, label: '对冲组' },

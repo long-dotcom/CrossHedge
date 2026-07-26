@@ -155,30 +155,6 @@ def _risk_events_payload(db: Session, page: int = 1, page_size: int = 20) -> dic
     return {"total": total, "page": page, "page_size": page_size, "items": [as_dict(r) for r in rows]}
 
 
-def _lead_lag_payload(
-    db: Session,
-    symbol: str,
-    window_seconds: int,
-    threshold_bps: float,
-    min_move: float,
-    follow_ratio: float,
-    max_lag_ms: int,
-) -> dict[str, Any]:
-    """领先-滞后分析（SSE 内部版本）。"""
-    from app.analytics.lead_lag import lead_lag_report
-    from app.api.deps import _leg_metadata
-    from app.db.models import SymbolMapping
-    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == symbol.upper()).first()
-    leg_meta = _leg_metadata(mapping)
-    data = lead_lag_report(
-        symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms,
-        leg_a_venue=leg_meta["leg_a_venue"],
-        leg_b_venue=leg_meta["leg_b_venue"],
-    )
-    data.update(leg_meta)
-    return data
-
-
 def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     """仪表盘摘要（SSE 内部版本）。"""
     from app.api.dashboard import _dashboard_summary_payload as _impl
@@ -203,12 +179,6 @@ def _stream_snapshot(
     page_size: int = 20,
     fill_page: int = 1,
     alert_page: int = 1,
-    symbol: str = "JP225",
-    window_seconds: int = 300,
-    threshold_bps: float = 3.0,
-    min_move: float = 0.0,
-    follow_ratio: float = 0.5,
-    max_lag_ms: int = 2000,
     include_voided: bool = False,
 ) -> dict[str, Any]:
     """根据 channel 参数生成快照数据。"""
@@ -228,9 +198,6 @@ def _stream_snapshot(
         return {"logs": _logs_payload(db, page=page, page_size=page_size), "alerts": _alerts_payload(db, page=alert_page, page_size=page_size)}
     if channel == "risk":
         return {"risk_status": _risk_status_payload(db), "risk_events": _risk_events_payload(db, page=page, page_size=page_size)}
-    if channel == "lead-lag":
-        return {"lead_lag": _lead_lag_payload(db, symbol, window_seconds, threshold_bps, min_move, follow_ratio, max_lag_ms)}
-
     # 默认 channel == "all"：聚合价差、机会、账户、Pipeline
     state = scan_state_store.snapshot()
     enabled_symbols = _enabled_symbol_names(db)
@@ -314,12 +281,6 @@ async def stream(
     page_size: int = 20,
     fill_page: int = 1,
     alert_page: int = 1,
-    symbol: str = "JP225",
-    window_seconds: int = 300,
-    threshold_bps: float = 3.0,
-    min_move: float = 0.0,
-    follow_ratio: float = 0.5,
-    max_lag_ms: int = 2000,
     include_voided: bool = False,
 ) -> StreamingResponse:
     """SSE 实时推送端点。"""
@@ -327,8 +288,6 @@ async def stream(
     fill_page = max(int(fill_page), 1)
     alert_page = max(int(alert_page), 1)
     page_size = min(max(int(page_size), 1), 100)
-    window_seconds = min(max(int(window_seconds), 1), 86400)
-    max_lag_ms = min(max(int(max_lag_ms), 1), 60000)
     # SSE 不走 Depends，手动验证 Token
     token = bearer_token_from_request(request)
     try:
@@ -352,12 +311,6 @@ async def stream(
             "page_size": page_size,
             "fill_page": fill_page,
             "alert_page": alert_page,
-            "symbol": symbol,
-            "window_seconds": window_seconds,
-            "threshold_bps": threshold_bps,
-            "min_move": min_move,
-            "follow_ratio": follow_ratio,
-            "max_lag_ms": max_lag_ms,
             "include_voided": include_voided,
         }
         while True:

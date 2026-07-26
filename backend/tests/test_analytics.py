@@ -1,4 +1,4 @@
-"""分析测试：价差分析、资金费分析、领先-滞后分析、统计信号计算。"""
+"""分析测试：价差分析、资金费分析、统计信号计算。"""
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -13,11 +13,8 @@ from app.db.models import (
 )
 from app.analytics.spreads import SpreadPoint, downsample_spreads, load_spread_points, summarize_spreads
 from app.analytics.funding import FundingPoint, bucket_funding_points, funding_history, summarize_funding
-from app.analytics.lead_lag import lead_lag_report
 from app.strategy.statistical_signal import SignalStats, evaluate_entry_signal, refresh_signal_stats_cache
-from app.market.quotes import quote_cache
 from app.market import scanner as scanner_module
-import time
 
 
 def test_spread_series_downsamples_large_window() -> None:
@@ -87,19 +84,6 @@ def test_spread_analytics_complete_cost_includes_spread_and_fee() -> None:
     assert summary["avg_spread_cost"] == pytest.approx(0.03)
     assert summary["avg_total_cost"] == pytest.approx(0.05)
     assert series[0]["avg_total_cost"] == pytest.approx(0.05)
-
-def test_lead_lag_detects_following_move() -> None:
-    symbol = "LLTEST"
-    quote_cache.put("hyperliquid", symbol, 100, 101, 10000, "test")
-    quote_cache.put("mt5", symbol, 100, 101, 10000, "test")
-    time.sleep(0.001)
-    quote_cache.put("hyperliquid", symbol, 102, 103, 10000, "test")
-    time.sleep(0.001)
-    quote_cache.put("mt5", symbol, 102, 103, 10000, "test")
-    report = lead_lag_report(symbol, window_seconds=60, threshold_bps=50, follow_ratio=0.5, max_lag_ms=2000)
-    summary = report["summary"]["leg_a_to_leg_b"]
-    assert summary["event_count"] >= 1
-    assert summary["follow_count"] >= 1
 
 def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> None:
     from app.strategy import statistical_signal as statistical_signal_module

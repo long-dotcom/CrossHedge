@@ -196,18 +196,6 @@ def test_execution_reconcile_api_runs_reconciler_and_audits(monkeypatch) -> None
     assert result == {"status": "ok", "changed": 3, "cost_changed": 0}
     assert db.query(AuditLog).filter(AuditLog.action == "run_execution_reconcile", AuditLog.detail == "3").count() == 1
 
-def test_lead_lag_stream_channel_returns_only_report() -> None:
-    engine = create_engine("sqlite:///:memory:", future=True)
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine, future=True)
-    db = Session()
-
-    event = streaming_api._stream_snapshot(db, channel="lead-lag", symbol="JP225", window_seconds=60, threshold_bps=3, min_move=0, max_lag_ms=2000)
-
-    assert set(event) == {"lead_lag"}
-    assert event["lead_lag"]["symbol"] == "JP225"
-    assert "summary" in event["lead_lag"]
-
 def test_hedge_groups_api_returns_realtime_spreads() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
