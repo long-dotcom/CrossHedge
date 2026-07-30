@@ -57,8 +57,9 @@ function detailItems(row: any) {
   return [
     { key: 'execution_intent', label: '最近执行 Intent', children: execution ? `#${execution.intent_id} ${execution.intent_type} / ${execution.status}` : '-' },
     { key: 'execution_event', label: '最近执行阶段', children: execution?.latest_event_type || '-' },
-    { key: 'execution_pending', label: '待确认订单', children: execution ? `${execution.pending_orders}/${execution.total_orders}` : '-' },
-    { key: 'execution_error', label: '执行信息/失败原因', children: <EllipsisCell value={execution?.error_message || '-'} /> },
+    { key: 'execution_pending', label: '执行腿 / 场所订单', children: execution ? `${execution.planned_legs || 0} 条待发送腿；${execution.pending_orders}/${execution.total_orders} 场所订单待确认` : '-' },
+    { key: 'execution_outbox', label: '发送队列', children: execution ? `${execution.outbox_status || '-'} / 尝试 ${execution.outbox_attempts || 0} 次` : '-' },
+    { key: 'execution_error', label: '执行信息/门禁原因', children: <EllipsisCell value={execution?.error_message || execution?.outbox_error || '-'} /> },
     { key: 'leg_b_quantity', label: `${legTitle(row, 'b')} 数量`, children: fmtAdaptive(row.leg_b_quantity, 2, 6) },
     { key: 'leg_a_quantity', label: `${legTitle(row, 'a')} 数量`, children: fmtAdaptive(row.leg_a_quantity, 4, 8) },
     { key: 'trigger_spread', label: '触发价差', children: fmtSpread(row.trigger_spread) },

@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.core.type_utils import safe_float
 from app.db.models import ExecutionIntent, ExecutionLeg, Fill, HedgeGroup, Order, SymbolMapping, VenueOrder
+from app.execution.fees import commission_cost
 
 
 @dataclass(frozen=True)
@@ -177,11 +178,69 @@ def liquidation_pnl_from_close_spread(group: HedgeGroup, close_spread: float) ->
 def realized_pnl_from_fills(
     db: Session, group: HedgeGroup, *, mapping: SymbolMapping | None = None,
 ) -> float | None:
-    """根据平仓 Fill 记录计算已实现盈亏。"""
+    """根据完整开平仓成交事实计算已实现盈亏。
+
+    原生场所事件可能晚于 Worker 的首次完成回报到达，因此不能假定
+    ``group.entry_spread`` 已经先被异步投影写回。
+    """
+    entry_spread = actual_entry_spread_from_fills(db, group, mapping=mapping)
     close_spread = actual_close_spread_from_fills(db, group, mapping=mapping)
-    if close_spread is None:
+    if entry_spread is None or close_spread is None:
         return None
-    return pnl_from_close_spread(group, close_spread)
+    return projected_pnl(
+        entry_spread,
+        close_spread,
+        safe_float(group.leg_a_quantity or group.quantity),
+        execution_commission_total(db, group.id),
+    ).net_pnl
+
+
+def execution_commission_total(db: Session, group_id: int) -> float:
+    """返回组级实际手续费；新执行模型存在时以 VenueOrder 为权威。"""
+    rows = (
+        db.query(VenueOrder.commission)
+        .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+        .join(ExecutionIntent, ExecutionIntent.id == ExecutionLeg.intent_id)
+        .filter(ExecutionIntent.hedge_group_id == group_id)
+        .all()
+    )
+    if rows:
+        return sum(max(safe_float(value), 0.0) for (value,) in rows)
+    legacy = (
+        db.query(Fill.platform, Fill.fee)
+        .join(Order, Order.id == Fill.order_id)
+        .filter(Order.hedge_group_id == group_id)
+        .all()
+    )
+    return sum(commission_cost(platform, fee) for platform, fee in legacy)
+
+
+def refresh_closed_group_financials(db: Session, group: HedgeGroup) -> bool:
+    """用最终成交事实幂等刷新已平仓组的价差、手续费和已实现盈亏。"""
+    if str(group.status or "") != "closed":
+        return False
+    entry_spread = actual_entry_spread_from_fills(db, group)
+    close_spread = actual_close_spread_from_fills(db, group)
+    if entry_spread is None or close_spread is None:
+        return False
+    fees = execution_commission_total(db, group.id)
+    realized = projected_pnl(
+        entry_spread,
+        close_spread,
+        safe_float(group.leg_a_quantity or group.quantity),
+        fees,
+    ).net_pnl
+    changed = any((
+        abs(safe_float(group.entry_spread) - entry_spread) > 1e-12,
+        abs(safe_float(group.fees) - fees) > 1e-12,
+        abs(safe_float(group.realized_pnl) - realized) > 1e-12,
+        abs(safe_float(group.unrealized_pnl)) > 1e-12,
+    ))
+    group.entry_spread = entry_spread
+    group.fees = fees
+    group.realized_pnl = realized
+    group.unrealized_pnl = 0.0
+    return changed
 
 
 def weighted_fill_price(

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import as_dict, _leg_metadata_for_symbol, audit
 from app.auth.dependencies import get_current_user, require_admin
-from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, HedgeGroup, Order, User, VenueOrder
+from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, Order, User, VenueOrder
 from app.db.session import get_db
 from app.execution.actions import hedge_group_actions
 from app.execution.coordinator import create_close_intent, create_recovery_intent
@@ -29,7 +29,9 @@ from app.execution.pnl import (
     actual_close_spread_from_fills,
     actual_close_time_from_fills,
     actual_entry_spread_from_fills,
+    execution_commission_total,
     pnl_breakdown_from_close_spread,
+    realized_pnl_from_fills,
 )
 from app.market.hedge_spreads import hedge_group_spreads
 from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn, VoidHedgeGroupIn
@@ -63,6 +65,13 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot, le
             data["entry_spread"] = None
         data["actual_close_spread"] = actual_close_spread_from_fills(db, group)
         data["actual_close_time"] = actual_close_time_from_fills(db, group)
+        if group.status == "closed":
+            realized = realized_pnl_from_fills(db, group)
+            if realized is not None:
+                data["realized_pnl"] = realized
+                data["unrealized_pnl"] = 0.0
+                data["fees"] = execution_commission_total(db, group.id)
+                data["accrued_fees"] = data["fees"]
     spreads = hedge_group_spreads(group)
     data.update(spreads)
     current_close_spread = spreads.get("current_close_spread")
@@ -108,6 +117,13 @@ def _execution_summary(db: Session, group_id: int) -> dict[str, Any] | None:
         .order_by(VenueOrder.id)
         .all()
     )
+    legs = db.query(ExecutionLeg).filter(ExecutionLeg.intent_id == intent.id).all()
+    outbox = (
+        db.query(ExecutionOutbox)
+        .filter(ExecutionOutbox.intent_id == intent.id)
+        .order_by(ExecutionOutbox.id.desc())
+        .first()
+    )
     pending = sum(1 for order in orders if order.status in {
         "INITIALIZED", "NEW", "SUBMITTED", "ACCEPTED", "PENDING", "OPEN", "PARTIALLY_FILLED", "UNKNOWN",
     })
@@ -120,6 +136,12 @@ def _execution_summary(db: Session, group_id: int) -> dict[str, Any] | None:
         "latest_event_type": latest_event.event_type if latest_event else "",
         "pending_orders": pending,
         "total_orders": len(orders),
+        "planned_legs": sum(1 for leg in legs if str(leg.status or "").upper() == "PLANNED"),
+        "total_legs": len(legs),
+        "outbox_status": outbox.status if outbox else "",
+        "outbox_attempts": int(outbox.attempts or 0) if outbox else 0,
+        "outbox_error": outbox.last_error if outbox else "",
+        "outbox_available_at": outbox.available_at if outbox else None,
         "created_at": intent.created_at,
         "updated_at": intent.updated_at,
     }
@@ -150,6 +172,10 @@ def _execution_history(db: Session, group_id: int) -> list[dict[str, Any]]:
             ]
             leg_items.append(leg_item)
         item["legs"] = leg_items
+        item["outboxes"] = [
+            as_dict(row) for row in
+            db.query(ExecutionOutbox).filter(ExecutionOutbox.intent_id == intent.id).order_by(ExecutionOutbox.id).all()
+        ]
         result.append(item)
     return result
 

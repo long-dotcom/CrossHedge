@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
@@ -28,6 +29,7 @@ from app.venues.manager import native_venue_manager
 
 AdapterFactory = Callable[[str, str], Any]
 logger = get_logger(__name__)
+_next_stale_predispatch_repair_at = 0.0
 
 NON_TERMINAL_ORDER_STATUSES = {
     "INITIALIZED", "NEW", "SUBMITTED", "ACCEPTED", "PENDING", "OPEN",
@@ -74,7 +76,12 @@ def run_execution_outbox_once(
     processing_timeout_seconds: int = 30,
 ) -> int:
     """领取并处理一批 Outbox 命令，返回领取数量。"""
+    global _next_stale_predispatch_repair_at
     factory = adapter_factory or _default_adapter_factory
+    monotonic_now = time.monotonic()
+    if monotonic_now >= _next_stale_predispatch_repair_at:
+        repair_stale_predispatch_intents_once(session_factory=session_factory)
+        _next_stale_predispatch_repair_at = monotonic_now + 60.0
     # 私有 WS 是订单确认主路径；REST 查单只允许启动或断线重连后的单次补偿。
     from app.execution.venue_events import consume_reconciliation_request, project_venue_events_once
 
@@ -97,6 +104,67 @@ def run_execution_outbox_once(
     for claim in claims:
         _process_claim(session_factory, factory, claim)
     return len(claims)
+
+
+def repair_stale_predispatch_intents_once(
+    *,
+    session_factory: sessionmaker = SessionLocal,
+    stale_after_seconds: int = 300,
+) -> int:
+    """安全回滚从未创建 VenueOrder/执行事件的陈旧平仓 Intent。
+
+    执行协议保证 VenueOrder 在任何外部提交之前提交到数据库。因此全部执行腿仍为
+    PLANNED，且没有 VenueOrder、ExecutionEvent 的 Intent 可以确定为零外部副作用。
+    单腿成交或结果未知的异常组不会进入此恢复路径。
+    """
+    cutoff = utc_now() - timedelta(seconds=max(int(stale_after_seconds), 1))
+    repaired = 0
+    with session_factory() as db:
+        intents = (
+            db.query(ExecutionIntent)
+            .filter(
+                ExecutionIntent.intent_type == "CLOSE",
+                ExecutionIntent.status.in_({"CREATED", "RUNNING", "RECOVERY_REQUIRED"}),
+                ExecutionIntent.created_at <= cutoff,
+            )
+            .order_by(ExecutionIntent.id)
+            .all()
+        )
+        for intent in intents:
+            legs = db.query(ExecutionLeg).filter(ExecutionLeg.intent_id == intent.id).all()
+            if not legs or any(str(leg.status or "").upper() != "PLANNED" for leg in legs):
+                continue
+            has_order = (
+                db.query(VenueOrder.id)
+                .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+                .filter(ExecutionLeg.intent_id == intent.id)
+                .first()
+                is not None
+            )
+            has_event = db.query(ExecutionEvent.id).filter(ExecutionEvent.intent_id == intent.id).first() is not None
+            if has_order or has_event:
+                continue
+            outboxes = db.query(ExecutionOutbox).filter(ExecutionOutbox.intent_id == intent.id).all()
+            previous_status = "open"
+            for outbox in outboxes:
+                payload = _outbox_payload(outbox)
+                candidate = str(payload.get("previous_group_status") or "open")
+                if candidate in {"open", "open_partial"}:
+                    previous_status = candidate
+                outbox.status = "CANCELED"
+                outbox.locked_at = None
+                outbox.last_error = "陈旧预提交 Intent 未产生任何外部订单，已安全回滚"
+            intent.status = "FAILED"
+            intent.error_message = "陈旧预提交 Intent 未产生任何外部订单，已安全回滚"
+            intent.completed_at = utc_now()
+            group = db.get(HedgeGroup, intent.hedge_group_id) if intent.hedge_group_id else None
+            if group is not None and group.status == "closing":
+                group.status = previous_status
+                group.close_reason = f"平仓 Intent #{intent.id} 未产生外部订单，已恢复持仓状态"
+                _add_group_event_once(db, group.id, "close_intent_rolled_back", group.close_reason)
+            repaired += 1
+        db.commit()
+    return repaired
 
 
 def advance_execution_timers_once(
@@ -957,15 +1025,13 @@ def _project_hedge_group_state(
         event_type = "recovery_intent_completed" if recovery else "close_intent_completed"
         _add_group_event_once(db, group.id, event_type, f"Intent #{intent.id} 已确认全部成交")
         try:
-            from app.execution.pnl import realized_pnl_from_fills
+            from app.execution.pnl import refresh_closed_group_financials
 
-            realized = realized_pnl_from_fills(db, group)
-            if realized is not None:
-                group.realized_pnl = realized
-                group.unrealized_pnl = 0.0
-        except Exception:
+            db.flush()
+            refresh_closed_group_financials(db, group)
+        except Exception as exc:
             # PnL 投影失败不能篡改已确认的订单成交事实，后续统计任务可重算。
-            pass
+            logger.exception("已平仓组财务投影失败: group_id={}, intent_id={}, error={}", group.id, intent.id, exc)
     elif "FAILED" in statuses:
         if filled_any or has_nonterminal:
             group.status = "manual_intervention"

@@ -13,7 +13,7 @@ from datetime import datetime, time, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, func
+from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.accounts.sync import latest_account_snapshots
@@ -28,7 +28,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.execution.hedge_pool import hedge_pool
-from app.execution.pnl import pnl_breakdown_from_close_spread
+from app.execution.pnl import pnl_breakdown_from_close_spread, realized_pnl_from_fills
 from app.core.time_utils import utc_now
 from app.market.hedge_spreads import hedge_group_spreads
 from app.db.models import User
@@ -89,25 +89,22 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     ).count()
     alerts = db.query(Alert).filter(Alert.acknowledged.is_(False)).count()
     risk = db.query(RiskSetting).first()
-    realized_pnl = float(
-        db.query(func.coalesce(func.sum(HedgeGroup.realized_pnl), 0.0))
-        .filter(HedgeGroup.status == "closed")
-        .scalar()
-        or 0.0
-    )
+    closed_groups = db.query(HedgeGroup).filter(HedgeGroup.status == "closed").all()
+    realized_by_group: dict[int, float] = {}
+    for group in closed_groups:
+        calculated = realized_pnl_from_fills(db, group)
+        realized_by_group[group.id] = (
+            calculated if calculated is not None else float(group.realized_pnl or 0.0)
+        )
+    realized_pnl = sum(realized_by_group.values())
     # 数据库时间统一保存为 naive UTC；“今日”也必须使用同一时区边界，
     # 否则历史已平仓收益会被错误地永久计入今日盈亏。
     day_start = datetime.combine(utc_now().date(), time.min)
     day_end = day_start + timedelta(days=1)
-    today_realized_pnl = float(
-        db.query(func.coalesce(func.sum(HedgeGroup.realized_pnl), 0.0))
-        .filter(
-            HedgeGroup.status == "closed",
-            HedgeGroup.closed_at >= day_start,
-            HedgeGroup.closed_at < day_end,
-        )
-        .scalar()
-        or 0.0
+    today_realized_pnl = sum(
+        realized_by_group[group.id]
+        for group in closed_groups
+        if group.closed_at is not None and day_start <= group.closed_at < day_end
     )
     unrealized_pnl, remaining_close_fees = _runtime_open_pnl(db)
     return {

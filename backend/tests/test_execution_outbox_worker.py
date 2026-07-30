@@ -6,9 +6,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
-from app.db.models import Base, ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Order, SystemLog, VenueOrder
+from app.db.models import Base, ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, HedgeGroup, Order, SystemLog, VenueOrder
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
-from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
+from app.execution.outbox_worker import (
+    reconcile_execution_orders_once,
+    repair_stale_predispatch_intents_once,
+    run_execution_outbox_once,
+)
 from tests.native_fakes import order_snapshot
 
 
@@ -218,3 +222,80 @@ def test_unknown_submit_failure_keeps_recovery_state_and_records_reason() -> Non
         assert outbox.status == "PROCESSING"
         assert "提交结果未知" in outbox.last_error
         assert db.query(SystemLog).filter_by(category="execution").count() == 1
+
+
+def test_stale_predispatch_close_is_rolled_back_only_without_external_facts() -> None:
+    factory = _factory_and_session()
+    with factory() as db:
+        group = HedgeGroup(
+            symbol="GOLD", direction="long_leg_b_short_leg_a", status="closing",
+            execution_mode="paper", notional=4000, quantity=1,
+            leg_a_quantity=1, leg_b_quantity=0.01,
+        )
+        db.add(group)
+        db.flush()
+        result = create_execution_intent(
+            db,
+            intent_type="CLOSE",
+            execution_mode="paper",
+            execution_style="maker_then_market",
+            idempotency_key="stale-close-without-submit",
+            hedge_group_id=group.id,
+            legs=[ExecutionLegPlan(
+                leg_key="leg_a", venue="binance", instrument_id="XAUUSDT",
+                venue_symbol="XAUUSDT", action="CLOSE", position_side="SHORT",
+                order_side="BUY", strategy_quantity=1, venue_order_quantity=1,
+                order_type="limit", post_only=True, role="MAKER",
+            )],
+            command_payload={"previous_group_status": "open"},
+        )
+        result.intent.created_at = utc_now() - timedelta(minutes=10)
+        intent_id = result.intent.id
+        group_id = group.id
+        db.commit()
+
+    assert repair_stale_predispatch_intents_once(
+        session_factory=factory, stale_after_seconds=60,
+    ) == 1
+
+    with factory() as db:
+        assert db.get(ExecutionIntent, intent_id).status == "FAILED"
+        assert db.get(HedgeGroup, group_id).status == "open"
+        assert db.query(ExecutionOutbox).one().status == "CANCELED"
+        assert db.query(VenueOrder).count() == 0
+
+        protected = HedgeGroup(
+            symbol="GOLD", direction="long_leg_b_short_leg_a", status="closing",
+            execution_mode="paper", notional=4000, quantity=1,
+            leg_a_quantity=1, leg_b_quantity=0.01,
+        )
+        db.add(protected)
+        db.flush()
+        protected_result = create_execution_intent(
+            db,
+            intent_type="CLOSE", execution_mode="paper",
+            idempotency_key="stale-close-with-external-fact", hedge_group_id=protected.id,
+            legs=[ExecutionLegPlan(
+                leg_key="leg_a", venue="binance", instrument_id="XAUUSDT",
+                venue_symbol="XAUUSDT", action="CLOSE", position_side="SHORT",
+                order_side="BUY", strategy_quantity=1, venue_order_quantity=1,
+            )],
+            command_payload={"previous_group_status": "open"},
+        )
+        protected_result.intent.created_at = utc_now() - timedelta(minutes=10)
+        protected_leg = db.query(ExecutionLeg).filter_by(intent_id=protected_result.intent.id).one()
+        db.add(VenueOrder(
+            execution_leg_id=protected_leg.id, client_order_id="protected-order",
+            status="INITIALIZED", requested_quantity=1, filled_quantity=0,
+            remaining_quantity=1,
+        ))
+        protected_id = protected.id
+        protected_intent_id = protected_result.intent.id
+        db.commit()
+
+    assert repair_stale_predispatch_intents_once(
+        session_factory=factory, stale_after_seconds=60,
+    ) == 0
+    with factory() as db:
+        assert db.get(ExecutionIntent, protected_intent_id).status == "CREATED"
+        assert db.get(HedgeGroup, protected_id).status == "closing"
