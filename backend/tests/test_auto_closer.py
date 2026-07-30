@@ -35,7 +35,7 @@ def test_auto_close_uses_mapping_venues_for_quote_sync(monkeypatch) -> None:
 
     monkeypatch.setattr("app.execution.auto_closer.quote_synchronizer.synchronized", synchronized)
     monkeypatch.setattr("app.execution.auto_closer.estimated_pair_close_fee", lambda *_args: 0.0)
-    strategy = SimpleNamespace(auto_close_min_profit=0.0, max_holding_minutes=60)
+    strategy = SimpleNamespace(max_holding_minutes=60)
     mapping = SimpleNamespace(
         symbol="GOLD", leg_a_venue="binance", leg_b_venue="mt5",
         max_close_spread=0.0, max_holding_minutes=60,
@@ -45,6 +45,33 @@ def test_auto_close_uses_mapping_venues_for_quote_sync(monkeypatch) -> None:
 
     assert calls[0]["leg_a_venue"] == "binance"
     assert calls[0]["leg_b_venue"] == "mt5"
+
+
+def test_auto_close_does_not_block_negative_estimated_profit(monkeypatch) -> None:
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=100.0, ask=101.0),
+        leg_b=SimpleNamespace(bid=101.0, ask=102.0),
+    )
+    monkeypatch.setattr(
+        "app.execution.auto_closer.quote_synchronizer.synchronized",
+        lambda *_args, **_kwargs: (synced, ""),
+    )
+    monkeypatch.setattr("app.execution.auto_closer.estimated_pair_close_fee", lambda *_args: 0.0)
+    strategy = SimpleNamespace(max_holding_minutes=60)
+    mapping = SimpleNamespace(
+        symbol="GOLD", leg_a_venue="binance", leg_b_venue="mt5",
+        max_close_spread=0.0, max_holding_minutes=60,
+    )
+
+    evaluation = evaluate_auto_close(
+        SimpleNamespace(),
+        strategy,
+        _snapshot(exit_target=3.0, fees=100.0),
+        mapping=mapping,
+    )
+
+    assert evaluation.should_close is True
+    assert evaluation.estimated_profit < 0
 
 
 def test_pnl_ignores_legacy_funding_and_swap_fields() -> None:

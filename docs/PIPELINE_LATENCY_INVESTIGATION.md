@@ -27,7 +27,7 @@
 - 双腿报价同步读取 2 次 Redis；
 - Hyperliquid 用户费率与市场元数据缓存读取 2 次 Redis；
 - 两个方向各执行一次 `mt5_cost_inputs`，合计 2 次 `ExchangeCredential` 数据库查询，以及 instrument/ticker/account 共 6 次 Redis；
-- 每个方向进行两轮信号评估，合计 4 次信号统计 Redis 缓存读取；
+- 每个方向进行一轮信号评估，并复用扫描开始时批量取得的统计快照，不再因利润门槛执行第二轮评估；
 - 非 USD 结算品种还会增加 FX 缓存/MT5 tick 读取。
 
 因此调查时单个品种稳定状态下也可能达到约 15 次 Redis 往返和 2 次 PostgreSQL 查询，而且都在扫描线程中串行等待。如果 Redis/数据库存在几十毫秒 RTT、连接池等待或宿主机资源竞争，单品种接近 1 秒是合理结果。`native_venue_manager.connector_for("mt5")` 即使连接器已经存在，也会先新建数据库 Session 查询凭据；`mt5_cost_inputs` 又在两个方向分别调用它，是最明确的重复数据库访问点。
@@ -50,7 +50,7 @@ MT5 Gateway 每轮先读取账户和全部持仓，再逐个订阅品种串行�
 
 ### 5. 扫描器串行处理与重叠外部读取
 
-主扫描按品种串行运行，每个方向执行两轮信号评估。统计缓存未命中时还会查询历史价差数据。当前 `SCANNER_INTERVAL_MS=1000` 也是在整轮扫描结束后重新计时，因此结果刷新周期为“扫描总耗时 + 1000ms”。MT5 Swap 预测读取已经移除，不再属于当前热路径。
+主扫描按品种串行运行，每个方向执行一轮信号评估。统计缓存未命中时还会查询历史价差数据。当前 `SCANNER_INTERVAL_MS=1000` 也是在整轮扫描结束后重新计时，因此结果刷新周期为“扫描总耗时 + 1000ms”。MT5 Swap 预测读取和第二轮利润门槛评估已经移除，不再属于当前热路径。
 
 ### 6. SSE 展示刷新
 
@@ -78,7 +78,7 @@ Pipeline SSE 默认每 1000ms 生成一次快照，并使用约 800ms 的共享�
 - `sizing_duration_ms`：两腿数量和 FX 换算；
 - `venue_cost_a_duration_ms` / `venue_cost_b_duration_ms`：两腿手续费输入；
 - `cost_compute_duration_ms`：纯本地价差和手续费计算；
-- `signal_first_duration_ms` / `signal_second_duration_ms`：两轮信号评估；
+- `signal_duration_ms`：不含利润门槛的单轮信号评估；
 - `projection_duration_ms`：退出线和收益计算；
 - `gates_duration_ms`：信号、流动性和市场门控；
 - `candidate_build_duration_ms`：候选与机会载荷构造；

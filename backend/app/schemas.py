@@ -40,21 +40,15 @@ class TokenResponse(BaseModel):
 
 class StrategySettingsIn(BaseModel):
     """策略参数全量更新请求体。"""
-    min_net_profit: float
-    min_annualized_return: float
-    signal_mode: str = "statistical"
     statistical_lookback_range: str = "1h"
     statistical_min_samples: int = 200
     reachable_entry_percentile: float = 0.75
     reachable_entry_zscore: float = 1.0
     cost_guard_percentile: float = 0.90
     min_unit_edge: float = 0.0
-    min_total_profit: float = 0.5
     auto_close_enabled: bool = True
     auto_close_live_enabled: bool = False
     exit_target_percentile: float = 0.25
-    auto_close_unit_profit_buffer: float = 0.0
-    auto_close_min_profit: float = 0.0
     default_notional: float
     max_holding_minutes: int
     execution_mode: str
@@ -66,7 +60,6 @@ class StrategySettingsIn(BaseModel):
     auto_execute_cooldown_seconds: int = 30
     auto_execute_max_per_symbol_open_groups: int = 1
     auto_execute_max_global_open_groups: int = 3
-    auto_execute_min_net_profit: float = 0.0
     paper_decision_delay_ms_min: int = 50
     paper_decision_delay_ms_max: int = 200
     paper_leg_a_latency_ms_min: int = 80

@@ -7,12 +7,11 @@ from threading import RLock
 
 from sqlalchemy.orm import Session
 
-from app.db.models import ArbitrageOpportunity, StrategySetting, SymbolMapping, SystemSetting
+from app.db.models import ArbitrageOpportunity, SymbolMapping, SystemSetting
 from app.execution.readiness import live_execution_readiness, paper_execution_readiness
 from app.market.active_refresh import refresh_execution_quotes
 from app.market.quotes import quote_synchronizer
 from app.strategy.spread_math import spreads_for_direction
-from app.execution.pnl import projected_pnl
 
 
 OPEN_CAPACITY_LOCK = RLock()
@@ -73,9 +72,8 @@ def strict_sync_for_execution(mapping: SymbolMapping, symbol: str, settings) -> 
 def refreshed_opportunity_still_executable(
     opportunity: ArbitrageOpportunity,
     synced,
-    strategy: StrategySetting,
 ) -> tuple[bool, str]:
-    """使用执行前当前 BBO 重新计算入场线和最低净利润。"""
+    """使用执行前当前 BBO 重新检查入场线。"""
     spread = spreads_for_direction(
         opportunity.direction,
         synced.leg_a.bid,
@@ -86,17 +84,6 @@ def refreshed_opportunity_still_executable(
     threshold = float(opportunity.entry_threshold or 0.0)
     if threshold > 0 and spread < threshold:
         return False, f"执行前当前价差不再满足入场线: {spread:.6f} < {threshold:.6f}"
-    quantity = float(opportunity.leg_a_quantity or opportunity.quantity or 0.0)
-    # 与扫描阶段使用同一公式：当前入场价差必须扣除退出目标和预计往返手续费。
-    net_profit = projected_pnl(
-        spread,
-        float(opportunity.exit_target or 0.0),
-        quantity,
-        float(opportunity.total_cost or 0.0),
-    ).net_pnl
-    minimum = max(float(strategy.min_total_profit or 0.0), float(strategy.min_net_profit or 0.0))
-    if net_profit < minimum:
-        return False, f"执行前当前净利润不足: {net_profit:.2f} < {minimum:.2f}"
     return True, ""
 
 

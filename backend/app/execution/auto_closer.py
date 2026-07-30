@@ -164,22 +164,19 @@ def evaluate_auto_close(
         estimated_close_fee=live_close_fee,
     ).net_pnl
 
-    min_profit = float(strategy.auto_close_min_profit or 0.0)
     hold_expired = _hold_expired(snapshot, strategy, mapping)
     if force:
         return CloseEvaluation(True, f"手工强制平仓: 估算利润 {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
-    if estimated_profit < min_profit:
-        return CloseEvaluation(False, f"估算平仓利润不足: {estimated_profit:.2f} < {min_profit:.2f}", close_spread, exit_target, estimated_profit)
     if exit_target <= 0:
         if close_spread <= 0:
             return CloseEvaluation(True, f"无统计退出线但平仓价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
         if hold_expired:
-            return CloseEvaluation(True, f"缺少退出线但超过最大持仓时间且利润达标: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
+            return CloseEvaluation(True, f"缺少退出线但已超过最大持仓时间: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
         return CloseEvaluation(False, "缺少退出线，等待更多统计样本", close_spread, exit_target, estimated_profit)
     if close_spread <= exit_target:
         return CloseEvaluation(True, f"平仓价差回归至退出线: {close_spread:.2f} <= {exit_target:.2f}", close_spread, exit_target, estimated_profit)
     if hold_expired:
-        return CloseEvaluation(True, f"超过最大持仓时间且利润达标: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
+        return CloseEvaluation(True, f"超过最大持仓时间: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     return CloseEvaluation(False, f"等待平仓价差回归: {close_spread:.2f} > {exit_target:.2f}", close_spread, exit_target, estimated_profit)
 
 

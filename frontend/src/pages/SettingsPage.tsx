@@ -411,9 +411,6 @@ export function SettingsPage() {
                     <section className="settings-group">
                       <div className="settings-group-title">信号与执行</div>
                       <div className="settings-field-grid">
-                        <Form.Item name="signal_mode" label="信号模式">
-                          <Select options={[{ value: 'statistical', label: '统计可达入场线' }, { value: 'fixed_profit', label: '固定净利润' }]} />
-                        </Form.Item>
                         <Form.Item name="execution_mode" label="执行模式"><Select options={[{ value: 'dry_run' }, { value: 'paper' }, { value: 'live' }]} /></Form.Item>
                         <Form.Item name="auto_execute_confirm_ticks" label="确认次数"><InputNumber min={1} step={1} /></Form.Item>
                         <Form.Item name="auto_execute_min_hold_ms" label="最小持续毫秒"><InputNumber min={0} step={50} /></Form.Item>
@@ -432,8 +429,6 @@ export function SettingsPage() {
                         <Form.Item name="reachable_entry_percentile" label="可达入场分位数"><InputNumber min={0.5} max={0.95} step={0.01} /></Form.Item>
                         <Form.Item name="reachable_entry_zscore" label="可达入场 Z 倍数"><InputNumber min={0} step={0.1} /></Form.Item>
                         <Form.Item name="cost_guard_percentile" label="成本保护分位数"><InputNumber min={0.5} max={0.99} step={0.01} /></Form.Item>
-                        <Form.Item name="min_total_profit" label="最小总净利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
-                        <Form.Item name="min_net_profit" label="固定净利润模式阈值 USD"><InputNumber min={0} step={0.1} /></Form.Item>
                         <Form.Item name="min_unit_edge" label="最小每份边际"><InputNumber min={0} step={0.1} /></Form.Item>
                       </div>
                     </section>
@@ -444,10 +439,6 @@ export function SettingsPage() {
                         <Form.Item name="auto_close_enabled" label="自动平仓" valuePropName="checked"><Switch /></Form.Item>
                         <Form.Item name="auto_close_live_enabled" label="Live 自动平仓" valuePropName="checked"><Switch /></Form.Item>
                         <Form.Item name="exit_target_percentile" label="平仓价差退出低分位数"><InputNumber min={0.05} max={0.5} step={0.01} /></Form.Item>
-                        <Form.Item name="auto_close_unit_profit_buffer" label="每份平仓利润缓冲"><InputNumber min={0} step={0.01} /></Form.Item>
-                        <Form.Item name="auto_close_min_profit" label="自动平仓最小利润 USD"><InputNumber min={0} step={0.1} /></Form.Item>
-                        <Form.Item name="auto_execute_min_net_profit" label="自动执行额外最小净利润"><InputNumber min={0} step={0.1} /></Form.Item>
-                        <Form.Item name="min_annualized_return" label="最小年化收益"><InputNumber min={0} step={0.01} /></Form.Item>
                       </div>
                     </section>
 

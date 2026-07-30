@@ -251,7 +251,6 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
     with factory() as db:
         db.add(StrategySetting(
             execution_mode="paper", paper_use_live_account_risk=False,
-            min_net_profit=0.0, min_total_profit=0.0,
         ))
         db.add(SymbolMapping(
             symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
@@ -318,7 +317,6 @@ def test_open_request_rechecks_current_bbo_even_without_active_refresh(monkeypat
     with factory() as db:
         db.add(StrategySetting(
             execution_mode="paper", paper_use_live_account_risk=False,
-            min_net_profit=0.0, min_total_profit=0.0,
         ))
         db.add(SymbolMapping(
             symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
@@ -357,7 +355,6 @@ def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) ->
     with factory() as db:
         db.add(StrategySetting(
             execution_mode="paper", paper_use_live_account_risk=False,
-            min_net_profit=0.0, min_total_profit=0.0,
         ))
         db.add(SymbolMapping(
             symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
@@ -563,7 +560,7 @@ def test_recovery_intent_refuses_unknown_pending_order() -> None:
             )
 
 
-def test_execution_recheck_uses_exit_target_and_round_trip_fees() -> None:
+def test_execution_recheck_does_not_apply_profit_limit() -> None:
     opportunity = SimpleNamespace(
         direction="long_leg_a_short_leg_b",
         entry_threshold=1.0,
@@ -576,12 +573,10 @@ def test_execution_recheck_uses_exit_target_and_round_trip_fees() -> None:
         leg_a=SimpleNamespace(bid=99.0, ask=100.0),
         leg_b=SimpleNamespace(bid=102.0, ask=103.0),
     )
-    strategy = SimpleNamespace(min_total_profit=0.0, min_net_profit=0.0)
+    allowed, reason = refreshed_opportunity_still_executable(opportunity, synced)
 
-    allowed, reason = refreshed_opportunity_still_executable(opportunity, synced, strategy)
-
-    assert allowed is False
-    assert "净利润不足" in reason
+    assert allowed is True
+    assert reason == ""
 
 
 def test_observed_slippage_uses_price_move_not_quote_timestamp_gap() -> None:

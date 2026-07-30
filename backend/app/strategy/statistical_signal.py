@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.analytics.spreads import SpreadPoint, load_spread_points
 from app.db.models import StrategySetting, SymbolMapping
-from app.strategy.signals import SignalResult, evaluate_signal
+from app.strategy.signals import SignalResult
 from app.config.settings import get_settings
 from app.core.cache import TTLCache
 from app.core.logging import get_logger
@@ -81,16 +81,12 @@ def evaluate_entry_signal(
     direction: str,
     current_spread: float,
     unit_cost: float,
-    unit_net_profit: float,
-    total_net_profit: float,
-    annualized_return: float,
     *,
     stats: SignalStats | None = None,
 ) -> StatisticalSignal:
     """评估入场信号。
 
-    当 ``strategy.signal_mode != "statistical"`` 时使用简单阈值判定；
-    否则使用基于历史价差分布的统计模型。
+    使用基于历史价差分布的统计模型。
 
     参数:
         db: 数据库会话
@@ -99,38 +95,16 @@ def evaluate_entry_signal(
         direction: 方向
         current_spread: 当前价差
         unit_cost: 单位成本
-        unit_net_profit: 单位净利润
-        total_net_profit: 总净利润
-        annualized_return: 年化收益率
-
     返回:
         StatisticalSignal 包含完整信号判定信息
     """
-    # 非统计模式：使用简单阈值
-    if strategy.signal_mode != "statistical":
-        return StatisticalSignal(
-            result=evaluate_signal(total_net_profit, annualized_return, strategy.min_net_profit, strategy.min_annualized_return),
-            reachable_entry=0.0,
-            cost_guard=unit_cost,
-            strong_entry=0.0,
-            exit_target=0.0,
-            overheat=0.0,
-            sample_count=0,
-        )
-
     stats = stats or _signal_stats(db, strategy, symbol, direction)
     # 样本不足时仅返回候选状态
     if stats.sample_count < strategy.statistical_min_samples:
         result = SignalResult("candidate", f"统计样本不足 {stats.sample_count}/{strategy.statistical_min_samples}，等待参考数据")
         return StatisticalSignal(result, 0.0, unit_cost, 0.0, 0.0, 0.0, stats.sample_count)
 
-    # 计算带利润缓冲的出场目标
-    exit_target = _exit_target_with_profit_buffer(
-        percentile_target=stats.exit_percentile_target,
-        entry_spread=current_spread,
-        unit_cost=stats.cost_guard,
-        unit_profit_buffer=_strategy_float(strategy, "auto_close_unit_profit_buffer", 0.0),
-    )
+    exit_target = stats.exit_percentile_target
     unit_edge = current_spread - stats.cost_guard
 
     # 多级信号判定
@@ -140,8 +114,6 @@ def evaluate_entry_signal(
         result = SignalResult("candidate", f"价差 {current_spread:.2f} 未达到可达入场线 {stats.reachable_entry:.2f}")
     elif unit_edge < _strategy_float(strategy, "min_unit_edge", 0.0):
         result = SignalResult("candidate", f"每份边际 {unit_edge:.2f} 低于最小边际 {_strategy_float(strategy, 'min_unit_edge', 0.0):.2f}")
-    elif total_net_profit < _strategy_float(strategy, "min_total_profit", 0.0):
-        result = SignalResult("candidate", f"总净利润 {total_net_profit:.2f} 低于最小总利润 {_strategy_float(strategy, 'min_total_profit', 0.0):.2f}")
     else:
         result = SignalResult("executable", f"达到可达入场线 {stats.reachable_entry:.2f}，成本保护线 {stats.cost_guard:.2f}")
     return StatisticalSignal(result, stats.reachable_entry, stats.cost_guard, stats.strong_entry, exit_target, stats.overheat, stats.sample_count)
@@ -319,20 +291,3 @@ def _percentile(values: list[float], percentile: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     weight = index - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
-
-
-def _exit_target_with_profit_buffer(
-    *,
-    percentile_target: float,
-    entry_spread: float,
-    unit_cost: float,
-    unit_profit_buffer: float,
-) -> float:
-    """计算带利润缓冲的出场目标。
-
-    出场目标 = min(分位数目标, 入场价差 - 成本 - 缓冲)，确保出场时仍有利润。
-    """
-    profit_safe_target = entry_spread - max(unit_cost, 0.0) - max(unit_profit_buffer, 0.0)
-    if percentile_target <= 0 or profit_safe_target <= 0:
-        return 0.0
-    return min(percentile_target, profit_safe_target)
