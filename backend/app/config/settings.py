@@ -265,6 +265,7 @@ _ENV_MAPPING: dict[str, tuple[str, str]] = {
     # --- 根级 ---
     "APP_NAME":                          ("", "app_name"),
     "ENVIRONMENT":                       ("", "environment"),
+    "APP_TIMEZONE":                      ("", "app_timezone"),
     # --- DatabaseSettings ---
     "DATABASE_URL":                      ("database", "url"),
     "DATABASE_POOL_SIZE":                ("database", "pool_size"),
@@ -372,6 +373,8 @@ class Settings:
     app_name: str = "CrossHedge"
     # 运行环境：local / dev / production 等（ENVIRONMENT）
     environment: str = "local"
+    # 仪表盘“今日”等业务日期口径（APP_TIMEZONE）
+    app_timezone: str = "Asia/Hong_Kong"
 
     # 数据库配置
     database: DatabaseSettings = field(default_factory=DatabaseSettings)

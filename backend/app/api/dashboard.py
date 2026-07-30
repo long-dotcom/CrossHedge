@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc
@@ -30,6 +31,7 @@ from app.db.session import get_db
 from app.execution.hedge_pool import hedge_pool
 from app.execution.pnl import pnl_breakdown_from_close_spread, realized_pnl_from_fills
 from app.core.time_utils import utc_now
+from app.config.settings import get_settings
 from app.market.hedge_spreads import hedge_group_spreads
 from app.db.models import User
 
@@ -76,6 +78,28 @@ def _runtime_open_unrealized_pnl(db: Session) -> float:
     return _runtime_open_pnl(db)[0]
 
 
+def _local_day_utc_bounds(
+    now_utc: datetime | None = None,
+    timezone_name: str | None = None,
+) -> tuple[datetime, datetime]:
+    """把业务时区的本地自然日换算为数据库使用的 naive UTC 边界。"""
+    name = timezone_name or get_settings().app_timezone
+    try:
+        local_tz = ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        local_tz = timezone.utc
+    current = now_utc or utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    local_date = current.astimezone(local_tz).date()
+    local_start = datetime.combine(local_date, time.min, tzinfo=local_tz)
+    start_utc = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = (local_start + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None)
+    return start_utc, end_utc
+
+
 # ---------------------------------------------------------------------------
 # 内部辅助：仪表盘摘要
 # ---------------------------------------------------------------------------
@@ -97,10 +121,8 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
             calculated if calculated is not None else float(group.realized_pnl or 0.0)
         )
     realized_pnl = sum(realized_by_group.values())
-    # 数据库时间统一保存为 naive UTC；“今日”也必须使用同一时区边界，
-    # 否则历史已平仓收益会被错误地永久计入今日盈亏。
-    day_start = datetime.combine(utc_now().date(), time.min)
-    day_end = day_start + timedelta(days=1)
+    # 数据库保存 naive UTC，但“今日”是业务时区的本地自然日。
+    day_start, day_end = _local_day_utc_bounds()
     today_realized_pnl = sum(
         realized_by_group[group.id]
         for group in closed_groups
@@ -110,6 +132,7 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     return {
         "equity": equity,
         "today_pnl": today_realized_pnl + unrealized_pnl,
+        "today_realized_pnl": today_realized_pnl,
         "realized_pnl": realized_pnl,
         "unrealized_pnl": unrealized_pnl,
         "remaining_close_fees": remaining_close_fees,

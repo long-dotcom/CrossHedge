@@ -1,13 +1,13 @@
 """后端高频查询与 SSE 共享快照回归测试。"""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.accounts.sync import latest_account_snapshots
 from app.api import streaming
-from app.api.dashboard import _dashboard_summary_payload
+from app.api.dashboard import _dashboard_summary_payload, _local_day_utc_bounds
 from app.db.models import AccountSnapshot, Base, HedgeGroup
 from app.core.time_utils import utc_now
 
@@ -57,7 +57,17 @@ def test_dashboard_today_pnl_excludes_historical_realized_pnl() -> None:
     result = _dashboard_summary_payload(db)
 
     assert result["realized_pnl"] == 106
+    assert result["today_realized_pnl"] == 7
     assert result["today_pnl"] == 7
+
+
+def test_dashboard_today_uses_hong_kong_calendar_boundary() -> None:
+    start, end = _local_day_utc_bounds(
+        datetime(2026, 7, 30, 4, 0, 0), timezone_name="Asia/Hong_Kong",
+    )
+
+    assert start == datetime(2026, 7, 29, 16, 0, 0)
+    assert end == datetime(2026, 7, 30, 16, 0, 0)
 
 
 def test_sse_snapshot_is_shared_within_ttl(monkeypatch) -> None:
