@@ -33,7 +33,7 @@ export function DashboardPage() {
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8} xl={4}><DataCard title="总权益" value={fmtMoney(data.equity)} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="今日盈亏" value={fmtPnlSigned(data.today_pnl)} valueStyle={{ color: fmtPnlColor(data.today_pnl) }} /></Col>
-        <Col xs={24} md={8} xl={4}><DataCard title="已实现盈亏" value={fmtPnlSigned(data.realized_pnl)} valueStyle={{ color: fmtPnlColor(data.realized_pnl) }} /></Col>
+        <Col xs={24} md={8} xl={4}><DataCard title="今日已实现盈亏" value={fmtPnlSigned(data.today_realized_pnl)} valueStyle={{ color: fmtPnlColor(data.today_realized_pnl) }} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="可平仓未实现盈亏" value={fmtPnlSigned(data.unrealized_pnl)} valueStyle={{ color: fmtPnlColor(data.unrealized_pnl) }} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="预计待付平仓费" value={fmtMoney(data.remaining_close_fees)} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="持仓对冲组" value={data.open_hedge_groups ?? 0} /></Col>

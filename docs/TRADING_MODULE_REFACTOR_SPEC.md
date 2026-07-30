@@ -139,6 +139,7 @@ Binance USDⓈ-M Futures 的检查流程固定为：校准服务器时间、读�
 - 预提交恢复以数据库中的 VenueOrder 为外部副作用边界：超过恢复窗口、全部腿仍为 PLANNED 且没有 VenueOrder/ExecutionEvent 的 CLOSE Intent 可确定性回滚；任何部分成交或 UNKNOWN 都只能进入对账/人工恢复。
 - 历史版本若把动态单腿 Outbox 误标为 SENT，但所属腿仍为 PLANNED 且不存在 VenueOrder/ExecutionEvent，可依据同一外部副作用边界安全重新排队。历史 MT5 `retcode=10018 Market closed` 即使曾被误标为 UNKNOWN，也必须纠正为确定性拒单并停止循环查询；查询恢复本身异常时要进入 `RECOVERY_REQUIRED`，不得无限增加发送尝试次数。
 - 已实现 PnL 是开仓成交、平仓成交和实际手续费的派生投影。首次完成时数据不齐不得永久写 0，迟到事件与周期对账必须重新投影，查询端应以成交事实覆盖陈旧汇总值。
+- 仪表盘“今日”按 `APP_TIMEZONE`（默认 `Asia/Hong_Kong`）的本地自然日统计，再换算为 UTC 查询数据库；“今日盈亏”必须等于“今日已实现盈亏 + 当前可平仓未实现盈亏”，累计已实现不得混用到今日卡片。
 - `/health` 暴露每个连接器环境、只读状态、公共/私有连接和订单簿同步状态。
 
 ## 10. 新交易所接入清单
