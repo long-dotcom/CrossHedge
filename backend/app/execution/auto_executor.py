@@ -157,13 +157,8 @@ def _auto_execute_inner(db: Session) -> int:
 def _eligible(db: Session, strategy: StrategySetting, opportunity: ArbitrageOpportunity) -> tuple[bool, str]:
     """检查机会是否满足自动执行资格。
 
-    检查项：
-    1. 净利润是否达标
-    2. 品种级与全局开仓容量是否充足
+    检查品种级与全局开仓容量是否充足。
     """
-    min_profit = strategy.auto_execute_min_net_profit or strategy.min_net_profit
-    if opportunity.net_profit < min_profit:
-        return False, f"自动执行净利润不足: {opportunity.net_profit:.2f} < {min_profit:.2f}"
     capacity = open_capacity_check(db, opportunity.symbol, opportunity.direction, opportunity.notional)
     if not capacity.allowed:
         return False, capacity.reason

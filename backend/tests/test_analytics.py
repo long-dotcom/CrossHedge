@@ -27,7 +27,7 @@ def test_spread_series_downsamples_large_window() -> None:
     assert len(series) <= 720
     assert series[0]["count"] >= 1
 
-def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
+def test_statistical_exit_target_is_not_limited_by_profit_buffer() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -39,8 +39,6 @@ def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
             statistical_min_samples=20,
             exit_target_percentile=0.25,
             cost_guard_percentile=0.90,
-            auto_close_unit_profit_buffer=20,
-            min_total_profit=0,
         )
         db.add(strategy)
         from app.db.models import SpreadBucket
@@ -64,8 +62,8 @@ def test_statistical_exit_target_rejects_oversized_unit_buffer() -> None:
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_b_short_leg_a", 0.115, 0.03, 0.085, 0.85, 1)
-        assert signal.exit_target == 0.0
+        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_b_short_leg_a", 0.115, 0.03)
+        assert signal.exit_target > 0.0
 
 def test_spread_analytics_empty_summary() -> None:
     summary = summarize_spreads([], "1h")
@@ -96,7 +94,6 @@ def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> Non
         signal_mode="statistical",
         statistical_lookback_range="1h",
         statistical_min_samples=20,
-        min_total_profit=0,
     )
     db.add(strategy)
     db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", enabled=True))
@@ -117,7 +114,7 @@ def test_statistical_signal_reads_background_refreshed_stats(monkeypatch) -> Non
             "load_spread_points",
             lambda *args, **kwargs: pytest.fail("扫描热路径不应重新读取历史样本"),
         )
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20)
     finally:
         statistical_signal_module.clear_signal_stats_cache()
 
@@ -138,7 +135,7 @@ def test_funding_day_bucket_and_positive_bias() -> None:
     assert buckets[0]["sum_funding_rate"] == pytest.approx(0.00005)
     assert buckets[0]["count"] == 8
 
-def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None:
+def test_statistical_exit_target_uses_low_percentile() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
@@ -150,8 +147,6 @@ def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None
             statistical_min_samples=20,
             exit_target_percentile=0.25,
             cost_guard_percentile=0.90,
-            auto_close_unit_profit_buffer=20,
-            min_total_profit=0,
         )
         db.add(strategy)
         from app.db.models import SpreadBucket
@@ -175,9 +170,8 @@ def test_statistical_exit_target_uses_low_percentile_and_profit_buffer() -> None
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 360, 70, 290, 10, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 360, 70)
         assert signal.exit_target == pytest.approx(152.5)
-        assert signal.exit_target <= 360 - signal.cost_guard - strategy.auto_close_unit_profit_buffer
 
 def test_spread_analytics_detects_mean_reversion_shape() -> None:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -239,7 +233,6 @@ def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None
             signal_mode="statistical",
             statistical_lookback_range="1h",
             statistical_min_samples=20,
-            min_total_profit=0.1,
         )
         db.add(strategy)
         from app.db.models import SpreadBucket
@@ -263,7 +256,7 @@ def test_statistical_signal_blocks_entry_when_samples_are_insufficient() -> None
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_a_short_leg_b", 0.8, 0.02, 0.78, 50, 1)
+        signal = evaluate_entry_signal(db, strategy, "OIL", "long_leg_a_short_leg_b", 0.8, 0.02)
 
         assert signal.result.status == "candidate"
         assert "统计样本不足" in signal.result.reason
@@ -285,7 +278,6 @@ def test_statistical_exit_target_uses_close_spread_distribution() -> None:
             reachable_entry_zscore=0.0,
             exit_target_percentile=0.25,
             cost_guard_percentile=0.5,
-            min_total_profit=0,
         )
         for index in range(30):
             db.add(
@@ -308,7 +300,7 @@ def test_statistical_exit_target_uses_close_spread_distribution() -> None:
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 0, 126, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 0)
 
     assert signal.reachable_entry > 100
     assert signal.exit_target < 30
@@ -392,7 +384,6 @@ def test_statistical_signal_reuses_stats_cache(monkeypatch) -> None:
         signal_mode="statistical",
         statistical_lookback_range="1h",
         statistical_min_samples=20,
-        min_total_profit=0,
     )
     points = [SpreadPoint(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=index), 100 + index, 20, 80 + index) for index in range(30)]
     calls = {"count": 0}
@@ -404,8 +395,8 @@ def test_statistical_signal_reuses_stats_cache(monkeypatch) -> None:
     statistical_signal_module.clear_signal_stats_cache()
     monkeypatch.setattr(statistical_signal_module, "load_spread_points", fake_load_points)
     try:
-        first = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
-        second = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 127, 20, 107, 1, 1)
+        first = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20)
+        second = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 127, 20)
     finally:
         statistical_signal_module.clear_signal_stats_cache()
 
@@ -425,7 +416,6 @@ def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
             reachable_entry_percentile=0.85,
             reachable_entry_zscore=1.0,
             cost_guard_percentile=0.90,
-            min_total_profit=0.5,
         )
         db.add(strategy)
         db.add(SymbolMapping(symbol="JP225", leg_a_venue_symbol="xyz:JP225", mt5_symbol="JP225", min_entry_spread=200))
@@ -451,7 +441,7 @@ def test_overheat_marks_risk_without_blocking_executable_entry() -> None:
             )
         db.commit()
 
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 263.1, 20, 243.1, 9.14, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 263.1, 20)
 
     mapping = SimpleNamespace(min_entry_spread=200)
     assert scanner_module._effective_entry_threshold(mapping, signal.reachable_entry) == 200
@@ -577,7 +567,6 @@ def test_statistical_signal_uses_reachable_entry() -> None:
             reachable_entry_percentile=0.75,
             reachable_entry_zscore=1.0,
             cost_guard_percentile=0.90,
-            min_total_profit=0.1,
         )
         db.add(strategy)
         from app.db.models import SpreadBucket
@@ -601,24 +590,24 @@ def test_statistical_signal_uses_reachable_entry() -> None:
                 )
             )
         db.commit()
-        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20, 106, 1, 1)
+        signal = evaluate_entry_signal(db, strategy, "JP225", "long_leg_a_short_leg_b", 126, 20)
         assert signal.result.status == "executable"
         assert signal.reachable_entry > 0
 
 
 def test_statistical_signal_reuses_supplied_stats(monkeypatch) -> None:
-    """同方向两次利润判定不应再次读取统计缓存。"""
+    """同方向重复判定不应再次读取统计缓存。"""
     strategy = StrategySetting(
-        signal_mode="statistical", statistical_min_samples=1, min_total_profit=0,
+        signal_mode="statistical", statistical_min_samples=1,
     )
     stats = SignalStats(100, 1.0, 0.1, 2.0, 0.2, 3.0)
     monkeypatch.setattr(
         "app.strategy.statistical_signal._signal_stats",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应重新读取统计缓存")),
     )
-    for total_profit in (1.0, 2.0):
+    for current_spread in (1.5, 1.6):
         result = evaluate_entry_signal(
             SimpleNamespace(), strategy, "TEST", "long_leg_a_short_leg_b",
-            1.5, 0.1, 1.4, total_profit, 1.0, stats=stats,
+            current_spread, 0.1, stats=stats,
         )
         assert result.sample_count == 100

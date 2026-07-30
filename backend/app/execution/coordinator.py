@@ -120,7 +120,7 @@ def create_open_intent(
         if not synced:
             record_risk_event(db, "strict_quote_sync", sync_reason, opportunity.symbol)
             raise ValueError(sync_reason)
-        still_executable, refresh_reason = refreshed_opportunity_still_executable(opportunity, synced, strategy)
+        still_executable, refresh_reason = refreshed_opportunity_still_executable(opportunity, synced)
         if not still_executable and not force_strategy_checks:
             record_risk_event(db, "execution_quote_recheck", refresh_reason, opportunity.symbol)
             raise ValueError(refresh_reason)

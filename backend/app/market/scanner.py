@@ -385,7 +385,6 @@ def run_scan(db: Session) -> int:
                         spread_values = spreads_for_direction(direction, hl.bid, hl.ask, mt.bid, mt.ask)
                         gross_spread = spread_values.entry_spread
                         breaker_feed(mapping.symbol, direction, spread_values.entry_spread)
-                        gross_profit = gross_spread * sizing.leg_a_quantity
                         quantity = sizing.leg_b_quantity
                         notional = sizing.notional_usd
                         leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
@@ -403,18 +402,12 @@ def run_scan(db: Session) -> int:
                             source=f"{leg_a_costs.source};{leg_b_costs.source}",
                         )
                         unit_cost = cost.total / sizing.leg_a_quantity if sizing.leg_a_quantity > 0 else cost.total
-                    # 第一次评估用于得到统计退出线；最终收益必须扣除退出价差，
-                    # 因为入场和平仓均使用可成交 bid/ask，不能另行重复扣点差。
-                    provisional_net_profit = gross_profit - cost.total
-                    provisional_unit_net_profit = gross_spread - unit_cost
-                    provisional_annualized_return = (provisional_net_profit / notional) * (365 * 24 / holding_hours)
                     with _timed_phase(
-                        timings, "signal_first_duration_ms", scan_id, mapping.symbol, direction=direction,
+                        timings, "signal_duration_ms", scan_id, mapping.symbol, direction=direction,
                     ):
                         statistical_signal = evaluate_entry_signal(
                             db, strategy, mapping.symbol, direction,
-                            gross_spread, unit_cost, provisional_unit_net_profit,
-                            provisional_net_profit, provisional_annualized_return,
+                            gross_spread, unit_cost,
                             stats=stats_snapshot.get((mapping.symbol, direction)),
                         )
                     with _timed_phase(
@@ -426,15 +419,6 @@ def run_scan(db: Session) -> int:
                             gross_spread, exit_target, cost.total, sizing.leg_a_quantity,
                         )
                         annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
-                    # 用包含退出线摩擦的最终净利润再次执行利润门槛。
-                    with _timed_phase(
-                        timings, "signal_second_duration_ms", scan_id, mapping.symbol, direction=direction,
-                    ):
-                        statistical_signal = evaluate_entry_signal(
-                            db, strategy, mapping.symbol, direction,
-                            gross_spread, unit_cost, unit_net_profit, net_profit, annualized_return,
-                            stats=stats_snapshot.get((mapping.symbol, direction)),
-                        )
                     with _timed_phase(
                         timings, "gates_duration_ms", scan_id, mapping.symbol, direction=direction,
                     ):
@@ -846,10 +830,7 @@ def _finalize_legacy_timings(timings: dict[str, float]) -> None:
         timings.get(key, 0.0)
         for key in ("venue_cost_a_duration_ms", "venue_cost_b_duration_ms", "cost_compute_duration_ms")
     )
-    timings["signal_duration_ms"] = (
-        timings.get("signal_first_duration_ms", 0.0)
-        + timings.get("signal_second_duration_ms", 0.0)
-    )
+    timings["signal_duration_ms"] = timings.get("signal_duration_ms", 0.0)
     timings["candidate_sync_duration_ms"] = (
         timings.get("gates_duration_ms", 0.0)
         + timings.get("candidate_build_duration_ms", 0.0)

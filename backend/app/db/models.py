@@ -160,8 +160,7 @@ class StrategySetting(Base, TimestampMixin):
     自动平仓、自动执行、模拟延迟、执行断路器等。
     系统启动时读取，前端可动态修改。
     关键字段：
-    - min_net_profit / min_annualized_return: 最低净利润 / 年化收益率门槛
-    - signal_mode: 信号模式（statistical / simple）
+    - signal_mode: 内部信号模式（当前固定为 statistical）
     - reachable_entry_*: 可达性入场过滤参数
     - cost_guard_percentile: 成本保护分位数
     - auto_close_*: 自动平仓相关参数
@@ -173,8 +172,6 @@ class StrategySetting(Base, TimestampMixin):
     __tablename__ = "strategy_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    min_net_profit: Mapped[float] = mapped_column(Float, default=5.0)
-    min_annualized_return: Mapped[float] = mapped_column(Float, default=0.08)
     signal_mode: Mapped[str] = mapped_column(String(32), default="statistical")
     statistical_lookback_range: Mapped[str] = mapped_column(String(16), default="1h")
     statistical_min_samples: Mapped[int] = mapped_column(Integer, default=200)
@@ -182,12 +179,9 @@ class StrategySetting(Base, TimestampMixin):
     reachable_entry_zscore: Mapped[float] = mapped_column(Float, default=1.0)
     cost_guard_percentile: Mapped[float] = mapped_column(Float, default=0.90)
     min_unit_edge: Mapped[float] = mapped_column(Float, default=0.0)
-    min_total_profit: Mapped[float] = mapped_column(Float, default=0.5)
     auto_close_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_close_live_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     exit_target_percentile: Mapped[float] = mapped_column(Float, default=0.25)
-    auto_close_unit_profit_buffer: Mapped[float] = mapped_column(Float, default=0.0)
-    auto_close_min_profit: Mapped[float] = mapped_column(Float, default=0.0)
     default_notional: Mapped[float] = mapped_column(Float, default=1000.0)
     max_holding_minutes: Mapped[int] = mapped_column(Integer, default=240)
     execution_mode: Mapped[str] = mapped_column(String(32), default="paper")
@@ -199,7 +193,6 @@ class StrategySetting(Base, TimestampMixin):
     auto_execute_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=30)
     auto_execute_max_per_symbol_open_groups: Mapped[int] = mapped_column(Integer, default=1)
     auto_execute_max_global_open_groups: Mapped[int] = mapped_column(Integer, default=3)
-    auto_execute_min_net_profit: Mapped[float] = mapped_column(Float, default=0.0)
     paper_decision_delay_ms_min: Mapped[int] = mapped_column(Integer, default=50)
     paper_decision_delay_ms_max: Mapped[int] = mapped_column(Integer, default=200)
     paper_leg_a_latency_ms_min: Mapped[int] = mapped_column(Integer, default=80)

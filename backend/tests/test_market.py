@@ -21,7 +21,6 @@ from app.market.mt5_sessions import MT5SessionState, mt5_action_allowed, mt5_ses
 from app.market.mt5_schedule import apply_mt5_session_template, infer_template, local_schedule_state
 from app.strategy.cost import estimate_cost
 from app.strategy.live_costs import _hyperliquid_effective_fee_rates
-from app.strategy.signals import evaluate_signal
 from app.strategy.spread_math import spreads_for_direction
 from app.risk.engine import pre_trade_check
 from app.api import markets as markets_api
@@ -243,10 +242,6 @@ def test_enabled_mappings_cache_requires_explicit_clear() -> None:
         assert [row.symbol for row in cached] == ["BTC"]
         assert [row.symbol for row in refreshed] == ["BTC", "ETH"]
 
-def test_signal_rejects_unprofitable() -> None:
-    signal = evaluate_signal(-1, 0.2, 5, 0.08)
-    assert signal.status == "rejected"
-
 def test_hyperliquid_symbol_map_can_include_standard_and_hip3_symbols() -> None:
     mappings = [
         SimpleNamespace(symbol="BTC", leg_a_venue="hyperliquid", leg_a_venue_symbol="BTC"),
@@ -440,8 +435,7 @@ def test_scanner_legacy_timings_are_rebuilt_from_non_overlapping_phases() -> Non
         "venue_cost_a_duration_ms": 1.0,
         "venue_cost_b_duration_ms": 2.0,
         "cost_compute_duration_ms": 3.0,
-        "signal_first_duration_ms": 4.0,
-        "signal_second_duration_ms": 5.0,
+        "signal_duration_ms": 4.0,
         "gates_duration_ms": 6.0,
         "candidate_build_duration_ms": 7.0,
         "result_assembly_duration_ms": 8.0,
@@ -450,7 +444,7 @@ def test_scanner_legacy_timings_are_rebuilt_from_non_overlapping_phases() -> Non
     scanner_module._finalize_legacy_timings(timings)
 
     assert timings["cost_duration_ms"] == 6.0
-    assert timings["signal_duration_ms"] == 9.0
+    assert timings["signal_duration_ms"] == 4.0
     assert timings["candidate_sync_duration_ms"] == 13.0
     assert timings["persist_duration_ms"] == 8.0
 
@@ -569,7 +563,7 @@ def test_scanner_records_two_direction_current_rows(monkeypatch) -> None:
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
     db = Session()
-    db.add(StrategySetting(signal_mode="fixed_profit", min_net_profit=-999, min_annualized_return=-999, default_notional=1000))
+    db.add(StrategySetting(signal_mode="statistical", statistical_min_samples=0, default_notional=1000))
     db.add(SymbolMapping(symbol="DUAL", leg_a_venue_symbol="DUAL", mt5_symbol="DUAL", mt5_min_lot=1, mt5_volume_step=1, mt5_contract_size=1, enabled=True))
     db.commit()
     quote_cache.put("hyperliquid", "DUAL", bid=99, ask=101, depth_notional=100000, source="test")
@@ -649,17 +643,17 @@ def test_strategy_setting_cache_requires_explicit_clear() -> None:
     Session = sessionmaker(bind=engine, future=True)
     with Session() as db:
         scanner_module.clear_strategy_setting_cache()
-        db.add(StrategySetting(min_total_profit=1.0))
+        db.add(StrategySetting(reachable_entry_percentile=0.75))
         db.commit()
 
         first = scanner_module.get_strategy_setting(db)
         row = db.query(StrategySetting).first()
-        row.min_total_profit = 2.0
+        row.reachable_entry_percentile = 0.85
         db.commit()
         cached = scanner_module.get_strategy_setting(db)
         scanner_module.clear_strategy_setting_cache()
         refreshed = scanner_module.get_strategy_setting(db)
 
-        assert first.min_total_profit == 1.0
-        assert cached.min_total_profit == 1.0
-        assert refreshed.min_total_profit == 2.0
+        assert first.reachable_entry_percentile == 0.75
+        assert cached.reachable_entry_percentile == 0.75
+        assert refreshed.reachable_entry_percentile == 0.85
