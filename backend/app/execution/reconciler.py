@@ -34,7 +34,12 @@ from app.db.models import Alert, ExchangeCredential, ExecutionIntent, Fill, Hedg
 from app.execution.event_projection import project_legacy_order, project_legacy_orders, project_unmirrored_legacy_orders
 from app.execution.fees import commission_cost
 from app.execution.hedge_pool import hedge_pool
-from app.execution.pnl import actual_close_time_from_fills, actual_entry_spread_from_fills, realized_pnl_from_fills
+from app.execution.pnl import (
+    actual_close_time_from_fills,
+    actual_entry_spread_from_fills,
+    realized_pnl_from_fills,
+    refresh_closed_group_financials,
+)
 from app.venues.domain.models import Position as VenuePosition, PositionSide
 from app.venues.manager import native_venue_manager
 
@@ -84,6 +89,10 @@ def _reconcile_impl(db: Session) -> int:
     reconciled += reconcile_unresolved_orders(db, exclude_group_ids={group.id for group in groups})
     reconciled += reconcile_residual_positions(db)
     reconciled += reconcile_orphan_positions(db)
+    # 原生成交事件可能晚于首次“已平仓”投影到达；每轮对账按最终成交事实
+    # 幂等修正入场价差、手续费和已实现 PnL。
+    for closed_group in db.query(HedgeGroup).filter(HedgeGroup.status == "closed").all():
+        reconciled += int(refresh_closed_group_financials(db, closed_group))
     # 分批回填历史订单；幂等事件 ID 保证重启或重复扫描不会重复写入。
     project_unmirrored_legacy_orders(db)
     # 同步完成后刷新 Redis 对冲组快照

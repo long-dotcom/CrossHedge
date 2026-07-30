@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.time_utils import utc_now
-from app.db.models import ArbitrageOpportunity, Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, Order, StrategySetting, SymbolMapping
+from app.db.models import ArbitrageOpportunity, Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, Order, StrategySetting, SymbolMapping, VenueOrder
 from app.execution.coordinator import (
     _observed_entry_slippage_bps,
     create_close_intent,
@@ -17,7 +17,7 @@ from app.execution.coordinator import (
     create_recovery_intent,
 )
 from app.execution.outbox_worker import run_execution_outbox_once
-from app.execution.pnl import actual_close_spread_from_fills, actual_close_time_from_fills, actual_entry_spread_from_fills
+from app.execution.pnl import actual_close_spread_from_fills, actual_close_time_from_fills, actual_entry_spread_from_fills, realized_pnl_from_fills, refresh_closed_group_financials
 from app.execution.preflight import refreshed_opportunity_still_executable
 from tests.native_fakes import order_snapshot
 
@@ -169,6 +169,57 @@ def test_paper_close_runs_as_async_intent_and_closes_only_after_both_fills() -> 
         close_orders = db.query(Order).filter_by(hedge_group_id=group_id, reduce_only=True).all()
         assert len(close_orders) == 2
         assert db.query(Fill).join(Order, Fill.order_id == Order.id).filter(Order.hedge_group_id == group_id).count() == 2
+
+
+def test_closed_group_financials_are_rebuilt_from_late_execution_facts() -> None:
+    factory = _factory()
+    with factory() as db:
+        db.add(SymbolMapping(
+            symbol="GOLD", leg_a_venue="binance", leg_a_venue_symbol="XAUUSDT", leg_a_symbol="XAUUSDT",
+            leg_b_venue="mt5", leg_b_symbol="XAUUSD", mt5_symbol="XAUUSD",
+        ))
+        group = HedgeGroup(
+            symbol="GOLD", direction="long_leg_b_short_leg_a", status="closed",
+            execution_mode="paper", notional=4000, quantity=1,
+            leg_a_quantity=1, leg_b_quantity=0.01,
+            entry_spread=0, realized_pnl=0, unrealized_pnl=9,
+        )
+        db.add(group)
+        db.flush()
+        facts = (
+            ("OPEN", "binance", "SELL", 4055.18, 0.10),
+            ("OPEN", "mt5", "BUY", 4048.366, 0.20),
+            ("CLOSE", "binance", "BUY", 4085.13, 0.10),
+            ("CLOSE", "mt5", "SELL", 4077.736, 0.20),
+        )
+        for index, (action, venue, side, price, fee) in enumerate(facts):
+            intent = ExecutionIntent(
+                hedge_group_id=group.id, intent_type=action, execution_mode="paper",
+                idempotency_key=f"fact-{index}", status="COMPLETED",
+            )
+            db.add(intent)
+            db.flush()
+            leg = ExecutionLeg(
+                intent_id=intent.id, leg_key=f"leg-{index}", venue=venue,
+                instrument_id="XAU", venue_symbol="XAU", action=action,
+                position_side="NET", order_side=side, strategy_quantity=1,
+                venue_order_quantity=1, status="FILLED",
+            )
+            db.add(leg)
+            db.flush()
+            db.add(VenueOrder(
+                execution_leg_id=leg.id, client_order_id=f"fact-order-{index}",
+                status="FILLED", requested_quantity=1, filled_quantity=1,
+                remaining_quantity=0, average_price=price, commission=fee,
+            ))
+        db.flush()
+
+        assert realized_pnl_from_fills(db, group) == pytest.approx(-1.18)
+        assert refresh_closed_group_financials(db, group) is True
+        assert group.entry_spread == pytest.approx(6.814)
+        assert group.realized_pnl == pytest.approx(-1.18)
+        assert group.unrealized_pnl == 0
+        assert group.fees == pytest.approx(0.60)
 
 
 def test_single_leg_close_fill_enters_manual_recovery_instead_of_false_closed() -> None:
