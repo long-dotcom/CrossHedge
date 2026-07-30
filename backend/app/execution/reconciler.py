@@ -32,8 +32,9 @@ from app.core.time_utils import utc_now
 from app.core.worker_runner import run_worker
 from app.db.models import Alert, ExchangeCredential, ExecutionIntent, Fill, HedgeGroup, HedgeGroupEvent, Order, Position, SymbolMapping, SystemLog, WorkerRun
 from app.execution.event_projection import project_legacy_order, project_legacy_orders, project_unmirrored_legacy_orders
+from app.execution.fees import commission_cost
 from app.execution.hedge_pool import hedge_pool
-from app.execution.pnl import actual_entry_spread_from_fills, realized_pnl_from_fills
+from app.execution.pnl import actual_close_time_from_fills, actual_entry_spread_from_fills, realized_pnl_from_fills
 from app.venues.domain.models import Position as VenuePosition, PositionSide
 from app.venues.manager import native_venue_manager
 
@@ -298,7 +299,7 @@ def _refresh_order(db: Session, group: HedgeGroup, order: Order) -> bool:
         changed = True
     filled_quantity = float(snapshot.filled_quantity)
     average_price = float(snapshot.average_price or snapshot.price or 0)
-    fee = float(snapshot.commission)
+    fee = commission_cost(order.platform, snapshot.commission)
     recorded_quantity = _order_fill_quantity(db, order.id)
     fill_delta = max(filled_quantity - recorded_quantity, 0.0)
     if fill_delta > 0 and average_price > 0:
@@ -311,7 +312,15 @@ def _refresh_order(db: Session, group: HedgeGroup, order: Order) -> bool:
             price = float(trade.price)
             if quantity <= 0 or price <= 0:
                 continue
-            db.add(Fill(order_id=order.id, platform=order.platform, symbol=order.symbol, side=order.side, quantity=quantity, price=price, fee=float(trade.commission)))
+            db.add(Fill(
+                order_id=order.id,
+                platform=order.platform,
+                symbol=order.symbol,
+                side=order.side,
+                quantity=quantity,
+                price=price,
+                fee=commission_cost(order.platform, trade.commission),
+            ))
             changed = True
     return changed
 
@@ -383,7 +392,7 @@ def _advance_group_state(db: Session, group: HedgeGroup, orders: list[Order]) ->
     if group.status == "closing":
         if all(effects):
             group.status = "closed"
-            group.closed_at = group.closed_at or utc_now()
+            group.closed_at = group.closed_at or actual_close_time_from_fills(db, group) or utc_now()
             group.fees += _orders_fee(db, platform_orders.values())
             group.realized_pnl = realized_pnl_from_fills(db, group)
             if group.realized_pnl is None:
@@ -584,7 +593,10 @@ def _orders_fee(db: Session, orders) -> float:
     order_ids = [order.id for order in orders]
     if not order_ids:
         return 0.0
-    return sum(row.fee for row in db.query(Fill).filter(Fill.order_id.in_(order_ids)).all())
+    return sum(
+        commission_cost(row.platform, row.fee)
+        for row in db.query(Fill).filter(Fill.order_id.in_(order_ids)).all()
+    )
 
 
 def _float_value(snapshot: dict, *keys: str) -> float:

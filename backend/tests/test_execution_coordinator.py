@@ -17,9 +17,28 @@ from app.execution.coordinator import (
     create_recovery_intent,
 )
 from app.execution.outbox_worker import run_execution_outbox_once
-from app.execution.pnl import actual_entry_spread_from_fills
+from app.execution.pnl import actual_close_spread_from_fills, actual_close_time_from_fills, actual_entry_spread_from_fills
 from app.execution.preflight import refreshed_opportunity_still_executable
 from tests.native_fakes import order_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _allow_mt5_execution_gate(monkeypatch):
+    """普通 Coordinator 测试默认处于 MT5 可交易窗口。"""
+    state = SimpleNamespace(
+        status="normal_trade", reason="", can_open_long=True, can_open_short=True,
+        can_close_long=True, can_close_short=True, mt5_leg="b",
+    )
+    monkeypatch.setattr("app.execution.coordinator.mt5_session_state", lambda mapping: state)
+    monkeypatch.setattr("app.market.mt5_sessions.mt5_session_state", lambda mapping: state)
+    monkeypatch.setattr(
+        "app.market.mt5_tradability.mt5_tradability_cache.is_fresh_allowed",
+        lambda *args, **kwargs: (True, ""),
+    )
+    monkeypatch.setattr(
+        "app.adapters.mt5.mt5_market_order_check",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok", retcode=0, request=None),
+    )
 
 
 class FillingAdapter:
@@ -145,6 +164,8 @@ def test_paper_close_runs_as_async_intent_and_closes_only_after_both_fills() -> 
         assert group.status == "closed"
         assert group.closed_at is not None
         assert group.fees == pytest.approx(0.02)
+        assert actual_close_spread_from_fills(db, group) == pytest.approx(-1.0)
+        assert actual_close_time_from_fills(db, group) == group.closed_at
         close_orders = db.query(Order).filter_by(hedge_group_id=group_id, reduce_only=True).all()
         assert len(close_orders) == 2
         assert db.query(Fill).join(Order, Fill.order_id == Order.id).filter(Order.hedge_group_id == group_id).count() == 2
@@ -362,6 +383,77 @@ def test_maker_close_uses_explicit_binance_position_side_without_reduce_only(mon
         assert maker.venue_reduce_only is False
         assert payload["hedge_template"]["order_side"] == "BUY"
         assert payload["hedge_template"]["position_side"] == "SHORT"
+
+
+def test_close_intent_is_rejected_before_maker_when_mt5_market_is_closed(monkeypatch) -> None:
+    factory = _factory()
+    closed = SimpleNamespace(
+        status="closed", reason="Market closed", can_open_long=False, can_open_short=False,
+        can_close_long=False, can_close_short=False, mt5_leg="b",
+    )
+    monkeypatch.setattr("app.execution.coordinator.mt5_session_state", lambda mapping: closed)
+    with factory() as db:
+        group = _group_and_mapping(db, mode="paper")
+        with pytest.raises(ValueError, match="不允许该方向平仓"):
+            create_close_intent(
+                db, group_id=group.id, reason="auto close", requested_by="auto_closer",
+                idempotency_key="close:market-closed",
+            )
+        assert db.query(ExecutionIntent).count() == 0
+
+
+def test_close_intent_uses_direct_mt5_order_check_before_maker(monkeypatch) -> None:
+    factory = _factory()
+    monkeypatch.setattr(
+        "app.adapters.mt5.mt5_market_order_check",
+        lambda *args, **kwargs: SimpleNamespace(
+            allowed=False, message="retcode=10018 Market closed", retcode=10018, request=None,
+        ),
+    )
+    with factory() as db:
+        group = _group_and_mapping(db, mode="paper")
+        with pytest.raises(ValueError, match="订单预检查失败.*Market closed"):
+            create_close_intent(
+                db, group_id=group.id, reason="auto close", requested_by="auto_closer",
+                idempotency_key="close:direct-order-check",
+            )
+        assert db.query(ExecutionIntent).count() == 0
+
+
+def test_outbox_rechecks_mt5_session_and_defers_before_any_submit(monkeypatch) -> None:
+    factory = _factory()
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=4000.0, ask=4000.5),
+        leg_b=SimpleNamespace(bid=3999.0, ask=3999.5),
+    )
+    monkeypatch.setattr("app.execution.preflight.strict_sync_for_execution", lambda *args: (synced, "", False))
+    with factory() as db:
+        group = _group_and_mapping(db, mode="paper")
+        mapping = db.query(SymbolMapping).filter_by(symbol="GOLD").one()
+        mapping.execution_style = "maker_then_market"
+        mapping.maker_leg = "a"
+        result = create_close_intent(
+            db, group_id=group.id, reason="queued close", requested_by="test",
+            idempotency_key="close:queued-before-break",
+        )
+        intent_id = result.intent.id
+        db.commit()
+
+    closed = SimpleNamespace(
+        status="closed", reason="Market closed", can_open_long=False, can_open_short=False,
+        can_close_long=False, can_close_short=False, mt5_leg="b",
+    )
+    monkeypatch.setattr("app.market.mt5_sessions.mt5_session_state", lambda mapping: closed)
+    calls: list = []
+    assert run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: FillingAdapter(venue, calls),
+    ) == 1
+    assert calls == []
+    with factory() as db:
+        outbox = db.query(ExecutionOutbox).filter_by(intent_id=intent_id).one()
+        assert outbox.status == "PENDING"
+        assert "MT5 会话门禁" in outbox.last_error
 
 
 def test_recovery_intent_flattens_only_confirmed_group_residual() -> None:

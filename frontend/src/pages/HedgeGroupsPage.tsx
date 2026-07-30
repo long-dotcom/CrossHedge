@@ -6,7 +6,7 @@ import { api } from '../api/client';
 import { EllipsisCell } from '../components/EllipsisCell';
 import { useHeaderStreamStatus } from '../components/HeaderStreamStatus';
 import { usePageStream } from '../hooks/useLiveStream';
-import { executionModeLabel, fmtAdaptive, fmtMoney, fmtSpread } from '../utils/format';
+import { executionModeLabel, fmtAdaptive, fmtLocalTime, fmtMoney, fmtSpread } from '../utils/format';
 import { tableScrollAutoY } from '../utils/tableScroll';
 import { legTitle, venueLabel } from '../utils/venues';
 import { QueryErrorAlert } from '../components/QueryErrorAlert';
@@ -67,6 +67,10 @@ function detailItems(row: any) {
     { key: 'trigger_leg_b_bid', label: `触发 ${legTitle(row, 'b')} Bid`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_b_bid, 2, 8) : '-' },
     { key: 'trigger_leg_b_ask', label: `触发 ${legTitle(row, 'b')} Ask`, children: hasTriggerPrices(row) ? fmtAdaptive(row.trigger_leg_b_ask, 2, 8) : '-' },
     { key: 'entry_spread', label: '真实开仓价差', children: row.entry_spread == null ? '-' : fmtSpread(row.entry_spread) },
+    { key: 'actual_close_spread', label: '真实平仓价差', children: row.actual_close_spread == null ? '-' : fmtSpread(row.actual_close_spread) },
+    { key: 'opened_at', label: '开仓时间', children: fmtLocalTime(row.opened_at) },
+    { key: 'actual_close_time', label: '最后平仓成交时间', children: fmtLocalTime(row.actual_close_time) },
+    { key: 'closed_at', label: '平仓确认时间', children: fmtLocalTime(row.closed_at) },
     { key: 'current_entry_spread', label: '当前重新入场价差', children: row.current_entry_spread == null ? '-' : fmtSpread(row.current_entry_spread) },
     { key: 'current_close_spread', label: '当前平仓价差', children: row.current_close_spread == null ? '-' : fmtSpread(row.current_close_spread) },
     { key: 'quote_time_diff_ms', label: '报价时间差', children: row.quote_time_diff_ms == null ? '-' : `${Math.round(row.quote_time_diff_ms)}ms` },
@@ -159,7 +163,10 @@ export function HedgeGroupsPage() {
     { title: '数量', dataIndex: 'quantity', width: 80, align: 'right', render: (v) => <EllipsisCell value={fmtAdaptive(v, 2, 6)} align="right" /> },
     { title: '触发价差', dataIndex: 'trigger_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={fmtSpread(v)} align="right" /> },
     { title: '开仓价差', dataIndex: 'entry_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
-    { title: '平仓价差', dataIndex: 'current_close_spread', width: 100, align: 'right', render: (v) => <EllipsisCell value={v == null ? '-' : fmtSpread(v)} align="right" /> },
+    { title: '平仓价差', width: 100, align: 'right', render: (_, row) => {
+      const value = row.status === 'closed' ? row.actual_close_spread : row.current_close_spread;
+      return <EllipsisCell value={value == null ? '-' : fmtSpread(value)} align="right" />;
+    } },
     { title: '净 PnL', width: 92, align: 'right', render: (_, row) => <EllipsisCell value={fmtMoney(Number(row.realized_pnl || 0) + Number(row.unrealized_pnl || 0))} align="right" /> },
     { title: '操作', fixed: 'right', width: 230, render: (_, row) => (
       <Space size={4}>

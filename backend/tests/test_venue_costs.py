@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.execution.fees import commission_cost
 from app.market.quotes import quote_cache
 from app.market.scanner import _projected_profit, _readonly_leg_pair_payloads, _venue_fee_rate
 from app.strategy.cost import estimate_pair_cost
@@ -13,6 +14,13 @@ from app.exchanges.credentials import (
     _binance_environment as http_binance_environment,
     normalize_connection_environment,
 )
+
+
+def test_commission_cost_normalizes_mt5_sign_and_preserves_native_fee_cost() -> None:
+    assert commission_cost("mt5", -0.25) == pytest.approx(0.25)
+    assert commission_cost("mt5", 0.25) == pytest.approx(0.25)
+    assert commission_cost("binance", 0.25) == pytest.approx(0.25)
+    assert commission_cost("binance", -0.01) == pytest.approx(0.0)
 
 
 def test_pair_cost_counts_both_legs_open_and_close_fees_without_duplicate_spread() -> None:

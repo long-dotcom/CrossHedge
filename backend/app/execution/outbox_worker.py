@@ -19,8 +19,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.logging import get_logger
 from app.core.time_utils import utc_now
-from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, HedgeGroupEvent, Order, SystemLog, VenueOrder
+from app.db.models import ExecutionEvent, ExecutionIntent, ExecutionLeg, ExecutionOutbox, Fill, HedgeGroup, HedgeGroupEvent, Order, SymbolMapping, SystemLog, VenueOrder
 from app.db.session import SessionLocal
+from app.execution.fees import commission_cost
 from app.venues.domain.models import OrderRequest, OrderStatus, OrderType, PositionSide, Side, TimeInForce
 from app.venues.manager import native_venue_manager
 
@@ -263,6 +264,23 @@ def _process_claim(
             _refresh_hedge_pool(db, intent)
             return
 
+        mt5_block_reason = _mt5_dispatch_block_reason(db, intent)
+        if mt5_block_reason:
+            # Intent 可能在可交易时创建、排队期间跨入休市。真正产生外部副作用前
+            # 必须再次失败关闭；Maker 首腿也不能先行发送。
+            outbox.status = "PENDING"
+            outbox.locked_at = None
+            outbox.available_at = utc_now() + timedelta(seconds=5)
+            outbox.last_error = mt5_block_reason
+            intent.error_message = mt5_block_reason
+            db.commit()
+            _refresh_hedge_pool(db, intent)
+            return
+
+        if str(intent.error_message or "").startswith("执行发送前 MT5"):
+            intent.error_message = ""
+        if str(outbox.last_error or "").startswith("执行发送前 MT5"):
+            outbox.last_error = ""
         intent.status = "RUNNING"
         venue_orders = [_ensure_venue_order(db, intent, leg) for leg in legs]
         commands = [
@@ -318,6 +336,52 @@ def _process_claim(
             _finish_command(db, outbox, intent, legs, adapter_factory=adapter_factory)
         db.commit()
         _refresh_hedge_pool(db, intent)
+
+
+def _mt5_dispatch_block_reason(db: Session, intent: ExecutionIntent) -> str:
+    """返回 MT5 执行门禁拒绝原因；空字符串表示允许发送。"""
+    if intent.intent_type not in {"OPEN", "CLOSE", "RECOVER"} or intent.hedge_group_id is None:
+        return ""
+    group = db.get(HedgeGroup, intent.hedge_group_id)
+    if group is None:
+        return ""
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).one_or_none()
+    if mapping is None or "mt5" not in {
+        str(mapping.leg_a_venue or "").lower(),
+        str(mapping.leg_b_venue or "").lower(),
+    }:
+        return ""
+
+    from app.market.mt5_sessions import mt5_action_allowed, mt5_order_side, mt5_session_state
+    from app.market.mt5_tradability import mt5_tradability_cache
+    from app.adapters.mt5 import mt5_market_order_check
+
+    action = "open" if intent.intent_type == "OPEN" else "close"
+    session_state = mt5_session_state(mapping)
+    allowed, reason = mt5_action_allowed(session_state, group.direction, action)
+    if not allowed:
+        return f"执行发送前 MT5 会话门禁阻止{action}: {reason}"
+    side = mt5_order_side(mapping, group.direction, action)
+    quantity = float((
+        group.leg_a_quantity if str(mapping.leg_a_venue or "").lower() == "mt5"
+        else group.leg_b_quantity
+    ) or group.quantity or 0.0)
+    check = mt5_market_order_check(
+        mapping.mt5_symbol,
+        side,
+        quantity,
+        reduce_only=action == "close",
+        demo=str(group.execution_mode or "").lower() == "paper",
+    )
+    mt5_tradability_cache.update(
+        group.symbol, mapping.mt5_symbol, side, quantity, check, "outbox_pre_submit",
+    )
+    if not check.allowed:
+        return f"执行发送前 MT5 order_check 阻止{action}: {check.message}"
+    tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(group.symbol, side)
+    if not tradability_allowed:
+        return f"执行发送前 MT5 订单预检查阻止{action}: {tradability_reason}"
+    return ""
 
 
 def _outbox_dispatch_legs(outbox: ExecutionOutbox, all_legs: list[ExecutionLeg]) -> list[ExecutionLeg]:
@@ -534,9 +598,12 @@ def _apply_gateway_result(
     average_price = float(getattr(result, "average_price", 0.0) or 0.0)
     if average_price > 0:
         venue_order.average_price = average_price
-    venue_order.commission = float(getattr(result, "commission", 0.0) or venue_order.commission or 0.0)
+    raw_commission = getattr(result, "commission", 0.0)
+    normalized_commission = commission_cost(leg.venue, raw_commission)
+    if normalized_commission > 0 or not venue_order.commission:
+        venue_order.commission = normalized_commission
     venue_order.reconciliation_state = "RECONCILED" if reconciliation else "VENUE_ACK"
-    venue_order.last_event_at = utc_now()
+    venue_order.last_event_at = getattr(result, "updated_at", None) or utc_now()
     venue_order.raw_last_report = json.dumps(_result_payload(result), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     _sync_legacy_order_and_fills(db, venue_order, result)
 
@@ -882,7 +949,9 @@ def _project_hedge_group_state(
     recovery = intent.intent_type == "RECOVER"
     if statuses and statuses <= {"FILLED"}:
         group.status = "closed"
-        group.closed_at = group.closed_at or utc_now()
+        from app.execution.pnl import actual_close_time_from_fills
+
+        group.closed_at = group.closed_at or actual_close_time_from_fills(db, group) or utc_now()
         group.close_reason = reason
         group.fees = _group_commission_total(db, group.id)
         event_type = "recovery_intent_completed" if recovery else "close_intent_completed"

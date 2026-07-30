@@ -19,6 +19,12 @@ from app.venues.mt5 import codec
 from app.venues.protocols import EventHandler
 
 
+class MT5GatewayError(RuntimeError):
+    """Gateway 已明确返回的提交前/交易服务器拒绝。"""
+
+    outcome_unknown = False
+
+
 class MT5RedisConnector:
     """保持 VenueConnector 接口不变，实际操作交给 Gateway。"""
 
@@ -191,13 +197,15 @@ class MT5RedisConnector:
         _, messages = rows[0]
         _, fields = messages[0]
         if fields.get("ok") != "1":
-            raise RuntimeError(fields.get("error") or f"MT5 Gateway 调用失败: {operation}")
+            # 能收到带 error 的响应说明 Gateway 已明确完成处理；例如 retcode=10018
+            # Market closed 不可能已经创建外部订单，不能误标为 UNKNOWN。
+            raise MT5GatewayError(fields.get("error") or f"MT5 Gateway 调用失败: {operation}")
         return codec.loads(fields.get("data"))
 
     def _require_gateway(self) -> None:
         health = self.health()
         if not health.get("connected"):
-            raise RuntimeError(str(health.get("error") or "MT5 Gateway 未连接"))
+            raise MT5GatewayError(str(health.get("error") or "MT5 Gateway 未连接"))
 
     def _event_loop(self) -> None:
         stream = redis_key("mt5", "events")

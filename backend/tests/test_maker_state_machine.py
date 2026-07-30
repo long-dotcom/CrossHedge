@@ -3,6 +3,7 @@
 from dataclasses import asdict
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -11,6 +12,12 @@ from app.db.models import Base, ExecutionIntent, ExecutionLeg, ExecutionOutbox, 
 from app.execution.intents import ExecutionLegPlan, create_execution_intent
 from app.execution.outbox_worker import reconcile_execution_orders_once, run_execution_outbox_once
 from tests.native_fakes import order_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _allow_mt5_dispatch_gate(monkeypatch):
+    """状态机单元测试聚焦 Maker 生命周期，默认市场门禁已通过。"""
+    monkeypatch.setattr("app.execution.outbox_worker._mt5_dispatch_block_reason", lambda *args: "")
 
 
 class MakerAdapter:

@@ -15,6 +15,25 @@ from app.schemas import ReplayExecutionIntentIn
 from tests.native_fakes import order_snapshot
 
 
+@pytest.fixture(autouse=True)
+def _allow_mt5_execution_gate(monkeypatch):
+    state = SimpleNamespace(
+        status="normal_trade", reason="", can_open_long=True, can_open_short=True,
+        can_close_long=True, can_close_short=True, mt5_leg="b",
+    )
+    monkeypatch.setattr("app.execution.coordinator.mt5_session_state", lambda mapping: state)
+    monkeypatch.setattr("app.execution.coordinator.mt5_action_allowed", lambda *args: (True, ""))
+    monkeypatch.setattr(
+        "app.market.mt5_tradability.mt5_tradability_cache.is_fresh_allowed",
+        lambda *args, **kwargs: (True, ""),
+    )
+    monkeypatch.setattr(
+        "app.adapters.mt5.mt5_market_order_check",
+        lambda *args, **kwargs: SimpleNamespace(allowed=True, message="ok", retcode=0, request=None),
+    )
+    monkeypatch.setattr("app.execution.outbox_worker._mt5_dispatch_block_reason", lambda *args: "")
+
+
 class FillAdapter:
     def __init__(self, venue: str) -> None:
         self.platform = venue

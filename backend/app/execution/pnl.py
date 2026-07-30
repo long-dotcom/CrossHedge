@@ -92,6 +92,35 @@ def actual_close_spread_from_fills(
     return actual_spread_from_fills(db, group, reduce_only=True, mapping=mapping)
 
 
+def actual_close_time_from_fills(db: Session, group: HedgeGroup):
+    """返回本组最后一笔已确认平仓成交的 venue 时间。"""
+    new_row = (
+        db.query(VenueOrder.last_event_at)
+        .join(ExecutionLeg, ExecutionLeg.id == VenueOrder.execution_leg_id)
+        .join(ExecutionIntent, ExecutionIntent.id == ExecutionLeg.intent_id)
+        .filter(
+            ExecutionIntent.hedge_group_id == group.id,
+            ExecutionLeg.action == "CLOSE",
+            VenueOrder.status == "FILLED",
+            VenueOrder.last_event_at.is_not(None),
+        )
+        .order_by(VenueOrder.last_event_at.desc())
+        .first()
+    )
+    legacy_row = (
+        db.query(Fill.created_at)
+        .join(Order, Fill.order_id == Order.id)
+        .filter(
+            Order.hedge_group_id == group.id,
+            Order.reduce_only.is_(True),
+        )
+        .order_by(Fill.created_at.desc())
+        .first()
+    )
+    candidates = [row[0] for row in (new_row, legacy_row) if row and row[0] is not None]
+    return max(candidates) if candidates else None
+
+
 def actual_spread_from_fills(
     db: Session,
     group: HedgeGroup,

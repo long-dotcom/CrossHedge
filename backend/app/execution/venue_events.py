@@ -29,6 +29,7 @@ from app.db.models import (
     VenueOrder,
 )
 from app.db.session import SessionLocal
+from app.execution.fees import commission_cost
 from app.venues.domain.events import VenueEvent
 
 venue_event_queue: SimpleQueue[VenueEvent] = SimpleQueue()
@@ -204,7 +205,10 @@ def _apply_order(db, venue_order: VenueOrder, leg: ExecutionLeg, snapshot) -> No
     venue_order.remaining_quantity = max(float(snapshot.remaining_quantity), 0.0)
     if snapshot.average_price is not None and snapshot.average_price > 0:
         venue_order.average_price = float(snapshot.average_price)
-    venue_order.commission = max(float(venue_order.commission or 0), float(snapshot.commission))
+    venue_order.commission = max(
+        float(venue_order.commission or 0),
+        commission_cost(leg.venue, snapshot.commission),
+    )
     venue_order.reconciliation_state = "VENUE_EVENT"
     venue_order.last_event_at = snapshot.updated_at
     venue_order.raw_last_report = json.dumps(snapshot.raw, ensure_ascii=False, default=_json_default)
@@ -264,7 +268,8 @@ def _apply_fill(db, venue_order: VenueOrder, leg: ExecutionLeg, fill) -> None:
     venue_order.remaining_quantity = max(float(venue_order.requested_quantity or 0) - cumulative, 0.0)
     if event_quantity > 0:
         venue_order.average_price = event_notional / event_quantity
-    venue_order.commission = existing_commission + float(fill.commission)
+    normalized_commission = commission_cost(fill.venue, fill.commission)
+    venue_order.commission = existing_commission + normalized_commission
     venue_order.status = "FILLED" if venue_order.remaining_quantity <= 1e-12 else "PARTIALLY_FILLED"
     venue_order.reconciliation_state = "VENUE_FILL"
     venue_order.last_event_at = fill.occurred_at
@@ -283,7 +288,7 @@ def _apply_fill(db, venue_order: VenueOrder, leg: ExecutionLeg, fill) -> None:
                     side=fill.side.value,
                     quantity=float(fill.quantity),
                     price=float(fill.price),
-                    fee=float(fill.commission),
+                    fee=normalized_commission,
                 )
             )
 
@@ -303,7 +308,7 @@ def _projected_fill_totals(db, venue_order_id: int) -> tuple[float, float, float
             fill_quantity = abs(float(fill.get("quantity") or 0))
             quantity += fill_quantity
             notional += fill_quantity * float(fill.get("price") or 0)
-            commission += float(fill.get("commission") or 0)
+            commission += commission_cost(str(fill.get("venue") or ""), fill.get("commission"))
         except (TypeError, ValueError):
             continue
     return quantity, notional, commission

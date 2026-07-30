@@ -24,6 +24,7 @@ from app.db.models import (
     Order,
     VenueOrder,
 )
+from app.execution.fees import commission_cost
 
 
 TERMINAL_SUCCESS_STATUSES = {"filled"}
@@ -226,7 +227,7 @@ def _fill_totals(db: Session, order_id: int) -> tuple[float, float, float]:
     fills = db.query(Fill).filter(Fill.order_id == order_id).order_by(Fill.id).all()
     quantity = sum(abs(float(fill.quantity or 0.0)) for fill in fills)
     notional = sum(abs(float(fill.quantity or 0.0)) * float(fill.price or 0.0) for fill in fills)
-    commission = sum(float(fill.fee or 0.0) for fill in fills)
+    commission = sum(commission_cost(fill.platform, fill.fee) for fill in fills)
     average_price = notional / quantity if quantity > 0 else float(0.0)
     return quantity, average_price, commission
 

@@ -25,7 +25,12 @@ from app.execution.actions import hedge_group_actions
 from app.execution.coordinator import create_close_intent, create_recovery_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.voiding import void_hedge_group
-from app.execution.pnl import actual_entry_spread_from_fills, pnl_breakdown_from_close_spread
+from app.execution.pnl import (
+    actual_close_spread_from_fills,
+    actual_close_time_from_fills,
+    actual_entry_spread_from_fills,
+    pnl_breakdown_from_close_spread,
+)
 from app.market.hedge_spreads import hedge_group_spreads
 from app.schemas import CloseHedgeGroupIn, RecoverHedgeGroupIn, VoidHedgeGroupIn
 
@@ -56,6 +61,8 @@ def _hedge_group_payload(db: Session, group: HedgeGroup | HedgeGroupSnapshot, le
         elif group.status in {"pending_open", "opening", "open", "open_partial"}:
             # 没有双腿成交事实时不能把建组占位值称为真实开仓价差。
             data["entry_spread"] = None
+        data["actual_close_spread"] = actual_close_spread_from_fills(db, group)
+        data["actual_close_time"] = actual_close_time_from_fills(db, group)
     spreads = hedge_group_spreads(group)
     data.update(spreads)
     current_close_spread = spreads.get("current_close_spread")
@@ -212,6 +219,7 @@ def close_group(
             reason=payload.reason,
             requested_by=f"user:{user.id}",
             idempotency_key=idempotency_key,
+            force=payload.force,
         )
         audit(db, user.id, "close_hedge_group", "hedge_group", f"{group_id}; force={payload.force}")
         db.commit()
