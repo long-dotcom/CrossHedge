@@ -16,7 +16,7 @@ from app.execution.modes import (
     MAKER_THEN_MARKET, execution_mode, maker_leg,
     maker_ttl_seconds, maker_unfilled_action,
 )
-from app.market.mt5_sessions import mt5_action_allowed, mt5_session_state
+from app.market.mt5_sessions import mt5_action_allowed, mt5_order_side, mt5_session_state
 from app.risk.engine import pre_trade_check, record_risk_event
 
 
@@ -296,6 +296,7 @@ def create_close_intent(
     reason: str,
     requested_by: str,
     idempotency_key: str,
+    force: bool = False,
 ) -> IntentCreationResult:
     """为普通平仓创建幂等 CLOSE Intent，不在请求线程下单。"""
     normalized_key = idempotency_key.strip()
@@ -331,6 +332,36 @@ def create_close_intent(
     mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).one_or_none()
     if mapping is None:
         raise ValueError("品种映射不存在")
+    if "mt5" in {str(mapping.leg_a_venue or "").lower(), str(mapping.leg_b_venue or "").lower()}:
+        session_state = mt5_session_state(mapping)
+        mt5_allowed, mt5_reason = mt5_action_allowed(session_state, group.direction, "close")
+        if not mt5_allowed:
+            record_risk_event(db, "mt5_session_close", mt5_reason, group.symbol)
+            raise ValueError(mt5_reason)
+        from app.market.mt5_tradability import mt5_tradability_cache
+        from app.adapters.mt5 import mt5_market_order_check
+
+        mt5_side = mt5_order_side(mapping, group.direction, "close")
+        mt5_quantity = float((
+            group.leg_a_quantity if str(mapping.leg_a_venue or "").lower() == "mt5"
+            else group.leg_b_quantity
+        ) or group.quantity or 0.0)
+        mt5_check = mt5_market_order_check(
+            mapping.mt5_symbol, mt5_side, mt5_quantity,
+            reduce_only=True, demo=str(group.execution_mode or "").lower() == "paper",
+        )
+        mt5_tradability_cache.update(
+            group.symbol, mapping.mt5_symbol, mt5_side, mt5_quantity, mt5_check, "close_intent",
+        )
+        if not mt5_check.allowed:
+            reason_text = f"MT5 当前平仓订单预检查失败: {mt5_check.message}"
+            record_risk_event(db, "mt5_order_check_close", reason_text, group.symbol)
+            raise ValueError(reason_text)
+        tradability_allowed, tradability_reason = mt5_tradability_cache.is_fresh_allowed(group.symbol, mt5_side)
+        if not tradability_allowed:
+            reason_text = f"MT5 当前平仓预检查未通过: {tradability_reason}"
+            record_risk_event(db, "mt5_tradability_close", reason_text, group.symbol)
+            raise ValueError(reason_text)
     previous_status = group.status
     style = execution_mode(mapping)
     legs = _close_leg_plans(db, group, mapping)
@@ -340,6 +371,7 @@ def create_close_intent(
         "reason": reason.strip() or "manual close",
         "previous_group_status": previous_status,
         "coordinator": "hedge_group_close_v2",
+        "force": bool(force),
     }
     if style == MAKER_THEN_MARKET:
         if (mapping.leg_a_venue if maker_leg(mapping) == "a" else mapping.leg_b_venue) == "mt5":

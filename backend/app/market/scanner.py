@@ -175,18 +175,8 @@ def run_scan(db: Session) -> int:
         opportunity_payloads: list[dict] = []
         native_mappings = [mapping for mapping in mappings if is_native_pair(mapping)]
 
-        # 扫描轮次快照：整轮计算只使用同一批报价和共享门控数据，避免按品种、
-        # 按方向反复访问 Redis，也避免同一轮前后读到不一致的报价版本。
-        quote_snapshot_started = perf_counter()
-        quote_snapshot = quote_cache.latest_many(
-            (venue, mapping.symbol)
-            for mapping in mappings
-            for venue in (mapping_leg(mapping, "a")[0], mapping_leg(mapping, "b")[0])
-        )
-        log_slow_operation(
-            logger, "scanner", "quote_snapshot_load", elapsed_ms(quote_snapshot_started),
-            scan_id=scan_id, quote_count=len(quote_snapshot),
-        )
+        # 先读取市场门禁，再决定哪些方向值得进入报价、成本和统计信号扫描。
+        # 休市品种必须在任何昂贵计算之前失败关闭。
         session_snapshot_started = perf_counter()
         session_snapshot = {
             mapping.symbol: mt5_session_state(mapping)
@@ -196,15 +186,6 @@ def run_scan(db: Session) -> int:
         log_slow_operation(
             logger, "scanner", "session_snapshot_load", elapsed_ms(session_snapshot_started),
             scan_id=scan_id, session_count=len(session_snapshot),
-        )
-        signal_snapshot_started = perf_counter()
-        stats_snapshot = signal_stats_snapshot(
-            db, strategy,
-            ((mapping.symbol, direction) for mapping in native_mappings for direction in DIRECTIONS),
-        )
-        log_slow_operation(
-            logger, "scanner", "signal_snapshot_load", elapsed_ms(signal_snapshot_started),
-            scan_id=scan_id, stats_count=len(stats_snapshot),
         )
         tradability_snapshot_started = perf_counter()
         tradability_snapshot = mt5_tradability_cache.allowed_snapshot(
@@ -216,6 +197,51 @@ def run_scan(db: Session) -> int:
         log_slow_operation(
             logger, "scanner", "tradability_snapshot_load", elapsed_ms(tradability_snapshot_started),
             scan_id=scan_id, state_count=len(tradability_snapshot),
+        )
+        pre_market_gates: dict[tuple[str, str], GateResult] = {}
+        for mapping in native_mappings:
+            if "mt5" not in {str(mapping.leg_a_venue).lower(), str(mapping.leg_b_venue).lower()}:
+                continue
+            leg_a_venue_name, _ = mapping_leg(mapping, "a")
+            for direction in DIRECTIONS:
+                leg_a_side = "buy" if direction == LONG_LEG_A_SHORT_LEG_B else "sell"
+                leg_b_side = "sell" if direction == LONG_LEG_A_SHORT_LEG_B else "buy"
+                mt5_side = leg_a_side if leg_a_venue_name == "mt5" else leg_b_side
+                pre_market_gates[(mapping.symbol, direction)] = _direction_market_gate(
+                    session_snapshot[mapping.symbol], mapping.symbol, direction, mt5_side,
+                    tradability_snapshot=tradability_snapshot,
+                )
+
+        signal_snapshot_started = perf_counter()
+        stats_snapshot = signal_stats_snapshot(
+            db, strategy,
+            (
+                (mapping.symbol, direction)
+                for mapping in native_mappings
+                for direction in DIRECTIONS
+                if pre_market_gates.get((mapping.symbol, direction), GateResult("pass", "", "market")).status != "rejected"
+            ),
+        )
+        log_slow_operation(
+            logger, "scanner", "signal_snapshot_load", elapsed_ms(signal_snapshot_started),
+            scan_id=scan_id, stats_count=len(stats_snapshot),
+        )
+
+        # 只有完成前置市场门禁后才读取本轮报价快照。
+        quote_snapshot_started = perf_counter()
+        quote_snapshot = quote_cache.latest_many(
+            (venue, mapping.symbol)
+            for mapping in mappings
+            for venue in (mapping_leg(mapping, "a")[0], mapping_leg(mapping, "b")[0])
+            if not is_native_pair(mapping)
+            or any(
+                pre_market_gates.get((mapping.symbol, direction), GateResult("pass", "", "market")).status != "rejected"
+                for direction in DIRECTIONS
+            )
+        )
+        log_slow_operation(
+            logger, "scanner", "quote_snapshot_load", elapsed_ms(quote_snapshot_started),
+            scan_id=scan_id, quote_count=len(quote_snapshot),
         )
         for mapping in mappings:
             symbol_started = perf_counter()
@@ -261,6 +287,26 @@ def run_scan(db: Session) -> int:
                         total_cost=0, net_profit=0, annualized_return=0,
                         status="rejected",
                         reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
+                        gate="market", blocker="market",
+                    ))
+                    _record_duration(timings, "result_assembly_duration_ms", assembly_started)
+                    continue
+                direction_market_gates = {
+                    direction: pre_market_gates.get((mapping.symbol, direction))
+                    for direction in DIRECTIONS
+                }
+                rejected_market_gates = [
+                    gate for gate in direction_market_gates.values()
+                    if gate is not None and gate.status == "rejected"
+                ]
+                if has_mt5 and len(rejected_market_gates) == len(DIRECTIONS):
+                    assembly_started = perf_counter()
+                    current_payloads.append(_current_payload(
+                        symbol=mapping.symbol, direction="none",
+                        leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
+                        quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
+                        total_cost=0, net_profit=0, annualized_return=0,
+                        status="rejected", reason=rejected_market_gates[0].reason,
                         gate="market", blocker="market",
                     ))
                     _record_duration(timings, "result_assembly_duration_ms", assembly_started)
@@ -402,7 +448,8 @@ def run_scan(db: Session) -> int:
                             signal_gate.status, leg_a_venue_name,
                         )
                         market_gate = (
-                            _direction_market_gate(
+                            direction_market_gates.get(direction)
+                            or _direction_market_gate(
                                 session_state, mapping.symbol, direction, mt5_side,
                                 tradability_snapshot=tradability_snapshot,
                             )

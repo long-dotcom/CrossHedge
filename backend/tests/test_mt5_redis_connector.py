@@ -11,7 +11,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from app.core.redis_client import redis_client, redis_key
 from app.venues.domain.models import AccountSnapshot, Instrument, OrderBookSnapshot, OrderRequest, Side, Ticker
 from app.venues.mt5 import codec
-from app.venues.mt5.redis_connector import MT5RedisConnector
+from app.venues.mt5.redis_connector import MT5GatewayError, MT5RedisConnector
 from app.venues.domain.models import OrderSnapshot, OrderStatus, OrderType
 from mt5_gateway.main import MT5Gateway
 
@@ -193,6 +193,30 @@ def test_mt5_submit_order_uses_stream_response_and_idempotency_key() -> None:
     assert result.venue_order_id == "123"
     assert captured["operation"] == "submit_order"
     assert captured["idempotency_key"] == "order-1"
+
+
+def test_mt5_gateway_explicit_market_closed_response_is_deterministic() -> None:
+    client = redis_client()
+    client.set(redis_key("mt5", "health"), codec.dumps({"status": "ok", "connected": True}))
+    connector = MT5RedisConnector(read_only=False, redis=client)
+
+    def gateway_once() -> None:
+        rows = client.xread({redis_key("mt5", "commands"): "0-0"}, count=1, block=1000)
+        _, messages = rows[0]
+        _, fields = messages[0]
+        client.xadd(fields["response_stream"], {
+            "ok": "0", "data": "", "error": "MT5 下单失败 retcode=10018: Market closed",
+        })
+
+    thread = threading.Thread(target=gateway_once)
+    thread.start()
+    with pytest.raises(MT5GatewayError, match="10018") as raised:
+        connector.submit_order(OrderRequest(
+            venue="mt5", symbol="XAUUSD", side=Side.SELL,
+            quantity=Decimal("0.01"), client_order_id="market-closed",
+        ))
+    thread.join(timeout=2)
+    assert raised.value.outcome_unknown is False
 
 
 def test_gateway_reuses_idempotent_submit_result() -> None:

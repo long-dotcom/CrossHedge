@@ -107,6 +107,16 @@ def _direction_is_mt5_long(direction: str, mt5_leg: str = "b") -> bool:
     return False
 
 
+def mt5_order_side(mapping: SymbolMapping, direction: str, action: str) -> str:
+    """返回指定策略方向在 MT5 腿上实际需要发送的买卖方向。"""
+    mt5_long = _direction_is_mt5_long(direction, _mt5_leg(mapping))
+    if action == "open":
+        return "buy" if mt5_long else "sell"
+    if action == "close":
+        return "sell" if mt5_long else "buy"
+    raise ValueError(f"未知 MT5 动作: {action}")
+
+
 def mt5_session_state(mapping: SymbolMapping, now: datetime | None = None) -> MT5SessionState:
     """获取品种的 MT5 会话状态。
 
