@@ -81,6 +81,7 @@ def run_execution_outbox_once(
     monotonic_now = time.monotonic()
     if monotonic_now >= _next_stale_predispatch_repair_at:
         repair_stale_predispatch_intents_once(session_factory=session_factory)
+        repair_stale_unsent_outboxes_once(session_factory=session_factory)
         _next_stale_predispatch_repair_at = monotonic_now + 60.0
     # 私有 WS 是订单确认主路径；REST 查单只允许启动或断线重连后的单次补偿。
     from app.execution.venue_events import consume_reconciliation_request, project_venue_events_once
@@ -162,6 +163,58 @@ def repair_stale_predispatch_intents_once(
                 group.status = previous_status
                 group.close_reason = f"平仓 Intent #{intent.id} 未产生外部订单，已恢复持仓状态"
                 _add_group_event_once(db, group.id, "close_intent_rolled_back", group.close_reason)
+            repaired += 1
+        db.commit()
+    return repaired
+
+
+def repair_stale_unsent_outboxes_once(
+    *,
+    session_factory: sessionmaker = SessionLocal,
+    stale_after_seconds: int = 300,
+) -> int:
+    """重新排队被误标为 SENT、但可证明从未提交的单腿命令。
+
+    动态 Maker/Hedge Outbox 可能受旧版本状态推进缺陷影响，在执行腿仍为
+    PLANNED、且没有 VenueOrder 和执行事件时被提前标记为 SENT。可靠执行协议
+    保证 VenueOrder 必须先于外部提交持久化，因此这组条件可以排除重复下单。
+    """
+    cutoff = utc_now() - timedelta(seconds=max(int(stale_after_seconds), 1))
+    repaired = 0
+    with session_factory() as db:
+        outboxes = (
+            db.query(ExecutionOutbox)
+            .join(ExecutionIntent, ExecutionIntent.id == ExecutionOutbox.intent_id)
+            .filter(
+                ExecutionOutbox.status == "SENT",
+                ExecutionOutbox.created_at <= cutoff,
+                ExecutionIntent.status.in_({"RUNNING", "RECOVERY_REQUIRED"}),
+            )
+            .order_by(ExecutionOutbox.id)
+            .all()
+        )
+        for outbox in outboxes:
+            payload = _outbox_payload(outbox)
+            raw_ids = payload.get("dispatch_leg_ids")
+            if not isinstance(raw_ids, list) or not raw_ids:
+                continue
+            leg_ids = {int(value) for value in raw_ids if str(value).isdigit()}
+            if not leg_ids:
+                continue
+            legs = db.query(ExecutionLeg).filter(ExecutionLeg.id.in_(leg_ids)).all()
+            if len(legs) != len(leg_ids) or any(str(leg.status or "").upper() != "PLANNED" for leg in legs):
+                continue
+            if db.query(VenueOrder.id).filter(VenueOrder.execution_leg_id.in_(leg_ids)).first() is not None:
+                continue
+            if db.query(ExecutionEvent.id).filter(ExecutionEvent.execution_leg_id.in_(leg_ids)).first() is not None:
+                continue
+            outbox.status = "PENDING"
+            outbox.available_at = utc_now()
+            outbox.locked_at = None
+            outbox.last_error = "检测到历史版本误标 SENT：未创建 VenueOrder/执行事件，已安全重新排队"
+            intent = db.get(ExecutionIntent, outbox.intent_id)
+            if intent is not None:
+                intent.status = "RUNNING"
             repaired += 1
         db.commit()
     return repaired
@@ -915,12 +968,22 @@ def _recover_without_resubmit(
             continue
         if venue_order.status not in NON_TERMINAL_ORDER_STATUSES:
             continue
+        rejection = _historical_deterministic_submit_rejection(leg, venue_order)
+        if rejection:
+            _mark_historical_submit_rejected(db, outbox, intent, leg, venue_order, rejection)
+            continue
         connector = adapter_factory(leg.venue, intent.execution_mode)
-        snapshot = connector.get_order(
-            leg.venue_symbol,
-            client_order_id=venue_order.client_order_id,
-            venue_order_id=venue_order.venue_order_id,
-        )
+        try:
+            snapshot = connector.get_order(
+                leg.venue_symbol,
+                client_order_id=venue_order.client_order_id,
+                venue_order_id=venue_order.venue_order_id,
+            )
+        except Exception as exc:
+            unresolved.append(
+                f"{leg.leg_key}:{venue_order.client_order_id}:查询恢复失败:{_exception_message(exc)}"
+            )
+            continue
         status = str(getattr(snapshot.status, "value", snapshot.status) or "not_ready").lower()
         if status in {"not_ready", "not_supported", "unknown", ""}:
             unresolved.append(f"{leg.leg_key}:{venue_order.client_order_id}:{status or 'unknown'}")
@@ -932,6 +995,71 @@ def _recover_without_resubmit(
     else:
         all_legs = db.query(ExecutionLeg).filter(ExecutionLeg.intent_id == intent.id).order_by(ExecutionLeg.id).all()
         _finish_command(db, outbox, intent, all_legs, adapter_factory=adapter_factory)
+
+
+def _historical_deterministic_submit_rejection(leg: ExecutionLeg, venue_order: VenueOrder) -> str:
+    """识别旧版本误标为 outcome_unknown 的确定性 MT5 拒单。"""
+    if str(leg.venue or "").lower() != "mt5":
+        return ""
+    if str(venue_order.venue_order_id or "").strip() or float(venue_order.filled_quantity or 0.0) > 1e-12:
+        return ""
+    raw = str(venue_order.raw_last_report or "")
+    lowered = raw.lower()
+    if "10018" not in lowered:
+        return ""
+    if "market closed" not in lowered:
+        return ""
+    return "MT5 下单被确定性拒绝 retcode=10018: Market closed（历史记录已从结果未知纠正）"
+
+
+def _mark_historical_submit_rejected(
+    db: Session,
+    outbox: ExecutionOutbox,
+    intent: ExecutionIntent,
+    leg: ExecutionLeg,
+    venue_order: VenueOrder,
+    message: str,
+) -> None:
+    venue_order.status = "REJECTED"
+    venue_order.remaining_quantity = max(
+        float(venue_order.requested_quantity or leg.venue_order_quantity) - float(venue_order.filled_quantity or 0.0),
+        0.0,
+    )
+    venue_order.reconciliation_state = "RECOVERED_SUBMIT_REJECTION"
+    venue_order.last_event_at = utc_now()
+    leg.status = "FAILED"
+    intent.error_message = message
+    if venue_order.legacy_order_id is not None:
+        legacy_order = db.get(Order, venue_order.legacy_order_id)
+        if legacy_order is not None:
+            legacy_order.status = "rejected"
+            legacy_order.error_message = message
+    payload = json.dumps({
+        "schema_version": 1,
+        "outbox_id": outbox.id,
+        "intent_id": intent.id,
+        "execution_leg_id": leg.id,
+        "client_order_id": venue_order.client_order_id,
+        "status": "REJECTED",
+        "error_message": message,
+        "recovered_from_historical_unknown": True,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    event_id = f"worker:{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:56]}"
+    if db.query(ExecutionEvent.id).filter(ExecutionEvent.event_id == event_id).first() is None:
+        db.add(ExecutionEvent(
+            event_id=event_id,
+            intent_id=intent.id,
+            execution_leg_id=leg.id,
+            venue_order_id_ref=venue_order.id,
+            event_type="ORDER_REJECTED",
+            client_order_id=venue_order.client_order_id,
+            venue_order_id=venue_order.venue_order_id,
+            ts_event=utc_now(),
+            reconciliation=True,
+            payload=payload,
+            processed_at=utc_now(),
+        ))
+    _record_execution_failure(db, intent, leg, venue_order, message, source="historical_recovery")
 
 
 def _finish_command(

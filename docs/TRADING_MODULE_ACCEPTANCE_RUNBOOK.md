@@ -125,8 +125,9 @@ MT5 Demo 证据需要包含请求、订单/成交 ticket、执行 retcode、最�
 4. Maker-then-Market 模式必须在发送 Maker 首腿前检查最终 MT5 Hedge 腿，禁止先成交 Maker 再发现 MT5 休市。
 5. 验收记录应包含会话状态、交易能力缓存、Outbox `last_error`、两边订单数量和最终真实仓位。
 6. Gateway 明确返回 `retcode=10018 Market closed` 时必须记录为确定性拒绝，不得标记为 `UNKNOWN` 或进入“可能已下单”的恢复分支。
-7. 超过 5 分钟且全部执行腿仍为 `PLANNED`、没有任何 VenueOrder/ExecutionEvent 的 CLOSE Intent，Worker 必须安全回滚到原持仓状态；存在任一成交、订单或未知结果时严禁自动回滚。
-8. 已平仓组必须根据最终开平仓成交事实重算已实现盈亏；迟到 Venue 事件到达后，对账任务应幂等刷新组级 PnL。
+7. 对历史遗留数据执行恢复验收：误标 UNKNOWN 的 `10018` 必须一次收敛到拒绝/人工恢复，Outbox 尝试次数不再增长；误标 SENT 且无 VenueOrder/ExecutionEvent 的 PLANNED 动态腿必须安全回到 PENDING，并重新经过三层 MT5 门禁后才允许提交。
+8. 超过 5 分钟且全部执行腿仍为 `PLANNED`、没有任何 VenueOrder/ExecutionEvent 的 CLOSE Intent，Worker 必须安全回滚到原持仓状态；存在任一成交、订单或未知结果时严禁自动回滚。
+9. 已平仓组必须根据最终开平仓成交事实重算已实现盈亏；迟到 Venue 事件到达后，对账任务应幂等刷新组级 PnL。
 
 对冲组页面必须区分当前可平仓价差与真实成交平仓价差，并分别展示最后一笔 venue 平仓成交时间和系统平仓确认时间。实际手续费统一以正数成本展示；MT5 原始负 commission 必须在入账边界归一化。详情还必须展示执行腿、Outbox 状态/尝试次数及门禁原因，不能用“0 个场所订单”掩盖尚未发送的计划腿。
 

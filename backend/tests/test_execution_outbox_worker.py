@@ -11,6 +11,7 @@ from app.execution.intents import ExecutionLegPlan, create_execution_intent
 from app.execution.outbox_worker import (
     reconcile_execution_orders_once,
     repair_stale_predispatch_intents_once,
+    repair_stale_unsent_outboxes_once,
     run_execution_outbox_once,
 )
 from tests.native_fakes import order_snapshot
@@ -54,6 +55,11 @@ class FailingAdapter:
         error = RuntimeError("Binance 私有 WebSocket 尚未连接")
         error.outcome_unknown = self.outcome_unknown
         raise error
+
+
+class QueryMustNotRunAdapter:
+    def get_order(self, symbol, **kwargs):
+        raise AssertionError("确定性历史拒单不应再次查询场所")
 
 
 def _factory_and_session():
@@ -222,6 +228,76 @@ def test_unknown_submit_failure_keeps_recovery_state_and_records_reason() -> Non
         assert outbox.status == "PROCESSING"
         assert "提交结果未知" in outbox.last_error
         assert db.query(SystemLog).filter_by(category="execution").count() == 1
+
+
+def test_historical_mt5_market_closed_unknown_converges_without_query() -> None:
+    factory = _factory_and_session()
+    intent_id = _create(factory)
+    with factory() as db:
+        intent = db.get(ExecutionIntent, intent_id)
+        leg = db.query(ExecutionLeg).filter_by(intent_id=intent.id).one()
+        leg.venue = "mt5"
+        leg.venue_symbol = "XAUUSD"
+        order = Order(
+            platform="mt5", symbol="GOLD", side="sell", quantity=0.01,
+            order_type="market", status="unknown",
+        )
+        db.add(order)
+        db.flush()
+        db.add(VenueOrder(
+            execution_leg_id=leg.id, legacy_order_id=order.id,
+            client_order_id=f"CH-{intent.id}-{leg.id}", venue_order_id="",
+            status="UNKNOWN", requested_quantity=0.01, filled_quantity=0,
+            remaining_quantity=0.01, reconciliation_state="SUBMIT_UNKNOWN",
+            raw_last_report='{"error_message":"RuntimeError: MT5 下单失败 retcode=10018: Market closed","outcome_unknown":true}',
+        ))
+        outbox = db.query(ExecutionOutbox).one()
+        outbox.status = "PROCESSING"
+        outbox.locked_at = utc_now() - timedelta(seconds=60)
+        db.commit()
+
+    assert run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: QueryMustNotRunAdapter(),
+        processing_timeout_seconds=30,
+    ) == 1
+    assert run_execution_outbox_once(
+        session_factory=factory,
+        adapter_factory=lambda venue, mode: QueryMustNotRunAdapter(),
+        processing_timeout_seconds=30,
+    ) == 0
+
+    with factory() as db:
+        assert db.get(ExecutionIntent, intent_id).status == "FAILED"
+        assert db.query(ExecutionLeg).one().status == "FAILED"
+        assert db.query(VenueOrder).one().status == "REJECTED"
+        assert db.query(VenueOrder).one().reconciliation_state == "RECOVERED_SUBMIT_REJECTION"
+        assert db.query(ExecutionOutbox).one().status == "SENT"
+        assert db.query(Order).one().status == "rejected"
+        assert db.query(ExecutionEvent).filter_by(event_type="ORDER_REJECTED").count() == 1
+
+
+def test_stale_sent_planned_outbox_without_external_facts_is_requeued() -> None:
+    factory = _factory_and_session()
+    intent_id = _create(factory)
+    with factory() as db:
+        intent = db.get(ExecutionIntent, intent_id)
+        intent.status = "RUNNING"
+        outbox = db.query(ExecutionOutbox).one()
+        leg = db.query(ExecutionLeg).filter_by(intent_id=intent_id).one()
+        outbox.payload = '{"dispatch_leg_ids":[%d]}' % leg.id
+        outbox.status = "SENT"
+        outbox.created_at = utc_now() - timedelta(minutes=10)
+        db.commit()
+
+    assert repair_stale_unsent_outboxes_once(
+        session_factory=factory, stale_after_seconds=60,
+    ) == 1
+    with factory() as db:
+        outbox = db.query(ExecutionOutbox).one()
+        assert outbox.status == "PENDING"
+        assert "安全重新排队" in outbox.last_error
+        assert db.get(ExecutionIntent, intent_id).status == "RUNNING"
 
 
 def test_stale_predispatch_close_is_rolled_back_only_without_external_facts() -> None:
