@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from app.execution.auto_closer import evaluate_auto_close
+from app.execution.auto_closer import evaluate_auto_close, run_auto_close
 from app.execution.hedge_pool import HedgeGroupSnapshot
 from app.execution.pnl import liquidation_pnl_from_close_spread, pnl_from_close_spread
 
@@ -85,3 +85,28 @@ def test_liquidation_pnl_includes_remaining_close_fee() -> None:
 
     assert pnl_from_close_spread(group, 4.0) == 4.5
     assert liquidation_pnl_from_close_spread(group, 4.0) == 3.75
+
+
+def test_auto_close_pauses_closed_mt5_symbol_without_logging_failure(monkeypatch) -> None:
+    """休市品种不应继续评估并触发每秒异常日志。"""
+    snapshot = SimpleNamespace(id=138, symbol="XAG")
+    group = SimpleNamespace(id=138, symbol="XAG", status="open")
+    mapping = SimpleNamespace(symbol="XAG", leg_a_venue="hyperliquid", leg_b_venue="mt5")
+    db = SimpleNamespace(get=lambda *_args: group)
+
+    monkeypatch.setattr(
+        "app.execution.auto_closer.get_strategy_setting",
+        lambda *_args: SimpleNamespace(auto_close_enabled=True, auto_close_live_enabled=True),
+    )
+    monkeypatch.setattr("app.execution.auto_closer.enabled_mappings", lambda *_args: [mapping])
+    monkeypatch.setattr("app.execution.auto_closer.hedge_pool.snapshot_open_groups", lambda *_args: [snapshot])
+    monkeypatch.setattr(
+        "app.execution.auto_closer.mt5_session_state",
+        lambda *_args: SimpleNamespace(symbol_flow_paused=True),
+    )
+    monkeypatch.setattr(
+        "app.execution.auto_closer.evaluate_auto_close",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("休市时不应评估平仓")),
+    )
+
+    assert run_auto_close(db) == 0

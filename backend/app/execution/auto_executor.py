@@ -40,7 +40,9 @@ from app.db.retention import prune_table_by_id
 from app.execution.circuit_breaker import is_blocked as breaker_is_blocked
 from app.execution.coordinator import create_open_intent
 from app.risk.engine import open_capacity_check
+from app.market.mt5_sessions import mt5_session_state, mt5_symbol_flow_paused
 from app.market.mt5_tradability import mt5_tradability_cache
+from app.market.symbols import enabled_mappings
 
 logger = get_logger(__name__)
 
@@ -87,7 +89,25 @@ def run_auto_execute(db: Session) -> int:
         .limit(20)
         .all()
     )
+    opportunity_symbols = {opportunity.symbol.upper() for opportunity in opportunities}
+    mappings = {
+        mapping.symbol.upper(): mapping
+        for mapping in enabled_mappings(db)
+        if mapping.symbol.upper() in opportunity_symbols
+    }
+    paused_symbols = {
+        symbol
+        for symbol, mapping in mappings.items()
+        if "mt5" in {str(mapping.leg_a_venue or "").lower(), str(mapping.leg_b_venue or "").lower()}
+        and mt5_symbol_flow_paused(mt5_session_state(mapping))
+    }
     for opportunity in opportunities:
+        if opportunity.symbol.upper() in paused_symbols:
+            # 防住扫描状态持久化之前残留的 executable 机会。
+            opportunity.status = "rejected"
+            opportunity.reject_reason = "品种当前休市，相关策略与执行流程已暂停"
+            _confirmations.invalidate(_confirmation_key(opportunity))
+            continue
         allowed, reason = _eligible(db, strategy, opportunity)
         if not allowed:
             opportunity.reject_reason = reason

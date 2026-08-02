@@ -77,6 +77,25 @@ class MT5SessionState:
     def can_close_any(self) -> bool:
         return self.can_close_long or self.can_close_short
 
+    @property
+    def symbol_flow_paused(self) -> bool:
+        """是否应暂停该品种的策略与执行流程。
+
+        ``reduce_only`` 仍需允许已有仓位减仓，``quote_only`` 仍可保留行情观察；
+        只有完全休市或状态未知且所有能力均关闭时才按下品种级“暂停键”。
+        """
+        return mt5_symbol_flow_paused(self)
+
+
+def mt5_symbol_flow_paused(state: Any) -> bool:
+    """兼容 ORM、数据类和测试快照的品种级暂停判定。"""
+    if str(getattr(state, "status", "unknown") or "unknown").lower() in {"closed", "unknown"}:
+        return True
+    return not any(
+        bool(getattr(state, field, False))
+        for field in ("can_quote", "can_open_long", "can_open_short", "can_close_long", "can_close_short")
+    )
+
 
 # 会话状态缓存：使用 TTLCache 替代手写 dict+monotonic+Lock
 _session_cache: LocalTTLCache[MT5SessionState] = LocalTTLCache(ttl_seconds=30.0)

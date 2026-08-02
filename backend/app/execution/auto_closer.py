@@ -22,6 +22,7 @@ from app.execution.coordinator import create_close_intent
 from app.execution.hedge_pool import HedgeGroupSnapshot, hedge_pool
 from app.execution.pnl import pnl_breakdown_from_close_spread
 from app.market.active_refresh import refresh_execution_quotes
+from app.market.mt5_sessions import mt5_session_state, mt5_symbol_flow_paused
 from app.market.quotes import quote_synchronizer
 from app.market.scanner import get_strategy_setting
 from app.market.symbols import enabled_mappings
@@ -63,6 +64,12 @@ def run_auto_close(db: Session) -> int:
             if mapping is None:
                 _log(db, "warning", f"自动平仓跳过: {group.symbol} #{group.id}", "品种映射不在运行缓存中")
                 continue
+            if "mt5" in {str(mapping.leg_a_venue or "").lower(), str(mapping.leg_b_venue or "").lower()}:
+                session_state = mt5_session_state(mapping)
+                if mt5_symbol_flow_paused(session_state):
+                    # 休市是可预期状态：不评估、不创建 Intent，也不按秒写 warning。
+                    # 会话探测恢复后，下一轮会自然重新进入自动平仓流程。
+                    continue
             evaluation = evaluate_auto_close(db, strategy, group, mapping=mapping)
             if not evaluation.should_close:
                 group.unrealized_pnl = evaluation.estimated_profit
