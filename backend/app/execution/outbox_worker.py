@@ -391,7 +391,7 @@ def _process_claim(
             # 必须再次失败关闭；Maker 首腿也不能先行发送。
             outbox.status = "PENDING"
             outbox.locked_at = None
-            outbox.available_at = utc_now() + timedelta(seconds=5)
+            outbox.available_at = utc_now() + timedelta(seconds=_mt5_dispatch_retry_seconds(db, intent))
             outbox.last_error = mt5_block_reason
             intent.error_message = mt5_block_reason
             db.commit()
@@ -503,6 +503,26 @@ def _mt5_dispatch_block_reason(db: Session, intent: ExecutionIntent) -> str:
     if not tradability_allowed:
         return f"执行发送前 MT5 订单预检查阻止{action}: {tradability_reason}"
     return ""
+
+
+def _mt5_dispatch_retry_seconds(db: Session, intent: ExecutionIntent) -> int:
+    """计算 MT5 门禁阻止后的退避时间，休市期间避免高频改写 Outbox。"""
+    if intent.hedge_group_id is None:
+        return 5
+    group = db.get(HedgeGroup, intent.hedge_group_id)
+    if group is None:
+        return 5
+    mapping = db.query(SymbolMapping).filter(SymbolMapping.symbol == group.symbol).one_or_none()
+    if mapping is None:
+        return 5
+
+    from app.market.mt5_sessions import mt5_session_state, mt5_symbol_flow_paused
+
+    session_state = mt5_session_state(mapping)
+    if not mt5_symbol_flow_paused(session_state):
+        return 5
+    # 最长每 5 分钟探测一次，以便配置热更新或临时提前开市后能够自动恢复。
+    return min(max(int(getattr(session_state, "seconds_to_open", None) or 300), 30), 300)
 
 
 def _outbox_dispatch_legs(outbox: ExecutionOutbox, all_legs: list[ExecutionLeg]) -> list[ExecutionLeg]:

@@ -487,6 +487,17 @@ def test_mt5_pre_close_blocks_open_but_allows_close() -> None:
     assert "不允许" in open_reason
     assert can_close
     assert close_reason == ""
+    assert state.symbol_flow_paused is False
+
+
+def test_closed_mt5_session_pauses_symbol_flow() -> None:
+    state = MT5SessionState(
+        symbol="XAU", status="closed", reason="周末休市", can_quote=False,
+        can_open_long=False, can_open_short=False, can_close_long=False, can_close_short=False,
+        seconds_to_open=3600,
+    )
+
+    assert state.symbol_flow_paused is True
 
 def test_xyz_growth_mode_uses_effective_fee_multiplier() -> None:
     taker, maker, source = _hyperliquid_effective_fee_rates(
