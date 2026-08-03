@@ -56,6 +56,7 @@ class HyperliquidConnector:
         default_maker_fee_rate: Decimal = Decimal("0.00015"),
         default_taker_fee_rate: Decimal = Decimal("0.00045"),
         slippage: float = 0.01,
+        perp_dexs: Sequence[str] | None = None,
         info_transport=None,
         exchange_factory=None,
     ) -> None:
@@ -71,6 +72,7 @@ class HyperliquidConnector:
         self.default_maker_fee_rate = default_maker_fee_rate
         self.default_taker_fee_rate = default_taker_fee_rate
         self.slippage = float(slippage)
+        self.perp_dexs = _normalize_perp_dexs(perp_dexs)
         self._info_transport = info_transport or post_hyperliquid_info
         self._exchange_factory = exchange_factory
         self._exchange = None
@@ -456,6 +458,9 @@ class HyperliquidConnector:
             wallet,
             base_url=self.info_url.removesuffix("/info"),
             account_address=self.account_address,
+            # SDK 默认只加载主 DEX；HIP-3 品种必须显式加载对应 Perp DEX，
+            # 否则下单编码阶段会在 name_to_asset 处抛出 KeyError。
+            perp_dexs=list(self.perp_dexs),
         )
         return self._exchange
 
@@ -539,6 +544,29 @@ class HyperliquidConnector:
             price=_optional_decimal(item.get("limitPx")),
             raw=item,
         )
+
+
+def hyperliquid_perp_dexs(symbols: Sequence[str]) -> tuple[str, ...]:
+    """从完整 HIP-3 品种名提取 SDK 所需的稳定 Perp DEX 列表。"""
+    values = [""]
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol or "").strip()
+        if ":" not in symbol:
+            continue
+        dex = symbol.split(":", 1)[0].strip()
+        if dex and dex not in values:
+            values.append(dex)
+    return tuple(values)
+
+
+def _normalize_perp_dexs(perp_dexs: Sequence[str] | None) -> tuple[str, ...]:
+    """规范化显式 DEX 配置，并始终保留 Hyperliquid 主 DEX。"""
+    values = [""]
+    for raw_dex in perp_dexs or ():
+        dex = str(raw_dex or "").strip()
+        if dex and dex not in values:
+            values.append(dex)
+    return tuple(values)
 
 
 def _decimal(value: Any) -> Decimal:

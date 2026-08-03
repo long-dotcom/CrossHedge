@@ -142,6 +142,7 @@ def build_credential_connector(
     row: ExchangeCredential,
     *,
     credentials: dict[str, Any] | None = None,
+    hyperliquid_perp_dexs: tuple[str, ...] | None = None,
 ):
     values = credentials if credentials is not None else decrypt_credentials(row)
     common = {
@@ -157,7 +158,7 @@ def build_credential_connector(
             default_taker_fee_rate=Decimal(str(settings.cost.binance_default_taker_fee_rate)),
         )
     if row.venue == "hyperliquid":
-        return HyperliquidConnector(**common)
+        return HyperliquidConnector(**common, perp_dexs=hyperliquid_perp_dexs)
     if row.venue == "mt5":
         return MT5Connector(**common)
     raise ValueError(f"尚未接入原生交易场所: {row.venue}")

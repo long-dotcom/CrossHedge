@@ -5,7 +5,7 @@ import json
 
 from app.venues.domain.events import VenueEventType
 from app.venues.domain.models import OrderRequest, OrderStatus, OrderType, Side
-from app.venues.hyperliquid.connector import HyperliquidConnector
+from app.venues.hyperliquid.connector import HyperliquidConnector, hyperliquid_perp_dexs
 from app.venues.hyperliquid.websocket import HyperliquidWebSocketRuntime, _bbo_subscription
 
 
@@ -161,6 +161,47 @@ def test_hyperliquid_native_account_instrument_and_order() -> None:
     assert instrument.maker_fee_rate == Decimal("0.0001")
     assert order.status == OrderStatus.ACCEPTED
     assert order.venue_order_id == "123"
+
+
+def test_hyperliquid_hip3_order_initializes_sdk_with_configured_dex(monkeypatch) -> None:
+    """HIP-3 下单前必须让 SDK 建立 xyz 品种到资产编号的映射。"""
+    captured: dict = {}
+
+    class CapturingExchange:
+        def __init__(self, _wallet, **kwargs):
+            captured.update(kwargs)
+
+        def market_open(self, symbol, is_buy, quantity, **kwargs):
+            captured.update({"symbol": symbol, "is_buy": is_buy, "quantity": quantity, **kwargs})
+            return {
+                "status": "ok",
+                "response": {"data": {"statuses": [{"filled": {"oid": 456, "totalSz": "6.26", "avgPx": "0.006"}}]}},
+            }
+
+    monkeypatch.setattr("eth_account.Account.from_key", lambda *_args: object())
+    monkeypatch.setattr("hyperliquid.exchange.Exchange", CapturingExchange)
+    connector = HyperliquidConnector(
+        credentials={"account_address": "0xabc", "secret_key": "test-key"},
+        read_only=False,
+        perp_dexs=("", "xyz"),
+    )
+
+    order = connector.submit_order(OrderRequest(
+        venue="hyperliquid", symbol="xyz:JPY", side=Side.SELL,
+        quantity=Decimal("6.26"), client_order_id="hip3-jpy-open",
+        order_type=OrderType.MARKET,
+    ))
+
+    assert captured["perp_dexs"] == ["", "xyz"]
+    assert captured["symbol"] == "xyz:JPY"
+    assert order.status == OrderStatus.FILLED
+    assert order.venue_order_id == "456"
+
+
+def test_hyperliquid_perp_dexs_extracts_both_leg_hip3_symbols() -> None:
+    assert hyperliquid_perp_dexs(("BTC", "xyz:JPY", "xyz:JP225", "plain:TEST")) == (
+        "", "xyz", "plain",
+    )
 
 
 def test_hyperliquid_hip3_instrument_queries_its_dex_and_keeps_full_symbol() -> None:

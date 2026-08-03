@@ -17,6 +17,7 @@ from app.market.quotes import quote_cache
 from app.venues.binance import BinanceFuturesConnector
 from app.venues.domain.models import OrderBookSnapshot, Ticker
 from app.venues.hyperliquid import HyperliquidConnector
+from app.venues.hyperliquid.connector import hyperliquid_perp_dexs
 from app.venues.hybrid_probe import HybridPaperProbeConnector
 from app.venues.mt5 import MT5Connector
 from app.venues.paper import PaperConnector
@@ -65,7 +66,10 @@ class NativeVenueManager:
                 connector = self._existing(key)
                 if connector is not None:
                     return connector
-                created = build_credential_connector(row)
+                created = build_credential_connector(
+                    row,
+                    hyperliquid_perp_dexs=hyperliquid_perp_dexs(self.configured_symbols("hyperliquid")),
+                )
                 return self._store(key, created)
 
         settings = get_settings()
@@ -83,6 +87,7 @@ class NativeVenueManager:
                     default_maker_fee_rate=Decimal(str(settings.hyperliquid.default_maker_fee_rate)),
                     default_taker_fee_rate=Decimal(str(settings.hyperliquid.default_taker_fee_rate)),
                     slippage=settings.hyperliquid.paper_live_slippage,
+                    perp_dexs=hyperliquid_perp_dexs(self.configured_symbols("hyperliquid")),
                 ),
             )
         if normalized == "mt5":
