@@ -105,6 +105,7 @@ FastAPI 只创建不可变 Intent、ExecutionLeg 和 Outbox。独立执行 Worke
 - 成本与 PnL 使用统一拆分：`spread_cost` 表示双腿 bid/ask 往返摩擦，`unit_cost/total_cost` 保持手续费口径，机会另外保存预计开仓/平仓手续费。价差研究展示两者之和；持仓“未实现盈亏”表示按当前可成交平仓价并预扣预计平仓手续费后的可平仓净 PnL；已实现盈亏只使用真实双腿 Fill 和实际手续费。
 - 策略入场、自动执行和自动平仓不再配置或检查净利润、年化收益及利润缓冲门槛；入场仍受统计可达线、成本保护线和每份边际约束，平仓仍受统计退出线、品种退出线及最大持仓时间约束。执行前最后复核只确认当前价差仍满足入场线。
 - MT5 品种完全休市时启用品种级暂停：跳过扫描计算、自动开仓和自动平仓，不产生按调度周期重复的休市 warning；已排队命令只做低频开市探测。行情、会话和仓位对账保留，开市后自动恢复。`reduce_only` 仍允许已有仓位减仓。
+- Hyperliquid HIP-3 品种（如 `xyz:JPY`）在原生 Connector 初始化时显式加载其 Perp DEX，确保 SDK 在发送订单前能够解析完整品种名和资产编号；A/B 任一腿配置 HIP-3 均会被纳入。
 
 - 下单前校验异常、确定性提交失败、结果未知异常以及交易所拒绝都会写入旧订单的
   `error_message`、Intent、Outbox/ExecutionEvent 和 `SystemLog(category=execution)`；
