@@ -70,7 +70,6 @@ def _live_close_test_db(auto_close_live_enabled: bool = False, live_trading_enab
             execution_mode="live",
             auto_close_enabled=True,
             auto_close_live_enabled=auto_close_live_enabled,
-            max_holding_minutes=240,
         )
     )
     db.add(SystemSetting(key="live_trading_enabled", value="true" if live_trading_enabled else "false"))

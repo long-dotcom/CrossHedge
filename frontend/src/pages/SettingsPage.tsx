@@ -248,7 +248,6 @@ export function SettingsPage() {
       max_daily_opens: 0,
       max_daily_open_notional: 0,
       allow_opposite_direction: false,
-      max_holding_minutes: 240,
       execution_style: 'simultaneous_market',
       maker_leg: 'a',
       maker_offset_bps: 1,
@@ -758,7 +757,6 @@ export function SettingsPage() {
                       <Form.Item name="open_cooldown_seconds" label="开仓冷却秒"><InputNumber min={0} step={1} /></Form.Item>
                       <Form.Item name="max_daily_opens" label="每日最大开仓次数"><InputNumber min={0} step={1} /></Form.Item>
                       <Form.Item name="max_daily_open_notional" label="每日累计开仓金额上限 USD"><InputNumber min={0} /></Form.Item>
-                      <Form.Item name="max_holding_minutes" label="最大持仓分钟"><InputNumber min={1} step={1} /></Form.Item>
                       <Form.Item name="allow_opposite_direction" label="允许双向同时持仓" valuePropName="checked"><Switch /></Form.Item>
                     </div>
                   </div>

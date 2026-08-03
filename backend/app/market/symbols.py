@@ -99,7 +99,6 @@ def seed_symbol_mappings_from_file(db: Session) -> int:
             "max_daily_opens": int(item.get("max_daily_opens", 0)),
             "max_daily_open_notional": float(item.get("max_daily_open_notional", 0.0)),
             "allow_opposite_direction": bool(item.get("allow_opposite_direction", False)),
-            "max_holding_minutes": int(item.get("max_holding_minutes", 240)),
             "execution_style": item.get("execution_style", "simultaneous_market"),
             "maker_leg": item.get("maker_leg", "a"),
             "maker_offset_bps": float(item.get("maker_offset_bps", item.get("hl_maker_offset_bps", 1))),

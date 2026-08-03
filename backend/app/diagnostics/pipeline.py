@@ -274,7 +274,6 @@ def _symbol_pipeline(
             "persist_duration_ms": persist_duration,
             "gross_spread": current.get("gross_spread") if current else None,
             "unit_net_profit": current.get("unit_net_profit") if current else None,
-            "annualized_return": current.get("annualized_return") if current else None,
         },
     }
 

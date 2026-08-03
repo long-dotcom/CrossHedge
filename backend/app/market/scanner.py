@@ -263,7 +263,7 @@ def run_scan(db: Session) -> int:
                             direction="none",
                             leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
                             quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
-                            total_cost=0, net_profit=0, annualized_return=0,
+                            total_cost=0, net_profit=0,
                             status="rejected", reason="缺少原生连接器行情",
                             gate="quote", blocker="quote",
                         ))
@@ -284,7 +284,7 @@ def run_scan(db: Session) -> int:
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
                         quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
-                        total_cost=0, net_profit=0, annualized_return=0,
+                        total_cost=0, net_profit=0,
                         status="rejected",
                         reason=f"MT5 不可报价/不可交易: {session_state.status}，{session_state.reason}",
                         gate="market", blocker="market",
@@ -305,7 +305,7 @@ def run_scan(db: Session) -> int:
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
                         quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
-                        total_cost=0, net_profit=0, annualized_return=0,
+                        total_cost=0, net_profit=0,
                         status="rejected", reason=rejected_market_gates[0].reason,
                         gate="market", blocker="market",
                     ))
@@ -332,7 +332,7 @@ def run_scan(db: Session) -> int:
                         symbol=mapping.symbol, direction="none",
                         leg_a_bid=0, leg_a_ask=0, leg_b_bid=0, leg_b_ask=0,
                         quantity=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
-                        total_cost=0, net_profit=0, annualized_return=0,
+                        total_cost=0, net_profit=0,
                         status="rejected", reason=sync_reason,
                         gate="quote", blocker="quote",
                     ))
@@ -355,7 +355,7 @@ def run_scan(db: Session) -> int:
                         quantity=0, leg_b_quantity=0, leg_a_quantity=0,
                         notional_currency=(mapping.mt5_currency_profit or mapping.quote_asset or "USD"),
                         fx_rate_to_usd=0, gross_spread=0, unit_cost=0, unit_net_profit=0,
-                        total_cost=0, net_profit=0, annualized_return=0,
+                        total_cost=0, net_profit=0,
                         status="rejected", reason=str(exc),
                         gate="market", blocker="sizing",
                     ))
@@ -363,8 +363,6 @@ def run_scan(db: Session) -> int:
                     continue
 
                 # ── 成本估算 + 信号评估 + 门控判定 ────────────────────────
-                holding_minutes = getattr(mapping, "max_holding_minutes", strategy.max_holding_minutes)
-                holding_hours = max(holding_minutes / 60, 1)
                 leg_a_symbol = mapping_leg(mapping, "a")[1]
                 leg_b_symbol = mapping_leg(mapping, "b")[1]
                 with _timed_phase(
@@ -418,7 +416,6 @@ def run_scan(db: Session) -> int:
                         net_profit, unit_net_profit = _projected_profit(
                             gross_spread, exit_target, cost.total, sizing.leg_a_quantity,
                         )
-                        annualized_return = (net_profit / notional) * (365 * 24 / holding_hours)
                     with _timed_phase(
                         timings, "gates_duration_ms", scan_id, mapping.symbol, direction=direction,
                     ):
@@ -459,7 +456,6 @@ def run_scan(db: Session) -> int:
                         estimated_close_fee=cost.close_fee,
                         unit_cost=unit_cost, unit_net_profit=unit_net_profit,
                         total_cost=cost.total, net_profit=net_profit,
-                        annualized_return=annualized_return,
                         status=final_gate.status, reason=reason,
                         gate=final_gate.gate, blocker=final_gate.blocker,
                         risk_tags=risk_tags,
@@ -589,7 +585,6 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snaps
     except ValueError:
         return []
     notional = sizing.notional_usd
-    holding_hours = max(float(getattr(mapping, "max_holding_minutes", getattr(strategy, "max_holding_minutes", 60.0)) or 60.0) / 60, 1.0)
     try:
         leg_a_costs = venue_cost_inputs(leg_a_venue, leg_a_symbol)
         leg_b_costs = venue_cost_inputs(leg_b_venue, leg_b_symbol)
@@ -661,7 +656,6 @@ def _readonly_leg_pair_payloads(mapping, settings, strategy=None, *, quote_snaps
             estimated_open_fee=estimated_open_fee, estimated_close_fee=estimated_close_fee,
             unit_net_profit=unit_net_profit,
             total_cost=total_cost, net_profit=net_profit,
-            annualized_return=(net_profit / notional) * (365 * 24 / holding_hours) if notional > 0 else 0.0,
             status=status,
             reason=reason,
             gate="readonly" if not cost_error else "cost", blocker=blocker,
@@ -895,7 +889,7 @@ def _opportunity_payload(payload, *, notional, entry_threshold, exit_target, ove
             "quantity", "leg_b_quantity", "leg_a_quantity", "notional_currency", "fx_rate_to_usd",
             "gross_spread", "spread_cost", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
             "estimated_open_fee", "estimated_close_fee",
-            "annualized_return", "status"
+            "status"
         )},
         "notional": notional, "entry_threshold": entry_threshold, "exit_target": exit_target,
         "overheat_threshold": overheat_threshold, "signal_sample_count": signal_sample_count,
@@ -982,7 +976,7 @@ def _spread_current_fields() -> set[str]:
     return {
         "symbol", "direction", "leg_a_bid", "leg_a_ask", "leg_b_bid", "leg_b_ask",
         "quantity", "gross_spread", "unit_cost", "unit_net_profit", "total_cost", "net_profit",
-        "annualized_return", "status", "reason", "entry_spread", "close_spread", "mid_spread",
+        "status", "reason", "entry_spread", "close_spread", "mid_spread",
         "spread_cost", "leg_b_quantity", "leg_a_quantity", "notional_currency", "fx_rate_to_usd",
     }
 
@@ -991,7 +985,7 @@ def _spread_direction_fields() -> set[str]:
     return _spread_current_fields() - {"direction"} | {"direction"}
 
 
-def _upsert_current_spread(db: Session, *, symbol: str, direction: str, leg_a_bid: float, leg_a_ask: float, leg_b_bid: float, leg_b_ask: float, quantity: float, gross_spread: float, unit_cost: float, unit_net_profit: float, total_cost: float, net_profit: float, annualized_return: float, status: str, reason: str, entry_spread: float = 0.0, close_spread: float = 0.0, mid_spread: float = 0.0, spread_cost: float = 0.0, leg_b_quantity: float = 0.0, leg_a_quantity: float = 0.0, notional_currency: str = "USD", fx_rate_to_usd: float = 1.0) -> SpreadCurrent:
+def _upsert_current_spread(db: Session, *, symbol: str, direction: str, leg_a_bid: float, leg_a_ask: float, leg_b_bid: float, leg_b_ask: float, quantity: float, gross_spread: float, unit_cost: float, unit_net_profit: float, total_cost: float, net_profit: float, status: str, reason: str, entry_spread: float = 0.0, close_spread: float = 0.0, mid_spread: float = 0.0, spread_cost: float = 0.0, leg_b_quantity: float = 0.0, leg_a_quantity: float = 0.0, notional_currency: str = "USD", fx_rate_to_usd: float = 1.0) -> SpreadCurrent:
     """插入或更新 SpreadCurrent 记录。"""
     row = db.query(SpreadCurrent).filter(SpreadCurrent.symbol == symbol).first()
     if not row:
@@ -1016,14 +1010,13 @@ def _upsert_current_spread(db: Session, *, symbol: str, direction: str, leg_a_bi
     row.unit_net_profit = unit_net_profit
     row.total_cost = total_cost
     row.net_profit = net_profit
-    row.annualized_return = annualized_return
     row.status = status
     row.reason = reason
     row.sampled_at = utc_now()
     return row
 
 
-def _upsert_direction_current(db: Session, *, symbol: str, direction: str, leg_a_bid: float, leg_a_ask: float, leg_b_bid: float, leg_b_ask: float, quantity: float, gross_spread: float, entry_spread: float, close_spread: float, mid_spread: float, spread_cost: float, unit_cost: float, unit_net_profit: float, total_cost: float, net_profit: float, annualized_return: float, status: str, reason: str, leg_b_quantity: float = 0.0, leg_a_quantity: float = 0.0, notional_currency: str = "USD", fx_rate_to_usd: float = 1.0) -> SpreadDirectionCurrent:
+def _upsert_direction_current(db: Session, *, symbol: str, direction: str, leg_a_bid: float, leg_a_ask: float, leg_b_bid: float, leg_b_ask: float, quantity: float, gross_spread: float, entry_spread: float, close_spread: float, mid_spread: float, spread_cost: float, unit_cost: float, unit_net_profit: float, total_cost: float, net_profit: float, status: str, reason: str, leg_b_quantity: float = 0.0, leg_a_quantity: float = 0.0, notional_currency: str = "USD", fx_rate_to_usd: float = 1.0) -> SpreadDirectionCurrent:
     """插入或更新 SpreadDirectionCurrent 记录。"""
     row = db.query(SpreadDirectionCurrent).filter(SpreadDirectionCurrent.symbol == symbol, SpreadDirectionCurrent.direction == direction).first()
     if not row:
@@ -1047,7 +1040,6 @@ def _upsert_direction_current(db: Session, *, symbol: str, direction: str, leg_a
     row.unit_net_profit = unit_net_profit
     row.total_cost = total_cost
     row.net_profit = net_profit
-    row.annualized_return = annualized_return
     row.status = status
     row.reason = reason
     row.sampled_at = utc_now()
@@ -1116,7 +1108,6 @@ def _record_spread_history_from_payload(db: Session, payload: dict, settings) ->
         unit_cost=unit_cost, unit_net_profit=unit_net_profit,
         total_cost=payload.get("total_cost", 0.0),
         net_profit=payload.get("net_profit", 0.0),
-        annualized_return=payload.get("annualized_return", 0.0),
         status=payload.get("status", "rejected"),
         reason=payload.get("reason", ""),
     ))
@@ -1193,7 +1184,6 @@ def _persist_opportunities(db: Session, opportunities: list[dict], ids_by_key: d
         current.unit_net_profit = payload["unit_net_profit"]
         current.total_cost = payload["total_cost"]
         current.net_profit = payload["net_profit"]
-        current.annualized_return = payload["annualized_return"]
         current.entry_threshold = payload["entry_threshold"]
         current.exit_target = payload["exit_target"]
         current.overheat_threshold = payload["overheat_threshold"]

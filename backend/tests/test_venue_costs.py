@@ -174,7 +174,7 @@ def test_readonly_scanner_cost_only_contains_spread_and_fees(monkeypatch) -> Non
         quote=SimpleNamespace(stale_ms=5000, loose_sync_ms=5000),
         cost=SimpleNamespace(default_slippage_bps=0.0, default_fx_cost_rate=0.0),
     )
-    strategy = SimpleNamespace(default_notional=1000.0, max_holding_minutes=240)
+    strategy = SimpleNamespace(default_notional=1000.0)
     quote_cache.put("binance", mapping.symbol, 4059.15, 4059.16, 100000, "test")
     quote_cache.put("mt5", mapping.symbol, 4057.166, 4057.334, 100000, "test")
     monkeypatch.setattr(

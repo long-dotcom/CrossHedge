@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { Card, Space, Tag, Tooltip, Typography } from 'antd';
-import { fmtAdaptive, fmtPct } from '../../utils/format';
+import { fmtAdaptive } from '../../utils/format';
 import { legTitle, venueLabel } from '../../utils/venues';
 import { PipelineStatusTag, statusClass } from './PipelineStatusTag';
 import type { PipelineEdge, PipelineNode, SymbolPipeline } from './types';
@@ -156,7 +156,6 @@ function PipelinePath({ symbol }: { symbol: SymbolPipeline }) {
 
 export const SymbolPipelineCard = memo(function SymbolPipelineCard({ symbol }: { symbol: SymbolPipeline }) {
   const netProfit = symbol.metrics.unit_net_profit;
-  const annualized = symbol.metrics.annualized_return;
   return (
     <Card className={`pipeline-card ${statusClass(symbol.status)}`} size="small">
       <div className="pipeline-card-header">
@@ -188,7 +187,6 @@ export const SymbolPipelineCard = memo(function SymbolPipelineCard({ symbol }: {
         <span>同步差 {msText(symbol.metrics.sync_diff_ms)}</span>
         <span>扫描 age {msText(symbol.metrics.scan_age_ms)}</span>
         <span>净利/份 {fmtAdaptive(netProfit ?? undefined)}</span>
-        <span>年化 {annualized === undefined || annualized === null ? '-' : fmtPct(annualized)}</span>
       </div>
     </Card>
   );

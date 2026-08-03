@@ -33,7 +33,6 @@ export type V2PipelineSymbol = {
     resultAge: number;
   };
   netPnl?: number;
-  annualized?: number;
 };
 
 export type V2HedgeGroup = {
