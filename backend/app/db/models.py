@@ -183,7 +183,6 @@ class StrategySetting(Base, TimestampMixin):
     auto_close_live_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     exit_target_percentile: Mapped[float] = mapped_column(Float, default=0.25)
     default_notional: Mapped[float] = mapped_column(Float, default=1000.0)
-    max_holding_minutes: Mapped[int] = mapped_column(Integer, default=240)
     execution_mode: Mapped[str] = mapped_column(String(32), default="paper")
     paper_use_live_account_risk: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_execute_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -302,7 +301,6 @@ class SymbolMapping(Base, TimestampMixin):
     max_daily_opens: Mapped[int] = mapped_column(Integer, default=0)
     max_daily_open_notional: Mapped[float] = mapped_column(Float, default=0.0)
     allow_opposite_direction: Mapped[bool] = mapped_column(Boolean, default=False)
-    max_holding_minutes: Mapped[int] = mapped_column(Integer, default=240)
     execution_style: Mapped[str] = mapped_column(String(64), default="simultaneous_market")
     maker_leg: Mapped[str] = mapped_column(String(1), default="a")
     maker_offset_bps: Mapped[float] = mapped_column(Float, default=1.0)
@@ -469,7 +467,6 @@ class SpreadCurrent(Base, TimestampMixin):
     - spread_cost / unit_cost: 价差成本 / 单位成本
     - unit_net_profit: 单位净利润
     - total_cost / net_profit: 总成本 / 总净利润
-    - annualized_return: 年化收益率
     - status: 状态（candidate / active / rejected 等）
     - reason: 状态原因说明
     - sampled_at: 采样时间
@@ -497,7 +494,6 @@ class SpreadCurrent(Base, TimestampMixin):
     unit_net_profit: Mapped[float] = mapped_column(Float, default=0.0)
     total_cost: Mapped[float] = mapped_column(Float)
     net_profit: Mapped[float] = mapped_column(Float)
-    annualized_return: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(Text, default="")
     sampled_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
@@ -533,7 +529,6 @@ class SpreadDirectionCurrent(Base, TimestampMixin):
     unit_net_profit: Mapped[float] = mapped_column(Float, default=0.0)
     total_cost: Mapped[float] = mapped_column(Float, default=0.0)
     net_profit: Mapped[float] = mapped_column(Float, default=0.0)
-    annualized_return: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(32), default="candidate")
     reason: Mapped[str] = mapped_column(Text, default="")
     sampled_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
@@ -605,7 +600,6 @@ class SpreadSnapshot(Base, TimestampMixin):
     unit_net_profit: Mapped[float] = mapped_column(Float, default=0.0)
     total_cost: Mapped[float] = mapped_column(Float)
     net_profit: Mapped[float] = mapped_column(Float)
-    annualized_return: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str] = mapped_column(Text, default="")
 
@@ -623,7 +617,7 @@ class ArbitrageOpportunity(Base, TimestampMixin):
     - symbol / direction: 品种与套利方向
     - notional / quantity: 名义价值与数量
     - trigger_leg_a_bid/ask, trigger_leg_b_bid/ask: 触发时各腿价格
-    - gross_spread / total_cost / net_profit / annualized_return: 收益指标
+    - gross_spread / total_cost / net_profit: 收益指标
     - entry_threshold / exit_target / overheat_threshold: 入场/出场/过热阈值
     - signal_sample_count: 信号采样次数
     - status: 状态（candidate / executed / expired / rejected）
@@ -652,7 +646,6 @@ class ArbitrageOpportunity(Base, TimestampMixin):
     estimated_open_fee: Mapped[float] = mapped_column(Float, default=0.0)
     estimated_close_fee: Mapped[float] = mapped_column(Float, default=0.0)
     net_profit: Mapped[float] = mapped_column(Float)
-    annualized_return: Mapped[float] = mapped_column(Float)
     entry_threshold: Mapped[float] = mapped_column(Float, default=0.0)
     exit_target: Mapped[float] = mapped_column(Float, default=0.0)
     overheat_threshold: Mapped[float] = mapped_column(Float, default=0.0)

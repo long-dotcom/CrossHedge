@@ -1,5 +1,6 @@
 """自动平仓场所路由与执行成本口径回归测试。"""
 
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from app.execution.auto_closer import evaluate_auto_close, run_auto_close
@@ -35,10 +36,10 @@ def test_auto_close_uses_mapping_venues_for_quote_sync(monkeypatch) -> None:
 
     monkeypatch.setattr("app.execution.auto_closer.quote_synchronizer.synchronized", synchronized)
     monkeypatch.setattr("app.execution.auto_closer.estimated_pair_close_fee", lambda *_args: 0.0)
-    strategy = SimpleNamespace(max_holding_minutes=60)
+    strategy = SimpleNamespace()
     mapping = SimpleNamespace(
         symbol="GOLD", leg_a_venue="binance", leg_b_venue="mt5",
-        max_close_spread=0.0, max_holding_minutes=60,
+        max_close_spread=0.0,
     )
 
     evaluate_auto_close(SimpleNamespace(), strategy, _snapshot(), mapping=mapping)
@@ -57,10 +58,10 @@ def test_auto_close_does_not_block_negative_estimated_profit(monkeypatch) -> Non
         lambda *_args, **_kwargs: (synced, ""),
     )
     monkeypatch.setattr("app.execution.auto_closer.estimated_pair_close_fee", lambda *_args: 0.0)
-    strategy = SimpleNamespace(max_holding_minutes=60)
+    strategy = SimpleNamespace()
     mapping = SimpleNamespace(
         symbol="GOLD", leg_a_venue="binance", leg_b_venue="mt5",
-        max_close_spread=0.0, max_holding_minutes=60,
+        max_close_spread=0.0,
     )
 
     evaluation = evaluate_auto_close(
@@ -72,6 +73,31 @@ def test_auto_close_does_not_block_negative_estimated_profit(monkeypatch) -> Non
 
     assert evaluation.should_close is True
     assert evaluation.estimated_profit < 0
+
+
+def test_auto_close_does_not_close_only_because_position_is_old(monkeypatch) -> None:
+    synced = SimpleNamespace(
+        leg_a=SimpleNamespace(bid=100.0, ask=101.0),
+        leg_b=SimpleNamespace(bid=101.0, ask=102.0),
+    )
+    monkeypatch.setattr(
+        "app.execution.auto_closer.quote_synchronizer.synchronized",
+        lambda *_args, **_kwargs: (synced, ""),
+    )
+    monkeypatch.setattr("app.execution.auto_closer.estimated_pair_close_fee", lambda *_args: 0.0)
+    mapping = SimpleNamespace(
+        symbol="GOLD", leg_a_venue="binance", leg_b_venue="mt5", max_close_spread=0.0,
+    )
+
+    evaluation = evaluate_auto_close(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        _snapshot(exit_target=1.0, opened_at=datetime.now() - timedelta(days=365)),
+        mapping=mapping,
+    )
+
+    assert evaluation.should_close is False
+    assert evaluation.reason.startswith("等待平仓价差回归")
 
 
 def test_pnl_ignores_legacy_funding_and_swap_fields() -> None:

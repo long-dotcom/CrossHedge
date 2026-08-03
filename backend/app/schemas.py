@@ -50,7 +50,6 @@ class StrategySettingsIn(BaseModel):
     auto_close_live_enabled: bool = False
     exit_target_percentile: float = 0.25
     default_notional: float
-    max_holding_minutes: int
     execution_mode: str
     paper_use_live_account_risk: bool = False
     auto_execute_enabled: bool = False
@@ -249,7 +248,6 @@ class SymbolMappingIn(BaseModel):
     max_daily_opens: int = 0
     max_daily_open_notional: float = 0.0
     allow_opposite_direction: bool = False
-    max_holding_minutes: int = 240
     execution_style: str = "simultaneous_market"
     maker_leg: str = "a"
     maker_offset_bps: float = 1.0
@@ -340,8 +338,6 @@ class SymbolMappingIn(BaseModel):
             raise ValueError("单品种未平对冲组上限必须至少为 1")
         if self.open_cooldown_seconds < 0 or self.max_daily_opens < 0 or self.max_daily_open_notional < 0:
             raise ValueError("开仓冷却和每日限额不能为负数")
-        if self.max_holding_minutes < 1:
-            raise ValueError("最大持仓时间必须至少为 1 分钟")
         if self.execution_style == "simultaneous_market":
             self.hl_open_order_type = "market"
             self.mt5_open_order_type = "market"

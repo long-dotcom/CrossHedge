@@ -51,7 +51,6 @@ export type SymbolPipeline = {
     persist_duration_ms?: number | null;
     gross_spread?: number | null;
     unit_net_profit?: number | null;
-    annualized_return?: number | null;
   };
 };
 

@@ -205,8 +205,8 @@ def test_delete_symbol_mapping_clears_current_scan_state() -> None:
     mapping = SymbolMapping(symbol="BTC", leg_a_venue_symbol="BTC", mt5_symbol="BTCUSD", enabled=True)
     db.add(mapping)
     db.flush()
-    db.add(SpreadCurrent(symbol="BTC", direction="none", leg_a_bid=1, leg_a_ask=1, leg_b_bid=1, leg_b_ask=1, quantity=1, gross_spread=0, unit_cost=0, unit_net_profit=0, total_cost=0, net_profit=0, annualized_return=0, status="rejected"))
-    db.add(ArbitrageOpportunity(symbol="BTC", direction="long_leg_b_short_leg_a", notional=1, quantity=1, gross_spread=1, total_cost=0, net_profit=1, annualized_return=1, status="candidate"))
+    db.add(SpreadCurrent(symbol="BTC", direction="none", leg_a_bid=1, leg_a_ask=1, leg_b_bid=1, leg_b_ask=1, quantity=1, gross_spread=0, unit_cost=0, unit_net_profit=0, total_cost=0, net_profit=0, status="rejected"))
+    db.add(ArbitrageOpportunity(symbol="BTC", direction="long_leg_b_short_leg_a", notional=1, quantity=1, gross_spread=1, total_cost=0, net_profit=1, status="candidate"))
     db.commit()
     scan_state_store.update([{"symbol": "BTC"}], [{"symbol": "BTC", "status": "candidate"}])
 
@@ -348,7 +348,6 @@ def test_create_current_symbol_opportunity_uses_best_executable_direction() -> N
             unit_net_profit=9,
             total_cost=1,
             net_profit=9,
-            annualized_return=0.1,
             status="candidate",
             reason="未达入场线",
         )
@@ -371,7 +370,6 @@ def test_create_current_symbol_opportunity_uses_best_executable_direction() -> N
             unit_net_profit=18,
             total_cost=2,
             net_profit=18,
-            annualized_return=0.2,
             status="executable",
             reason="ready",
         )

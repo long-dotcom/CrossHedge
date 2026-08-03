@@ -208,7 +208,6 @@ def test_load_spread_points_supports_close_and_mid_basis() -> None:
                 spread_cost=3,
                 total_cost=0,
                 net_profit=0,
-                annualized_return=0,
                 status="candidate",
                 created_at=now,
             )
@@ -342,7 +341,6 @@ def test_spread_analytics_uses_raw_snapshots_through_4h() -> None:
                 unit_net_profit=180,
                 total_cost=20,
                 net_profit=180,
-                annualized_return=0,
                 status="candidate",
                 created_at=now - timedelta(minutes=5),
             )
@@ -495,7 +493,6 @@ def test_spread_analytics_uses_buckets_for_24h_and_7d() -> None:
                 unit_net_profit=180,
                 total_cost=20,
                 net_profit=180,
-                annualized_return=0,
                 status="candidate",
                 created_at=now - timedelta(hours=6),
             )

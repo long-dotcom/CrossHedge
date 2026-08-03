@@ -260,7 +260,7 @@ def test_open_request_creates_intent_and_only_opens_after_two_confirmed_fills(mo
         opportunity = ArbitrageOpportunity(
             symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
             notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
-            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031, annualized_return=0.1,
+            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031,
             entry_threshold=1.0, exit_target=0.2,
         )
         db.add(opportunity)
@@ -325,7 +325,7 @@ def test_open_request_rechecks_current_bbo_even_without_active_refresh(monkeypat
         opportunity = ArbitrageOpportunity(
             symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
             notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
-            gross_spread=2.0, total_cost=0.5, net_profit=1.5, annualized_return=0.1,
+            gross_spread=2.0, total_cost=0.5, net_profit=1.5,
             entry_threshold=1.0, exit_target=0.2,
         )
         db.add(opportunity)
@@ -365,7 +365,7 @@ def test_maker_open_persists_only_maker_stage_and_hedge_template(monkeypatch) ->
         opportunity = ArbitrageOpportunity(
             symbol="GOLD", direction="long_leg_a_short_leg_b", status="executable",
             notional=4000, quantity=1.0, leg_a_quantity=0.002, leg_b_quantity=0.03,
-            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031, annualized_return=0.1,
+            gross_spread=2.0, total_cost=0.0005, net_profit=0.0031,
             entry_threshold=1.0, exit_target=0.2,
         )
         db.add(opportunity)

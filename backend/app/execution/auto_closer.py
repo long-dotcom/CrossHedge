@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
 from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
@@ -171,19 +170,14 @@ def evaluate_auto_close(
         estimated_close_fee=live_close_fee,
     ).net_pnl
 
-    hold_expired = _hold_expired(snapshot, strategy, mapping)
     if force:
         return CloseEvaluation(True, f"手工强制平仓: 估算利润 {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     if exit_target <= 0:
         if close_spread <= 0:
             return CloseEvaluation(True, f"无统计退出线但平仓价差已回到零轴: {close_spread:.2f} <= 0.00", close_spread, exit_target, estimated_profit)
-        if hold_expired:
-            return CloseEvaluation(True, f"缺少退出线但已超过最大持仓时间: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
         return CloseEvaluation(False, "缺少退出线，等待更多统计样本", close_spread, exit_target, estimated_profit)
     if close_spread <= exit_target:
         return CloseEvaluation(True, f"平仓价差回归至退出线: {close_spread:.2f} <= {exit_target:.2f}", close_spread, exit_target, estimated_profit)
-    if hold_expired:
-        return CloseEvaluation(True, f"超过最大持仓时间: {estimated_profit:.2f}", close_spread, exit_target, estimated_profit)
     return CloseEvaluation(False, f"等待平仓价差回归: {close_spread:.2f} > {exit_target:.2f}", close_spread, exit_target, estimated_profit)
 
 
@@ -194,20 +188,6 @@ def _effective_exit_target(group: HedgeGroupSnapshot, mapping: SimpleNamespace |
     if group_target and mapping_target:
         return min(group_target, mapping_target)
     return group_target or mapping_target
-
-
-def _hold_expired(
-    group: HedgeGroupSnapshot,
-    strategy: StrategySetting | SimpleNamespace,
-    mapping: SimpleNamespace | None = None,
-) -> bool:
-    """判断是否超过品种级或策略级最大持仓时间。"""
-    if not group.opened_at:
-        return False
-    minutes = getattr(mapping, "max_holding_minutes", None) if mapping else None
-    if minutes is None:
-        minutes = getattr(strategy, "max_holding_minutes", 1)
-    return utc_now() - group.opened_at >= timedelta(minutes=max(int(minutes or 1), 1))
 
 
 def _log(db: Session, level: str, message: str, context: str = "") -> None:

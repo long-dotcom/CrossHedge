@@ -114,7 +114,6 @@ def _create_current_symbol_opportunity(
         unit_net_profit=row.unit_net_profit,
         total_cost=row.total_cost,
         net_profit=row.net_profit,
-        annualized_return=row.annualized_return,
         entry_threshold=row.entry_spread,
         exit_target=row.close_spread,
         overheat_threshold=0.0,

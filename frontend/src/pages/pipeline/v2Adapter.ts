@@ -56,7 +56,6 @@ function toPipeline(symbol: SymbolPipeline): V2PipelineSymbol {
       resultAge: ms(symbol.metrics.scan_age_ms),
     },
     netPnl: Number(symbol.metrics.unit_net_profit ?? 0),
-    annualized: Number(symbol.metrics.annualized_return ?? 0) * 100,
   };
 }
 

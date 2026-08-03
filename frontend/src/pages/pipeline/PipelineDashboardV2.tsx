@@ -89,10 +89,9 @@ function PipelineRow({ data }: { data: V2PipelineSymbol }) {
         })}
       </div>
       {isBlocked && data.blockReason && <div className="v2-block-reason">{data.blockReason}</div>}
-      {data.netPnl !== undefined && data.annualized !== undefined && data.pipelineStatus === 'normal' && (
+      {data.netPnl !== undefined && data.pipelineStatus === 'normal' && (
         <div className="v2-row-profit">
           <span>净利 <strong>{data.netPnl >= 0 ? '+' : ''}{fmtAdaptive(data.netPnl)}</strong></span>
-          <span>年化 <strong>{data.annualized.toFixed(2)}%</strong></span>
         </div>
       )}
     </div>
