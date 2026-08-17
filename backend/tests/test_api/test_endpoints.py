@@ -134,6 +134,7 @@ def test_dashboard_summary_uses_runtime_unrealized_pnl() -> None:
 
     assert result["equity"] == 100
     assert result["realized_pnl"] == 3
+    assert result["total_pnl"] == 10.5
     assert result["today_realized_pnl"] == 3
     assert result["unrealized_pnl"] == 7.5
     assert result["remaining_close_fees"] == 0.5

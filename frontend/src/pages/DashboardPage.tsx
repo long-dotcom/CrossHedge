@@ -32,6 +32,7 @@ export function DashboardPage() {
       {data.risk_mode === 'emergency_stop' && <Alert type="error" showIcon message="系统处于紧急停止模式" />}
       <Row gutter={[16, 16]}>
         <Col xs={24} md={8} xl={4}><DataCard title="总权益" value={fmtMoney(data.equity)} /></Col>
+        <Col xs={24} md={8} xl={4}><DataCard title="总盈亏" value={fmtPnlSigned(data.total_pnl)} valueStyle={{ color: fmtPnlColor(data.total_pnl) }} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="今日盈亏" value={fmtPnlSigned(data.today_pnl)} valueStyle={{ color: fmtPnlColor(data.today_pnl) }} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="今日已实现盈亏" value={fmtPnlSigned(data.today_realized_pnl)} valueStyle={{ color: fmtPnlColor(data.today_realized_pnl) }} /></Col>
         <Col xs={24} md={8} xl={4}><DataCard title="可平仓未实现盈亏" value={fmtPnlSigned(data.unrealized_pnl)} valueStyle={{ color: fmtPnlColor(data.unrealized_pnl) }} /></Col>
