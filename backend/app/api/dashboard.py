@@ -131,6 +131,8 @@ def _dashboard_summary_payload(db: Session) -> dict[str, Any]:
     unrealized_pnl, remaining_close_fees = _runtime_open_pnl(db)
     return {
         "equity": equity,
+        # 总盈亏采用全历史已实现盈亏加当前可平仓未实现盈亏的统一口径。
+        "total_pnl": realized_pnl + unrealized_pnl,
         "today_pnl": today_realized_pnl + unrealized_pnl,
         "today_realized_pnl": today_realized_pnl,
         "realized_pnl": realized_pnl,

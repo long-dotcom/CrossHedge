@@ -57,6 +57,7 @@ def test_dashboard_today_pnl_excludes_historical_realized_pnl() -> None:
     result = _dashboard_summary_payload(db)
 
     assert result["realized_pnl"] == 106
+    assert result["total_pnl"] == 106
     assert result["today_realized_pnl"] == 7
     assert result["today_pnl"] == 7
 
